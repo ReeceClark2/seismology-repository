@@ -7,8 +7,11 @@ import math
 from obspy.core import UTCDateTime
 from obspy.clients.fdsn import Client 
 import sys
+import tqdm
 
 import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.animation import ArtistAnimation
 
 
 mpl.rc('font', family='serif')
@@ -22,15 +25,11 @@ class Compute_Normal_Mode_Spectra():
         client = Client('IRIS')
 
         self.length = length # TODO: What is length for/mean?
-        self.max_frequency, self.min_frequency = max_frequency, min_frequency # TODO: What is max_frequency & min_frequency for/mean? 
+        self.max_frequency, self.min_frequency = max_frequency, min_frequency
         self.window_length = window_length # Window of time to probe in hours
 
         # Define network, station, location, and channel
         self.net, self.sta, self.chan, self.loc = net, sta, chan, loc
-
-        # Alternate system configurations
-        # net, sta, loc, chan = 'IU', 'SSPA', '00', 'LHZ'
-        # net, sta, loc, chan = 'IU', 'ANMO', '00', 'LHZ'
         
         self.start_time = start_time
         self.end_time = self.start_time + self.window_length * 60 * 60
@@ -63,11 +62,11 @@ class Compute_Normal_Mode_Spectra():
         
         NFFT = 2 ** (math.ceil(math.log(trace.stats.npts, 2)))
 
-        power = np.fft.fft(trace.data, n=NFFT, norm='backward')[0:NFFT]*trace.stats.delta
-        frequency = np.fft.fftfreq(n=NFFT, d = trace.stats.sampling_rate)[0:NFFT]*1000
+        power = np.fft.fft(trace.data, n=NFFT, norm='backward')[0:NFFT] * trace.stats.delta
+        frequency = np.fft.fftfreq(n=NFFT, d = trace.stats.sampling_rate)[0:NFFT] * 1000
 
         inv_resp = self.inv.get_response(trace.id, trace.stats.starttime)
-        resp, _ = inv_resp.get_evalresp_response(trace.stats.delta, NFFT*2, 'ACC')
+        resp, _ = inv_resp.get_evalresp_response(trace.stats.delta, NFFT * 2, 'ACC')
         resp = resp[1:]
 
         power *= np.conjugate(resp)/np.abs(resp)**2
@@ -78,9 +77,10 @@ class Compute_Normal_Mode_Spectra():
         return power, frequency
     
 
-    def plot(self, x, y, type):
+    def plot(self, xs, ys, labels, type):
         if type == "observed":
-            plt.plot(x, np.abs(y), alpha=0.5, label='Data')
+            for [ind, x], y in zip(enumerate(xs), ys):
+                plt.plot(x, np.abs(y), alpha=0.5, label=f'{labels[ind]}')
 
             plt.title(f"Observed Spectrum at {sta}, {loc}")
             plt.xlabel("Frequency (mHz)")
@@ -96,13 +96,38 @@ class Compute_Normal_Mode_Spectra():
 
 
 if __name__ == "__main__":
-    length = 360
-    max_frequency, min_frequency = 2, 0.2
-    window_length = 60
-    net, sta, chan, loc = 'IU', 'HRV', 'LHZ', '00'
-    start_time = UTCDateTime('2025-07-29T23:24:50')
-    stream_index = 0
+    length = 360 # TODO: What is length?
 
-    spectra = Compute_Normal_Mode_Spectra(length, max_frequency, min_frequency, window_length, net, sta, chan, loc, start_time, stream_index)
-    power, frequency = spectra.process_data()
-    spectra.plot(frequency, power, "observed")
+    min_frequency = 0.2 # Minimum frequency for FFT
+    max_frequency = 1.2 # Maximum frequency for FFT
+
+    net = "IU" # Network
+    sta = "HRV" # Station
+    chan = "LHZ" # Channel
+    loc = "00" # Location
+    
+    stream_index = 0 # Stream index
+    start_time = UTCDateTime('2025-07-29T23:24:50') # Start time
+
+    window_length = 60 # Window length in hours
+
+    fig, ax = plt.subplots()
+    ax.set_xlabel('Frequency (mHz)')
+    ax.set_ylabel('Power')
+    frames = []
+
+    pbar = tqdm.tqdm(total=120)
+    for i in range(120):
+        current_start_time = start_time + (i * 3600)
+        spectra = Compute_Normal_Mode_Spectra(length, max_frequency, min_frequency, window_length, net, sta, chan, loc, current_start_time, stream_index)
+        power, frequency = spectra.process_data()
+        
+        line, = ax.plot(frequency, np.abs(power), color='skyblue')
+        ax.set_title(f"Normal Mode Spectra at {current_start_time}")
+        frames.append([line])
+        pbar.update(1)
+    pbar.close()
+
+    ani = ArtistAnimation(fig, frames, interval=250, blit=True)
+    ani.save('spectra_animation.mp4', writer='ffmpeg')
+    plt.show()
