@@ -34,8 +34,7 @@ class Compute_Normal_Mode_Spectra():
         self.start_time = start_time
         self.end_time = self.start_time + self.window_length * 60 * 60
 
-        # TODO: What does the following line do? Check obspy readthedocs.
-        self.inv = client.get_stations(network=net, sta=sta, channel=chan, location=loc, starttime=self.start_time, endtime=self.end_time, level='response')
+        self.inventory = client.get_stations(network=net, station=sta, channel=chan, location=loc, starttime=self.start_time, endtime=self.end_time, level='response')
         self.stream = client.get_waveforms(network=net, station=sta, location=loc, channel=chan, starttime=self.start_time, endtime=self.end_time)
         self.trace = self.stream[stream_index]
 
@@ -65,11 +64,11 @@ class Compute_Normal_Mode_Spectra():
         power = np.fft.fft(trace.data, n=NFFT, norm='backward')[0:NFFT] * trace.stats.delta
         frequency = np.fft.fftfreq(n=NFFT, d = trace.stats.sampling_rate)[0:NFFT] * 1000
 
-        inv_resp = self.inv.get_response(trace.id, trace.stats.starttime)
-        resp, _ = inv_resp.get_evalresp_response(trace.stats.delta, NFFT * 2, 'ACC')
-        resp = resp[1:]
+        inventory_response = self.inventory.get_response(trace.id, trace.stats.starttime)
+        response, _ = inventory_response.get_evalresp_response(trace.stats.delta, NFFT * 2, 'ACC')
+        response = response[1:]
 
-        power *= np.conjugate(resp)/np.abs(resp)**2
+        power *= np.conjugate(response)/np.abs(response)**2
 
         power = power[(frequency >= min_frequency) & (frequency <= max_frequency)]
         frequency = frequency[(frequency >= min_frequency) & (frequency <= max_frequency)]
@@ -109,9 +108,9 @@ if __name__ == "__main__":
     stream_index = 0 # Stream index
     start_time = UTCDateTime('2025-07-29T23:24:50') # Start time
 
-    window_length = 60 # Window length in hours
+    window_length = 40 # Window length in hours
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=200)
     ax.set_xlabel('Frequency (mHz)')
     ax.set_ylabel('Power')
     frames = []
@@ -119,15 +118,24 @@ if __name__ == "__main__":
     pbar = tqdm.tqdm(total=120)
     for i in range(120):
         current_start_time = start_time + (i * 3600)
+
+        sta = "HRV"
         spectra = Compute_Normal_Mode_Spectra(length, max_frequency, min_frequency, window_length, net, sta, chan, loc, current_start_time, stream_index)
         power, frequency = spectra.process_data()
         
-        line, = ax.plot(frequency, np.abs(power), color='skyblue')
-        ax.set_title(f"Normal Mode Spectra at {current_start_time}")
-        frames.append([line])
+        line1, = ax.plot(frequency, np.abs(power), color='skyblue', label="HRV")
+
+        # sta = "GNI"
+        # spectra = Compute_Normal_Mode_Spectra(length, max_frequency, min_frequency, window_length, net, sta, chan, loc, current_start_time, stream_index)
+        # power, frequency = spectra.process_data()
+
+        # line2, = ax.plot(frequency, np.abs(power), color='moccasin', label="GNI")
+
+        title = ax.text(0.5, 1.05, f"Normal Mode Spectra at {current_start_time}", transform=ax.transAxes, va="center", ha="center")
+        frames.append([line1, title])
         pbar.update(1)
     pbar.close()
 
-    ani = ArtistAnimation(fig, frames, interval=250, blit=True)
-    ani.save('spectra_animation.mp4', writer='ffmpeg')
+    ani = ArtistAnimation(fig, frames, interval=250, blit=False)
+    ani.save('spectra_isolated_damped_mode.mp4', writer='ffmpeg')
     plt.show()
