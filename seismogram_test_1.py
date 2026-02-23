@@ -8,8 +8,10 @@ from obspy.core import UTCDateTime
 from obspy.clients.fdsn import Client 
 import sys
 import tqdm
+import pandas as pd
 
 import matplotlib as mpl
+mpl.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import ArtistAnimation
 
@@ -115,6 +117,10 @@ if __name__ == "__main__":
     ax.set_ylabel('Power')
     frames = []
 
+    df_modes = pd.read_csv("normal_modes.csv")
+    mask = (df_modes["f PREM"] >= min_frequency) & (df_modes["f PREM"] <= max_frequency)
+    filtered_modes = df_modes[mask]
+
     pbar = tqdm.tqdm(total=120)
     for i in range(120):
         current_start_time = start_time + (i * 3600)
@@ -123,16 +129,22 @@ if __name__ == "__main__":
         spectra = Compute_Normal_Mode_Spectra(length, max_frequency, min_frequency, window_length, net, sta, chan, loc, current_start_time, stream_index)
         power, frequency = spectra.process_data()
         
-        line1, = ax.plot(frequency, np.abs(power), color='skyblue', label="HRV")
-
-        # sta = "GNI"
-        # spectra = Compute_Normal_Mode_Spectra(length, max_frequency, min_frequency, window_length, net, sta, chan, loc, current_start_time, stream_index)
-        # power, frequency = spectra.process_data()
-
-        # line2, = ax.plot(frequency, np.abs(power), color='moccasin', label="GNI")
+        line1, = ax.plot(frequency, np.abs(power), color='skyblue')
 
         title = ax.text(0.5, 1.05, f"Normal Mode Spectra at {current_start_time}", transform=ax.transAxes, va="center", ha="center")
-        frames.append([line1, title])
+        
+        frame_artists = [line1, title]
+        
+        for _, row in filtered_modes.iterrows():
+            f_val = row["f PREM"]
+            f_label = row.iloc[0]
+            
+            vl = ax.axvline(f_val, color='black', linestyle=':', scaley=False)
+            txt = ax.text(f_val, 0.95, f_label, transform=ax.get_xaxis_transform(), rotation=90, va='top', ha='right', fontsize=8)
+            
+            frame_artists.extend([vl, txt])
+
+        frames.append(frame_artists)
         pbar.update(1)
     pbar.close()
 
