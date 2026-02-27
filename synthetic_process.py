@@ -33,22 +33,19 @@ class Synthetic_Process():
             pass
 
 
-    def create_spectrum(self, minimum_frequency, maximum_frequency, start_time, end_time, stream_index):
+    def create_spectrum(self, minimum_frequency, maximum_frequency, window, start_time):
         intensities = self.intensities.copy()
+        delta = round(np.mean(np.diff(self.times)))
+
+        intensities = intensities[round((start_time * 60 * 60) / delta):round((window * 60 * 60) / delta) + round((start_time * 60 * 60) / delta)]
 
         # Use windowing function for DFT
         intensities *= signal.get_window(('kaiser', 2. * np.pi), len(intensities))
         
         NFFT = 2 ** (math.ceil(math.log(len(intensities), 2)))
 
-        power = np.fft.fft(intensities, n=NFFT, norm='backward')[0:NFFT] * trace.stats.delta
-        frequency = np.fft.fftfreq(n=NFFT, d = trace.stats.sampling_rate)[0:NFFT] * 1000
-
-        inventory_response = self.inventory.get_response(trace.id, trace.stats.starttime)
-        response, _ = inventory_response.get_evalresp_response(trace.stats.delta, NFFT * 2, 'ACC')
-        response = response[1:]
-
-        power *= np.conjugate(response) / np.abs(response)**2
+        power = np.fft.fft(intensities, n=NFFT, norm='backward')[0:NFFT] * delta
+        frequency = np.fft.fftfreq(n=NFFT, d=delta)[0:NFFT]
 
         # Filter power and frequency to parameters
         power = power[(frequency >= minimum_frequency) & (frequency <= maximum_frequency)]
@@ -64,6 +61,12 @@ class Synthetic_Process():
 
 
 if __name__=="__main__":
-    file = "timeseries_Russia/IU_HRV_TS.ascii"
+    file = "timeseries_Russia/IU_HRV_TS.ascii"  # Synthetic time series to use
 
-    Synthetic_Process(file, 0)
+    min_frequency = 0.2 # Minimum frequency for FFT
+    max_frequency = 1.2 # Maximum frequency for FFT
+
+    window = 60         # Window size in hours
+
+    data = Synthetic_Process(file, 0)
+    power, frequency = data.create_spectrum(min_frequency / 1000, max_frequency / 1000, window)

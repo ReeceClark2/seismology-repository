@@ -52,11 +52,11 @@ class Observation_Process():
 
         power = np.fft.fft(trace.data, n=NFFT, norm='backward')[0:NFFT] * trace.stats.delta
         frequency = np.fft.fftfreq(n=NFFT, d = trace.stats.sampling_rate)[0:NFFT] * 1000
-
+        
         inventory_response = self.inventory.get_response(trace.id, trace.stats.starttime)
         response, _ = inventory_response.get_evalresp_response(trace.stats.delta, NFFT * 2, 'ACC')
         response = response[1:]
-        print(trace.stats.delta, trace.stats.sampling_rate, trace.stats.npts)
+
         power *= np.conjugate(response) / np.abs(response)**2
 
         # Filter power and frequency to parameters
@@ -70,7 +70,7 @@ if __name__ == "__main__":
     length = 360        # TODO: What is length?
 
     min_frequency = 0.2 # Minimum frequency for FFT
-    max_frequency = 1.2 # Maximum frequency for FFT
+    max_frequency = 2.0 # Maximum frequency for FFT
 
     net = "IU"          # Network
     sta = "HRV"         # Station
