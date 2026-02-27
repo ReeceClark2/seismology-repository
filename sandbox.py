@@ -53,13 +53,13 @@ for i in range(100):
 
     power1, frequency1 = synthetic.create_spectrum(min_frequency / 1000, max_frequency / 1000, window, synthetic_start_time)
 
-    # power2, frequency2 = data.create_spectrum(min_frequency, max_frequency, data_start_time, data_end_time, stream_index)
+    power2, frequency2 = data.create_spectrum(min_frequency, max_frequency, data_start_time, data_end_time, stream_index)
 
-    xs.append([frequency1 * 1000])
-    ys.append([abs(power1) / max(abs(power1))])
-    # xs.append([frequency1 * 1000, frequency2])
-    # ys.append([abs(power1) / max(abs(power1)), abs(power2) / max(abs(power2))])
+    # xs.append([frequency1 * 1000])
+    # ys.append([abs(power1) / max(abs(power1))])
+    xs.append([frequency1 * 1000, frequency2])
+    ys.append([abs(power1) / max(abs(power1)), abs(power2) / max(abs(power2))])
     pbar.update(1)
 
-utils.animate(xs, ys, labels=["Synthetic", "Data"], colors=["navajowhite", "lightsteelblue"], xlabel="Frequency (mHz)", ylabel="Power", title="Normal Mode Spectra")
+utils.animate(xs, ys, labels=["Synthetic", "Data"], colors=["navajowhite", "lightsteelblue"], xlabel="Frequency (mHz)", ylabel="Power", title="Normal Mode Spectra", filename="both_sliding_window")
     

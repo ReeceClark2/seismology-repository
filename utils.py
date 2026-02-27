@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import ArtistAnimation
 
 
-def animate(xs, ys, labels=None, colors=None, xlabel=None, ylabel=None, title=None, xlim=None, ylim=None, interval=50):
+def animate(xs, ys, labels=None, colors=None, xlabel=None, ylabel=None, title=None, xlim=None, ylim=None, interval=50, filename=None):
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Set static plot attributes
@@ -57,4 +57,4 @@ def animate(xs, ys, labels=None, colors=None, xlabel=None, ylabel=None, title=No
         ax.legend(loc='upper right')
 
     ani = ArtistAnimation(fig, frames, interval=interval, blit=True)
-    ani.save('my_animation.mp4', writer='ffmpeg', fps=2, dpi=200)
+    ani.save(f'{filename}.mp4', writer='ffmpeg', fps=2, dpi=200)
