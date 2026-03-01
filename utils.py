@@ -33,7 +33,7 @@ def animate(xs, ys, labels=None, colors=None, xlabel=None, ylabel=None, title=No
     if colors is None:
         colors = [None] * num_lines
     
-    pbar = tqdm.tqdm(len(xs))
+    pbar = tqdm.tqdm(total=len(xs))
     # xs and ys are expected to be: [ [x1, x2], [x1, x2], ... ] for each frame
     for f_idx, (x_frame, y_frame) in enumerate(zip(xs, ys)):
         frame_artists = []

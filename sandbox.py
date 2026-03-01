@@ -9,6 +9,8 @@ from obspy.clients.fdsn import Client
 import sys
 import tqdm
 import pandas as pd
+from pathlib import Path
+import re
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -19,47 +21,66 @@ from observation_process import Observation_Process
 import utils
 
 
-file = "timeseries_Russia/IU_HRV_TS.ascii"  # Synthetic time series to use
-synthetic = Synthetic_Process(file, 0)
+folder = "timeseries_Russia/"
+pbar = tqdm.tqdm(total=len(list(Path(folder).iterdir())))
 
-min_frequency = 0.2 # Minimum frequency for FFT
-max_frequency = 1.2 # Maximum frequency for FFT
+frequencies = []
+data_power = []
+synthetic_power = []
+networks = []
+stations = []
 
-window = 60
+for file_path in Path(folder).iterdir():
+    try:
+        match = re.search(r"\\([^_]+)_([^_.]+)", str(file_path))
+        if match:
+            net = match.group(1)
+            sta = match.group(2)
 
-synthetic_start_time = 0
-data_start_time = UTCDateTime('2025-07-29T23:24:50') # Start time
-data_end_time = UTCDateTime('2025-08-6T23:24:50')    # End time
+            synthetic = Synthetic_Process(str(file_path), 0)
 
-length = 360        # TODO: What is length?
-net = "IU"          # Network
-sta = "HRV"         # Station
-chan = "LHZ"        # Channel
-loc = "00"          # Location
+            min_frequency = 0.2 # Minimum frequency for FFT
+            max_frequency = 1.2 # Maximum frequency for FFT
 
-stream_index = 0
+            window = 480
 
-data = Observation_Process(length, net, sta, chan, loc, data_start_time, data_end_time)
+            synthetic_start_time = 0
+            data_start_time = UTCDateTime('2025-07-29T23:24:50') # Start time
+            data_end_time = UTCDateTime('2025-08-6T23:24:50')    # End time
 
-xs = []
-ys = []
+            length = 360        # TODO: What is length?
+            chan = "LHZ"        # Channel
+            loc = "00"          # Location
 
-pbar = tqdm.tqdm(100)
-for i in range(100):
-    data_start_time += 3600
-    data_end_time = data_start_time + (window * 3600)
+            stream_index = 0
 
-    synthetic_start_time += 1
+            data = Observation_Process(length, net, sta, chan, loc, data_start_time, data_end_time)
 
-    power1, frequency1 = synthetic.create_spectrum(min_frequency / 1000, max_frequency / 1000, window, synthetic_start_time)
+            xs = []
+            ys = []
 
-    power2, frequency2 = data.create_spectrum(min_frequency, max_frequency, data_start_time, data_end_time, stream_index)
+            power1, frequency1 = synthetic.create_spectrum(min_frequency / 1000, max_frequency / 1000, window, synthetic_start_time)
+            power2, frequency2 = data.create_spectrum(min_frequency, max_frequency, data_start_time, data_start_time + 3600 * window, stream_index)
 
-    # xs.append([frequency1 * 1000])
-    # ys.append([abs(power1) / max(abs(power1))])
-    xs.append([frequency1 * 1000, frequency2])
-    ys.append([abs(power1) / max(abs(power1)), abs(power2) / max(abs(power2))])
-    pbar.update(1)
+            if len(frequencies) == 0:
+                frequencies.append([frequency1, frequency2])
+            data_power.append(power2)
+            synthetic_power.append(power1)
+            networks.append(net)
+            stations.append(sta)
 
-utils.animate(xs, ys, labels=["Synthetic", "Data"], colors=["navajowhite", "lightsteelblue"], xlabel="Frequency (mHz)", ylabel="Power", title="Normal Mode Spectra", filename="both_sliding_window")
-    
+            pbar.update(1)
+    except:
+        pbar.update(1)
+        continue
+
+print(len(frequencies[0]), len(power2))
+# Save Data Power
+df_data = pd.DataFrame(list(zip(*data_power)), columns=stations)
+df_data.insert(0, "Frequency", frequencies[0][1])
+df_data.to_csv('data_power.csv', index=False)
+
+# Save Synthetic Power
+df_synthetic = pd.DataFrame(list(zip(*synthetic_power)), columns=stations)
+df_synthetic.insert(0, "Frequency", frequencies[0][0])
+df_synthetic.to_csv('synthetic_power.csv', index=False)
