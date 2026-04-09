@@ -22,10 +22,8 @@ mpl.rc('font', size=14)
 
 
 class Observation_Process():
-    def __init__(self, length, net, sta, chan, loc, start_time, end_time):
+    def __init__(self, net, sta, chan, loc, start_time, end_time):
         client = Client('IRIS')
-
-        self.length = length # TODO: What is length for/mean?
 
         # Define network, station, location, and channel
         self.net, self.sta, self.chan, self.loc = net, sta, chan, loc
@@ -35,6 +33,22 @@ class Observation_Process():
 
         self.inventory = client.get_stations(network=net, station=sta, channel=chan, location=loc, starttime=self.start_time, endtime=self.end_time, level='response')
         self.stream = client.get_waveforms(network=net, station=sta, location=loc, channel=chan, starttime=self.start_time, endtime=self.end_time)
+
+
+    def create_time_series(self, minimum_frequency, maximum_frequency, stream_index, start_time=None, end_time=None):
+        stream = self.stream.copy()
+
+        if start_time and end_time:
+            stream.trim(start_time, end_time)
+        trace = stream[stream_index]
+
+        trace_copy = trace.copy()
+        trace_copy.filter('bandpass', freqmin=minimum_frequency, freqmax=maximum_frequency)
+
+        # Detrend data (primarily to filter tides)
+        trace.detrend('constant')
+
+        return trace_copy
 
 
     def create_spectrum(self, minimum_frequency, maximum_frequency, start_time, end_time, stream_index):
@@ -70,7 +84,7 @@ if __name__ == "__main__":
     length = 360        # TODO: What is length?
 
     min_frequency = 0.2 # Minimum frequency for FFT
-    max_frequency = 2.0 # Maximum frequency for FFT
+    max_frequency = 0.4 # Maximum frequency for FFT
 
     net = "IU"          # Network
     sta = "HRV"         # Station
@@ -79,9 +93,11 @@ if __name__ == "__main__":
     
     stream_index = 0                                # Stream index
     start_time = UTCDateTime('2025-07-29T23:24:50') # Start time
-    end_time = UTCDateTime('2025-08-4T23:24:50')    # End time
+    end_time = UTCDateTime('2025-08-9T23:24:50')    # End time
 
-    data = Observation_Process(length, net, sta, chan, loc, start_time, end_time)
+    data = Observation_Process(net, sta, chan, loc, start_time, end_time)
 
-    end_time = UTCDateTime('2025-07-30T13:24:50')
     power, frequency = data.create_spectrum(min_frequency, max_frequency, start_time, end_time, stream_index)
+
+    plt.plot(frequency, abs(power))
+    plt.show()
