@@ -53,7 +53,7 @@ def compute_fft(t, d, minimum_frequency, maximum_frequency):
 
 def find_peaks(x, y, threshold=None):
     if not threshold:
-        threshold = 100 * np.median(y)
+        threshold = 10 * np.median(y)
 
     deltas = np.diff(y)
 
@@ -134,8 +134,8 @@ def compute_probability(t, d, model_frequencies, model_quality_factors):
 
 def metropolis_hastings(t, d, current_frequencies, current_quality_factors, 
                         iterations=10000, 
-                        maximum_frequency_step=0.00001, 
-                        maximum_quality_factor_step=10):
+                        maximum_frequency_step=0.000001, 
+                        maximum_quality_factor_step=3):
     
     current_probability, _, _, _, _ = compute_probability(t, d, current_frequencies, current_quality_factors)
 
@@ -163,25 +163,23 @@ def metropolis_hastings(t, d, current_frequencies, current_quality_factors,
 
 
 # TODO: Find initial decay rates!
-# def find_decay_rate(t, d):
-#     peak_t, peak_d = find_peaks(t, d, threshold=0)
+def find_quality_factor(t, d, frequency):
+    peak_t, peak_d = find_peaks(t, d, threshold=0)
 
-#     plt.scatter(peak_t, np.log(peak_d))
+    res = stats.linregress(np.array(peak_t), np.array(np.log(peak_d)))
 
-#     res = stats.linregress(np.array(peak_t), np.array(np.log(peak_d)))
-#     x = np.linspace(min(t), max(t), 100)
-#     y = res.slope * x + res.intercept
+    quality_factor = np.pi * frequency / (-1 * res.slope)
 
-#     print((2 * np.pi * 0.000305) / res.slope)
+    return quality_factor
 
 
 if __name__ == "__main__":
     plotting = input("Save plots? (Y/N) ")
-    number_of_trials = input("Number of trials: ")
+    number_of_trials = int(input("Number of trials: "))
 
     for trial in range(number_of_trials):
         minimum_frequency = 0.0002
-        maximum_frequency = 0.0005
+        maximum_frequency = 0.0012
 
         file_path = "timeseries_Russia/IU_HRV_TS.ascii" 
 
@@ -191,10 +189,17 @@ if __name__ == "__main__":
         peak_f, _ = find_peaks(f, abs(p))
         
         guess_frequencies = peak_f
-        guess_quality_factors = [random.randint(200, 1000) for _ in range(len(peak_f))]
+        guess_quality_factors = []
 
-        new_f, new_q = metropolis_hastings(t, d, guess_frequencies, guess_quality_factors, iterations=10000)
+        for guess_frequency in guess_frequencies:
+            frequency_t, frequency_d = get_synthetic_data(file_path, guess_frequency - 0.00003, guess_frequency + 0.00003)
+            quality_factor = find_quality_factor(frequency_t, frequency_d, guess_frequency)
 
+            guess_quality_factors.append(quality_factor)
+
+        new_f, new_q = metropolis_hastings(t, d, guess_frequencies, guess_quality_factors, iterations=100000)
+
+        # new_f = [0.00030690, 0.00030617, 0.00030725, 0.00031118, 0.00031254, 0.00040715, 0.00046771, 0.00047042]
         _, old_variance, old_SNR, old_h, old_H = compute_probability(t, d, guess_frequencies, guess_quality_factors)
         _, new_variance, new_SNR, new_h, new_H = compute_probability(t, d, new_f, new_q)
 
@@ -225,7 +230,7 @@ if __name__ == "__main__":
                 ax.set_xlabel("Time")
 
             plt.tight_layout()
-            plt.savefig("model_comparison.png", dpi=300)
+            plt.savefig(f"model_comparison_{trial}.png", dpi=300)
 
 
         with open(f"modeling_run_{trial}.txt", "w") as f_out:
