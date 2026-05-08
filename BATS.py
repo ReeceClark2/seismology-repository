@@ -82,10 +82,6 @@ class BATS():
             peak_x.append(x[ind])
             peak_y.append(y[ind])
 
-        # plt.plot(x, y)
-        # plt.scatter(peak_x, peak_y)
-        # plt.show()
-
         return peak_x, peak_y
 
 
@@ -194,6 +190,14 @@ class BATS():
                 plt.title(f"Time Series")
                 plt.savefig(f"{model_title}.png", dpi=300)
 
+            plt.close('all')
+            f, p = self.compute_fft(t, d - model, self.minimum_frequency, self.maximum_frequency)
+            f1, p1 = self.compute_fft(t, d, self.minimum_frequency, self.maximum_frequency)
+            plt.plot(f, abs(p), color='red')
+            plt.plot(f1, abs(p1), color='black')
+            plt.xlim(self.minimum_frequency, self.maximum_frequency)
+            plt.show()
+
         return log_probability, mean_square_projection, estimated_noise_variance, SNR
 
 
@@ -204,7 +208,6 @@ class BATS():
         original_theta = np.array(list(model_frequencies) + list(model_decay_rates), dtype=float)
         H = np.zeros((m, m))  # Renamed 'b' to 'H' to represent the Hessian
 
-        # Helper function
         def get_prob(theta):
             freqs = theta[:r]
             decays = theta[r:]
@@ -212,13 +215,10 @@ class BATS():
             return msp
 
         f0 = get_prob(original_theta)
-        
-        # 1. ROBUST STEP SIZE: Optimal for central difference is eps^(1/3).
-        # We include a floor (1e-6) so step size doesn't vanish if a parameter is exactly 0.
+    
         eps = np.finfo(float).eps
         h = np.cbrt(eps) * np.maximum(np.abs(original_theta), 1e-6)
         
-        # Pre-compute single-parameter perturbations (for the diagonals)
         f_plus = np.zeros(m)
         f_minus = np.zeros(m)
         
@@ -231,13 +231,10 @@ class BATS():
             theta_minus[j] -= h[j]
             f_minus[j] = get_prob(theta_minus)
             
-            # Diagonal: Central Difference
             H[j, j] = (f_plus[j] - 2 * f0 + f_minus[j]) / (h[j] ** 2)
 
-        # 2. ROBUST OFF-DIAGONALS: Central Difference for Mixed Partials
         for j in range(m):
             for k in range(j + 1, m):
-                # Calculate f(x+h, y+h), f(x+h, y-h), f(x-h, y+h), f(x-h, y-h)
                 theta_pp = original_theta.copy(); theta_pp[j] += h[j]; theta_pp[k] += h[k]
                 theta_pm = original_theta.copy(); theta_pm[j] += h[j]; theta_pm[k] -= h[k]
                 theta_mp = original_theta.copy(); theta_mp[j] -= h[j]; theta_mp[k] += h[k]
@@ -248,24 +245,17 @@ class BATS():
                 f_mp = get_prob(theta_mp)
                 f_mm = get_prob(theta_mm)
                 
-                # Symmetric 4-point mixed partial formula
                 mixed_partial = (f_pp - f_pm - f_mp + f_mm) / (4 * h[j] * h[k])
                 H[j, k] = mixed_partial
                 H[k, j] = mixed_partial
 
-        # Apply your scalar multiplier
         H *= (-m / 2)
-
-        # 3. ROBUST INVERSION: Moore-Penrose Pseudo-Inverse via SVD
-        # This safely calculates the covariance matrix even if H is ill-conditioned
         covariance_matrix = np.linalg.pinv(H, rcond=1e-10)
 
         _, _, estimated_noise_variance, _ = self.compute_model_probability(
             model_frequencies, model_decay_rates, estimated_noise_variance_flag=True
         )
         
-        # The variances are simply the diagonal of the covariance matrix.
-        # np.abs is used as a safety net against tiny negative floats from numerical noise.
         parameter_variances = np.abs(np.diag(covariance_matrix))
         model_parameter_uncertainties = np.sqrt(parameter_variances * estimated_noise_variance)
 
@@ -289,8 +279,8 @@ class BATS():
         plt.figure(figsize=(10, 6))
 
         plt.plot(f, abs(p), color="black", label="FFT")
-        plt.vlines([self.guess_frequencies], -1, 800_000, colors="cornflowerblue", linestyles="dashed", label="FFT Frequencies")
-        plt.vlines([realized_frequencies], -1, 800_000, colors="lightcoral", linestyles="dashed", label="Bayesian Frequencies")
+        plt.vlines([self.guess_frequencies], -1, max(abs(p)) * 2, colors="cornflowerblue", linestyles="dashed", label="FFT Frequencies")
+        plt.vlines([realized_frequencies], -1, max(abs(p)) * 2, colors="lightcoral", linestyles="dashed", label="Bayesian Frequencies")
 
         plt.xlim(min(f), max(f))
         plt.ylim(0, max(abs(p)) * 1.1)

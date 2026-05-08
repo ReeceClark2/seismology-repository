@@ -82,10 +82,10 @@ def get_synthetic_data(filename, minimum_frequency=None, maximum_frequency=None)
 
 
 minimum_frequency = 0.00025     # Minimum frequency (Hz)
-maximum_frequency = 0.00055    # Maximum frequency (Hz)
+maximum_frequency = 0.00035    # Maximum frequency (Hz)
 
 network = "IU"                  # Network
-station = "KIP"                 # Station
+station = "HRV"                 # Station
 channel = "LHZ"                 # Channel
 location = "00"                 # Location
 
@@ -98,5 +98,5 @@ file_path = f"timeseries_Russia/{network}_{station}_TS.ascii"
 t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
 # t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, minimum_frequency, maximum_frequency)
 
-model = BATS(t, d, minimum_frequency=minimum_frequency, maximum_frequency=maximum_frequency, threshold=8)
-model.run(iterations=10_000)
+model = BATS(t, d, minimum_frequency=minimum_frequency, maximum_frequency=maximum_frequency, threshold=40.0)
+model.run(iterations=10)
