@@ -2,9 +2,10 @@ import numpy as np
 from scipy import signal, stats
 from scipy.signal import find_peaks
 from scipy.optimize import minimize
-import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
+import jax
+jax.config.update("jax_enable_x64", True)
 import random
 import math
 from tqdm import tqdm
@@ -25,7 +26,7 @@ class BATS():
         
         # Set the time t and data d
         self.t = t
-        self.d = d
+        self.d = d * 1e9
 
         # Set the minimum frequency
         self.minimum_frequency = minimum_frequency
@@ -73,7 +74,7 @@ class BATS():
         d = d * taper
         
         # Find the FFT
-        nfft = 2 ** (math.ceil(math.log(len(d), 2)) + 2)
+        nfft = 2 ** (math.ceil(math.log(len(d), 2)) + 4)
         frequencies = np.fft.fftfreq(n=nfft, d=delta)
         power = np.fft.fft(d, n=nfft) * delta
 
@@ -178,63 +179,86 @@ class BATS():
     
 
     def get_global_likelihood(self, model_frequencies, model_decay_rates):
-        omegas = jnp.array(model_frequencies) * 2 * jnp.pi
-        alphas = jnp.array(model_decay_rates)
-        
         t = self.t
         d = self.d
 
-        r = len(omegas)
+        r = len(model_frequencies)
         m = 2 * r
         N = len(d)
-        
-        arg = omegas[:, None] * t[None, :]
-        decay = jnp.exp(-alphas[:, None] * t[None, :])
-        
-        G_cos = jnp.cos(arg) * decay
-        G_sin = jnp.sin(arg) * decay
-        
-        G = jnp.vstack((G_cos, G_sin))
-        g = G @ G.T
 
-        eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-        
-        mask = eigenvalues > 1e-10
-        safe_eigenvalues = jnp.where(mask, eigenvalues, 1.0)
-        scaled_eigenvectors = eigenvectors * jnp.where(mask, 1.0 / jnp.sqrt(safe_eigenvalues), 0.0)[None, :]
-        
-        H = scaled_eigenvectors.T @ G
-        h = H @ d
-
-        mean_square_data = (1 / N) * jnp.sum(d ** 2)
-        mean_square_projection = (1 / m) * jnp.sum(h ** 2)
-
-        R_sigma, R_delta = 1.67e7, 1.67e7
+        # 1. Base Constants
+        mean_square_data = jnp.sum(d ** 2) / N
+        R_delta = jnp.maximum(jnp.max(jnp.abs(d)), 1e-6) * 10
+        R_sigma = jnp.maximum(jnp.max(jnp.abs(d)), 1e-6) * 10
         R_gamma = (0.5 / jnp.mean(jnp.diff(t))) * (t[-1] - t[0])
-
-        term_delta = jsp.gammaln(m / 2) - m * jnp.log(R_delta) - (m / 2) * jnp.log(jnp.maximum(m * mean_square_projection / 2, 1e-15))
-        term_gamma = - (r * jnp.log(R_gamma))
-        term_sigma = jsp.gammaln((N - m - r) / 2) - jnp.log(jnp.log10(R_sigma)) - ((N - m - r) / 2) * jnp.log(jnp.maximum((N * mean_square_data - m * mean_square_projection) / 2, 1e-15))
+        print(R_delta)
         
+        # Degrees of Freedom safety check
+        dof = jnp.maximum((N - m - r), 1.0)
+
+        # 2. Autodiff-Stable Projection Wrapper
         def ms_projection_wrapper(q):
-            f, a = q[:r], q[r:]
+            f = q[:r]
+            
+            # FIX 1: Use abs + epsilon instead of hard max(). 
+            # A hard max() breaks second derivatives (Hessians) at exactly zero.
+            a = jnp.abs(q[r:]) + 1e-10 
+            
             omega_l = f * 2 * jnp.pi
             decay_l = jnp.exp(-a[:, None] * t[None, :])
+            
             G_l = jnp.vstack((jnp.cos(omega_l[:, None] * t[None, :]) * decay_l, 
                               jnp.sin(omega_l[:, None] * t[None, :]) * decay_l))
-            vals, vecs = jnp.linalg.eigh(G_l @ G_l.T)
-            H_l = (vecs / jnp.sqrt(jnp.maximum(vals, 1e-4))[None, :]).T @ G_l
-            return jnp.sum((H_l @ d) ** 2) / m
+            
+            # FIX 2: Do NOT use eigh() inside a function destined for jax.hessian.
+            # Instead, calculate projection power via linear solve: d^T G^T (G G^T + ridge)^-1 G d
+            proj_d = G_l @ d
+            M = G_l @ G_l.T
+            
+            # Add Tikhonov regularization (ridge) to guarantee invertibility
+            ridge = jnp.eye(m) * 1e-6  
+            
+            # x = M^-1 * proj_d
+            x = jnp.linalg.solve(M + ridge, proj_d)
+            
+            # Projection power
+            return jnp.sum(x * proj_d) / m
 
+        # 3. Evaluate projection at optimal parameters
         q_combined = jnp.concatenate([jnp.array(model_frequencies), jnp.array(model_decay_rates)])
-        b_matrix = (-m / 2) * jax.hessian(ms_projection_wrapper)(q_combined)
+        ms_proj = ms_projection_wrapper(q_combined)
         
-        sign, logdet = jnp.linalg.slogdet(b_matrix + jnp.eye(2 * r) * 1e-7)
+        # 4. Stabilized Global Likelihood Terms
+        term_delta = (jsp.gammaln(m / 2) 
+                      - m * jnp.log(R_delta) 
+                      - (m / 2) * jnp.log(jnp.maximum(m * ms_proj / 2, 1e-12)))
+        
+        term_gamma = - (r * jnp.log(R_gamma))
+        
+        # Calculate Residual Sum of Squares (RSS), clamped safely
+        rss = jnp.maximum(N * mean_square_data - m * ms_proj, 1e-12)
+        
+        term_sigma = (jsp.gammaln(dof / 2) 
+                      - jnp.log(R_sigma) 
+                      - (dof / 2) * jnp.log(rss / 2))
+
+        # 5. Laplace Approximation (Ockham Factor)
+        raw_b_matrix = (-m / 2) * jax.hessian(ms_projection_wrapper)(q_combined)
+        
+        # FIX 3: Strip any floating-point NaNs that might squeak through
+        b_matrix = jnp.nan_to_num(raw_b_matrix, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+        # Calculate log determinant with a healthy amount of jitter
+        sign, logdet = jnp.linalg.slogdet(b_matrix + jnp.eye(m) * 1e-4)
+        
         logdet = jnp.where((sign > 0) & jnp.isfinite(logdet), logdet, 150.0)
         laplace_factor = (r * jnp.log(2 * jnp.pi)) - (0.5 * logdet)
 
+        # 6. Final Marginal Posterior Probability
         global_likelihood = term_delta + term_gamma + term_sigma + laplace_factor
 
+        print(global_likelihood, term_delta, term_gamma, term_sigma, laplace_factor)
+        
         return global_likelihood
     
 
@@ -305,7 +329,7 @@ class BATS():
         hessian = get_log_probability_hessian(current_q)
         hessian_diag = -np.diag(hessian)
         hessian_diag = np.where((hessian_diag > 0) & np.isfinite(hessian_diag), hessian_diag, 1e-6)
-        
+
         mass_matrix = np.array(hessian_diag)
 
         current_log_probability, log_probability_gradient = get_log_probability_gradient(current_q)
@@ -349,14 +373,14 @@ class BATS():
 
             burn_in_history[iteration] = [q[:functions], q[functions:], current_log_probability]
 
-            if iteration > B // 2:
-                available_burn_in_history = burn_in_history[:iteration]
-                frequencies, decay_rates, _ = zip(*available_burn_in_history)
-                samples = np.hstack([np.array(frequencies), np.array(decay_rates)])
-                scales = np.std(samples, axis=0)
-                scales = np.maximum(scales, np.abs(current_q) * 0.01)
+            # if iteration > B // 2:
+            #     available_burn_in_history = burn_in_history[:iteration]
+            #     frequencies, decay_rates, _ = zip(*available_burn_in_history)
+            #     samples = np.hstack([np.array(frequencies), np.array(decay_rates)])
+            #     scales = np.std(samples, axis=0)
+            #     scales = np.maximum(scales, np.abs(current_q) * 0.01)
                 
-                mass_matrix = 1.0 / (scales ** 2)
+            #     mass_matrix = 1.0 / (scales ** 2)
 
         print(f"Burn-in acceptance rate: {round(100 * acceptances / B, 4)}%")
 
@@ -472,7 +496,7 @@ class BATS():
         if functions is None:
             models = upper_bound_model_functions - lower_bound_model_functions + 1
 
-            histories = np.zeros(models, dtype=object)
+            histories = []
 
             for additional_functions in range(models):
                 print(f"\nNow creating a {lower_bound_model_functions + additional_functions}-function model!")
@@ -481,8 +505,9 @@ class BATS():
                 guess_frequencies = self.guess_frequencies[:(lower_bound_model_functions + additional_functions)]
                 guess_decay_rates = self.guess_decay_rates[:(lower_bound_model_functions + additional_functions)]
 
-                history = self.hamiltonian_monte_carlo(guess_frequencies, guess_decay_rates, B=1, M=1, L=1, epsilon=3e-9)
-                histories[additional_functions] = history
+                history = self.hamiltonian_monte_carlo(guess_frequencies, guess_decay_rates, B=10, M=10, L=30, epsilon=0.0003)
+
+                histories.append(history)
 
             global_likelihoods = np.zeros(models)
             SNRs = np.zeros(models)
@@ -512,6 +537,9 @@ class BATS():
                 print(f"{i + lower_bound_model_functions:<10} | {log_l:<18.2f} | {SNRs[i]:<12.2f} | {np.log(variances[i]):<12.2f} | {probs[i]:<12.4e}")
             print("-" * 77)
             print(f"The best model is the {best_index + lower_bound_model_functions}-frequency model!")
+
+            plt.plot(global_likelihoods)
+            plt.show()
 
         else:
             history = self.hamiltonian_monte_carlo(self.guess_frequencies, self.guess_decay_rates)

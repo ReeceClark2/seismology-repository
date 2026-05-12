@@ -6,7 +6,7 @@ import tqdm
 import pandas as pd
 from scipy import signal
 import math
-from BATS3 import BATS
+from BATS4 import BATS
 
 
 def get_synthetic_data(filename, minimum_frequency=None, maximum_frequency=None):
@@ -40,20 +40,15 @@ def get_synthetic_data(filename, minimum_frequency=None, maximum_frequency=None)
 def get_observed_data(network, station, channel, location, stream_index, start_time, end_time, minimum_frequency, maximum_frequency):
     client = Client('IRIS')
 
-    # Use obspy to retrieve data
     inventory = client.get_stations(network=network, station=station, location=location, channel=channel, starttime=start_time, endtime=end_time, level='response')
     stream = client.get_waveforms(network=network, station=station, location=location, channel=channel, starttime=start_time, endtime=end_time)
 
-    # Extract the specific trace
     trace = stream[stream_index]
 
-    # 1. Detrend FIRST. Removing response from data with a DC offset causes artifacts.
     trace.detrend('constant')
 
-    # 2. Remove instrument response and output as Acceleration (m/s^2)
     trace.remove_response(inventory=inventory, output="ACC")
 
-    # 3. Filter and decimate
     if minimum_frequency and maximum_frequency:
         trace.filter('bandpass', freqmin=minimum_frequency, freqmax=maximum_frequency)
         
@@ -62,15 +57,12 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.decimate(5, no_filter=False)
     trace.decimate(2, no_filter=False)
 
-    # Create accurate time array assuming evenly sampled data
     delta = trace.stats.delta 
     N = len(trace)
     t = np.arange(N) * delta
     
-    # Extract the data array
-    d = np.array(trace.data) 
+    d = np.array(trace.data)
 
-    # Trim the first 500 samples
     t = t[144:]
     d = d[144:]
 
@@ -96,4 +88,4 @@ t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
 
 
 model = BATS(t, d, minimum_frequency=minimum_frequency, maximum_frequency=maximum_frequency)
-model.run(lower_bound_model_functions=8, upper_bound_model_functions=12)
+model.run(lower_bound_model_functions=13, upper_bound_model_functions=25)
