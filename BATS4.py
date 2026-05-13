@@ -477,6 +477,7 @@ class BATS():
 
 
         print(f"Burn-in acceptance rate: {round(100 * acceptances / B, 4)}%")
+        burn_in_acceptance_rate = round(100 * acceptances / B, 4)
 
         typical_set_history = np.zeros(M, dtype=object)
         acceptances = 0
@@ -533,8 +534,9 @@ class BATS():
             typical_set_history[iteration] = [q[:r], q[r:], current_log_probability]
 
         print(f"Typical set acceptance rate: {round(100 * acceptances / M, 4)}%")
+        typical_set_acceptance_rate = round(100 * acceptances / M, 4)
 
-        return burn_in_history, typical_set_history
+        return burn_in_history, typical_set_history, burn_in_acceptance_rate, typical_set_acceptance_rate
 
 
     def run(self,
@@ -553,6 +555,9 @@ class BATS():
             # Initialize the history for each model
             histories = np.zeros(models, dtype=object)
 
+            burn_in_acceptance_rates = np.zeros(models)
+            typical_set_acceptance_rates = np.zeros(models)
+
             # Iterate through each model
             for additional_functions in range(models):
                 print(f"\nNow creating a {lower_bound_model_functions + additional_functions}-function model!")
@@ -562,10 +567,12 @@ class BATS():
                 guess_frequencies = self.guess_frequencies[:(lower_bound_model_functions + additional_functions)]
                 guess_decay_rates = self.guess_decay_rates[:(lower_bound_model_functions + additional_functions)]
 
-                _, history = self.hamiltonian_monte_carlo(guess_frequencies, guess_decay_rates, B=B, M=M, L=L, epsilon=epsilon)
+                _, history, burn_in_acceptance_rate, typical_set_acceptance_rate = self.hamiltonian_monte_carlo(guess_frequencies, guess_decay_rates, B=B, M=M, L=L, epsilon=epsilon)
 
                 # Save the model's history
                 histories[additional_functions] = history
+                burn_in_acceptance_rates[additional_functions] = burn_in_acceptance_rate
+                typical_set_acceptance_rates[additional_functions] = typical_set_acceptance_rate
 
             # Initialize the global likelihoods, SNRs, unceratinties, and variances
             global_likelihoods = np.zeros(models)
@@ -615,10 +622,10 @@ class BATS():
                 probs = exp_terms / np.nansum(exp_terms)
                 best_index = np.nanargmax(global_likelihoods)
                 
-                print(f"{'\nOrder (r)':<10} | {'Log-Likelihood':<18} | {'SNRs':<12} | {'Variance':<12} | {'Probability Weight':<12}", file=f)
+                print(f"{'\nOrder (r)':<10} | {'Log-Likelihood':<18} | {'SNRs':<12} | {'Variance':<12} | {'Probability Weight':<12} | {'B %':<12} | {'M %':<12}", file=f)
                 print("-" * 90, file=f)
                 for i, log_l in enumerate(global_likelihoods):
-                    print(f"{i + lower_bound_model_functions:<10} | {log_l:<18.2f} | {SNRs[i]:<12.2f} | {np.log(variances[i]):<12.2f} | {probs[i]:<12.4e}", file=f)
+                    print(f"{i + lower_bound_model_functions:<10} | {log_l:<18.2f} | {SNRs[i]:<12.2f} | {np.log(variances[i]):<12.2f} | {probs[i]:<12.4e} | {burn_in_acceptance_rates[i]:<12.4f} | {typical_set_acceptance_rates[i]:<12.4f}", file=f)
                 print("-" * 90, file=f)
                 print(f"The best model is the {best_index + lower_bound_model_functions}-frequency model!", file=f)
 
@@ -709,10 +716,10 @@ if __name__ == "__main__":
     file_path = f"timeseries_Russia/{network}_{station}_TS.ascii" 
 
     lower_bound_model_functions = 15
-    upper_bound_model_functions = 20
+    upper_bound_model_functions = 17
 
-    B = 1_000              # Number of burn-in samples
-    M = 2_000              # Number of typical set samples
+    B = 40              # Number of burn-in samples
+    M = 40              # Number of typical set samples
     L = 30                 # Number of Leapfrog integrations per sample
     epsilon = 0.003        # Step size of Leapfrog integrations
     
