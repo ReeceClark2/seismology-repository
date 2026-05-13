@@ -60,6 +60,7 @@ class BATS():
         if guess_decay_rates is None:
             # Calculate the decay rates from banding the guess frequencies individually in d
             self.guess_decay_rates = self.get_decay_rates(t, d, self.guess_frequencies)
+            self.guess_decay_rates = np.maximum(0, self.guess_decay_rates)
         else:
             self.guess_decay_rates = guess_decay_rates.tolist()
 
@@ -465,6 +466,7 @@ class BATS():
             # If the randomly drawn number is less than the criterion, then accept the new position
             if c < a:
                 current_q = q
+                current_q = np.maximum(0, current_q)
                 current_log_probability = proposal_log_probability
                 current_log_probability_gradient = proposal_log_probability_gradient
 
@@ -595,7 +597,7 @@ class BATS():
                     decay_uncert = parameter_uncertainties[r:]
 
                     print(f"\nDetails for {ind + lower_bound_model_functions}-frequency model:", file=f)
-                    print(f"{'Signal':<8} | {'Frequency ± Uncert':<28} | {'Decay Rate ± Uncert':<32}", file=f)
+                    print(f"{'Signal':<8} | {'Frequency ± Uncertainty':<28} | {'Decay Rate ± Uncertainty':<32}", file=f)
                     print("-" * 90, file=f)
                     
                     for i in range(r):
