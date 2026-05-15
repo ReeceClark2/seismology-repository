@@ -37,8 +37,8 @@ def get_synthetic_data(filename, minimum_frequency=None, maximum_frequency=None)
 
     d = signal.filtfilt(b, a, detrended)
 
-    t = t[144:]
-    d = d[144:]
+    # t = t[144:]
+    # d = d[144:]
 
     return t, d
 
@@ -190,6 +190,32 @@ def get_model_statistics(t, d, model_frequencies, model_decay_rates):
     return log_probability, SNR, estimated_noise_variance, parameter_uncertainties, h, H
 
 
+def get_fft(t, d, minimum_frequency=None, maximum_frequency=None):
+        # Find the sample rate
+        delta = np.mean(np.diff(t)) 
+
+        # Apply a window function
+        taper = signal.get_window(('kaiser', 2. * np.pi), len(d))
+        d = d * taper
+        
+        # Find the FFT
+        nfft = 2 ** (math.ceil(math.log(len(d), 2)) + 4)
+        frequencies = np.fft.fftfreq(n=nfft, d=delta)
+        power = np.fft.fft(d, n=nfft) * delta
+
+        # Mask the FFT to the specified frequency range
+        mask = np.ones_like(frequencies, dtype=bool)
+
+        if minimum_frequency is not None:
+            mask &= (frequencies >= minimum_frequency) 
+
+        if maximum_frequency is not None:
+            mask &= (frequencies <= maximum_frequency)
+
+        # Return the frequencies and powers with the mask
+        return frequencies[mask], power[mask]
+
+
 minimum_frequency = 0.0005     # Minimum frequency (Hz)
 maximum_frequency = 0.0012     # Maximum frequency (Hz)
 
@@ -204,48 +230,20 @@ end_time = UTCDateTime('2025-08-11T05:24:50')       # End time
 
 file_path = f"timeseries_Russia/{network}_{station}_TS.ascii" 
 
-# t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, minimum_frequency, maximum_frequency)
-t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
+t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, minimum_frequency, maximum_frequency)
+# t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
 # d = np.sin(2 * np.pi * 0.0011 * t) + np.sin(2 * np.pi * 0.0007 * t) + np.sin(2 * np.pi * 0.0009 * t)
 
 model_frequencies = [
-    0.0008140786,
-    0.0009426770,
-    0.0006482150,
-    0.0008411852,
-    0.0010399396,
-    0.0009442519,
-    0.0006450832,
-    0.0008385900,
-    0.0011071532,
-    0.0009364564,
-    0.0006808121,
-    0.0006439325,
-    0.0006788128,
-    0.0011746537,
-    0.0009404864,
-    0.0006777308,
-    0.0011031174
+    0.0008146543377901, 0.0009427651393473, 0.0009447533952135, 0.0006426282150699, 0.0006459406497157, 
+    0.0008395379785234, 0.0008423188720411, 0.0010396741910682, 0.0010364924080598, 0.0006460364750220, 
+    0.0006508961651642, 0.0006846456387499, 0.0006843798713934, 0.0006755903116709
 ]
 
 model_decay_rates = [
-    0.000000648184,
-    0.000005091962,
-    0.000007722001,
-    0.000008363178,
-    0.000009915547,
-    0.000004791010,
-    0.000006143168,
-    0.000007987602,
-    0.000010331854,
-    0.000006384915,
-    0.000008292969,
-    0.000007748250,
-    0.000006920229,
-    0.000013331732,
-    0.000005434136,
-   -0.000010440841,
-    0.000191079813
+    0.0000005084484921, 0.0000041179925748, 0.0000468724556667, 0.0000054184184974, 0.0000087759101338, 
+    0.0000043545628236, 0.0000082438151346, 0.0000121257909676, 0.0000142483803974, 0.0000214094131967, 
+    0.0000152861593340, 0.0000075731028185, 0.0000630123961435, 0.0000300282154905
 ]
 
 log_probability, SNR, estimated_noise_variance, parameter_uncertainties, h, H = get_model_statistics(t, d, model_frequencies, model_decay_rates)
@@ -254,25 +252,38 @@ model = np.zeros(len(t))
 for ind, _ in enumerate(h):
     model += h[ind] * H[ind]
 
-plt.figure(figsize=(10, 6))
+f, p = get_fft(t, d, minimum_frequency, maximum_frequency)
+f1, p1 = get_fft(t, d - model, minimum_frequency, maximum_frequency)
 
-# Plot the three series
-plt.plot(t, d, label='Data ($d$)', color='black', alpha=0.25, linewidth=1)
-plt.plot(t, model, label='Model', color='#d62728', linewidth=1.5)
-plt.plot(t, d - model, label='Residual ($d - model$)', color="#082e49", alpha=0.8, linewidth=1)
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
-# Axis labels with LaTeX formatting
-plt.xlabel("Time (s)", fontsize=11)
-plt.ylabel("Acceleration (m/s$^2$)", fontsize=11)
+# --- Left Plot: Time Series ---
+ax1.plot(t, d, label='Data ($d$)', color='black', alpha=0.25, linewidth=1)
+ax1.plot(t, model, label='Model', color="#082e49", linewidth=1.5)
+ax1.plot(t, d - model, label='Residual ($d - model$)', color='#d62728', alpha=0.8, linewidth=1)
 
-# Simplistic styling
-plt.grid(False) # Ensure no grid
-ax = plt.gca()
-ax.spines['top'].set_visible(False)
-ax.spines['right'].set_visible(False)
+ax1.set_xlabel("Time (s)", fontsize=11)
+ax1.set_ylabel("Acceleration (m/s$^2$)", fontsize=11)
+ax1.legend(frameon=False, loc='upper right')
 
-# Legend without a frame
-plt.legend(frameon=False, loc='upper right')
+# --- Right Plot: FFT ---
+ax2.plot(f, abs(p), color='black', linewidth=1, label='Data Power Spectrum')
+ax2.plot(f1, abs(p1), color='#d62728', linewidth=1, label='Residual Power Spectrum')
+
+# Add vertical lines for model frequencies
+for i, freq in enumerate(model_frequencies):
+    label = 'Model Frequencies' if i == 0 else None # Label only the first one for the legend
+    ax2.axvline(x=freq, color='#d62728', linestyle='--', alpha=0.5, linewidth=1, label=label)
+
+ax2.set_xlabel("Frequency (Hz)", fontsize=11)
+ax2.set_ylabel("Power", fontsize=11)
+ax2.legend(frameon=False, loc='upper right')
+
+# --- Shared Simplistic Styling ---
+for ax in [ax1, ax2]:
+    ax.grid(False)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
 
 plt.tight_layout()
 plt.show()
