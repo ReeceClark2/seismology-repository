@@ -173,19 +173,26 @@ class BATS():
                 self.f_init[len(f_init):] = f[len(f_init):self.signals]
         else:   
             f, p = self._get_fft()
-            f, _ = self._get_peaks(f, abs(p), limit=self.signals)
-            self.f_init = f
 
+        # Plot the combined FFT
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 6))
+        plt.plot(f, np.abs(p))
+        plt.title("Combined FFT (Full data ≤ 1.5 MHz, 40% data > 1.5 MHz)")
+        plt.xlabel("Frequency")
+        plt.ylabel("Magnitude")
+        plt.show()
+
+        f_peaks, _ = self._get_peaks(f, np.abs(p), limit=self.signals)
+        self.f_init = f_peaks
 
         if k_init:
             self.k_init = k_init
-
-            if len(k_init) < signals or len(k_init) < max_signals:
+            if len(k_init) < self.signals or len(k_init) < max_signals:
                 k = self._get_ks()
-
                 # If initial decay rates are specified, but do not fit the number of expected 
                 # decay rates, then finish populating them.
-                self.k_init[len(k_init):] = k[len(k_init):signals]
+                self.k_init[len(k_init):] = k[len(k_init):self.signals]
         else:
             self.k_init = self._get_ks()
 
@@ -209,6 +216,7 @@ class BATS():
                 self.f_bw = jnp.where(jnp.isnan(f_bw), max_f_uncertainty, f_bw)
             else:
                 self.f_bw = jnp.asarray(f_bw)
+                
             if k_bw is None:
                 k_bw = uncertainties[:len(self.k_init)]
                 self.k_bw = jnp.where(jnp.isnan(k_bw), max_k_uncertainty, k_bw)
@@ -222,7 +230,6 @@ class BATS():
         peaks in order of intensity in the dependent variable y. The number of returned 
         peaks can be specified with the "limit" variable.
         '''
-
         peak_indices, _ = signal.find_peaks(y)
 
         peak_x = x[peak_indices]
@@ -243,27 +250,42 @@ class BATS():
     def _get_fft(self):
         '''
         Helper function for finding the FFT of BATS's provided time series using a 
-        Kaiser window.
+        Kaiser window. Modified to splice low frequencies (<1.5MHz) from the full 
+        dataset with high frequencies (>1.5MHz) from the first 2/5ths of the dataset.
         '''
-
-        # Apply a window function
-        window = signal.get_window(('kaiser', 2. * np.pi), len(self.d))
-        d = self.d * window
+        # Define the cutoff frequency for 1.5 MHz 
+        # (Note: if self.sample_rate is in MHz instead of Hz, change this to 1.5)
+        cutoff_freq = 1.5e6 
         
-        # Find the FFT
+        # 1. Process the full dataset
+        window_full = signal.get_window(('kaiser', 2. * np.pi), len(self.d))
+        d_full = self.d * window_full
+        
+        # We define nfft based on the full dataset to maintain exact frequency bins
         nfft = 2 ** (math.ceil(math.log(len(self.d), 2)) + 2)
         fs = np.fft.fftfreq(n=nfft, d=self.sample_rate)
-        power = np.fft.fft(self.d, n=nfft) * self.sample_rate
+        power_full = np.fft.fft(d_full, n=nfft) * self.sample_rate
 
-        # Mask the FFT to the specified frequency range
+        # 2. Process the truncated dataset (first 2/5)
+        idx_2_5 = int(len(self.d) * 2 / 5)
+        d_trunc = self.d[:idx_2_5]
+        window_trunc = signal.get_window(('kaiser', 2. * np.pi), len(d_trunc))
+        d_trunc = d_trunc * window_trunc
+        
+        # Use the exact same nfft so the frequency bins (fs) match perfectly
+        power_trunc = np.fft.fft(d_trunc, n=nfft) * self.sample_rate
+
+        # 3. Splice the two sections together
+        # Use truncated data for absolute frequencies > 1.5MHz, full data otherwise
+        power_combined = np.where(np.abs(fs) > cutoff_freq, power_trunc, power_full)
+
+        # 4. Mask the final FFT to the specified global frequency range
         mask = np.ones_like(fs, dtype=bool)
-
         mask &= (fs >= self.min_f) 
         mask &= (fs <= self.max_f)
 
         # Return the fs and powers with the mask
-        return np.array(fs[mask]), np.array(power[mask])
-    
+        return np.array(fs[mask]), np.array(power_combined[mask])
 
     def _get_ks(self):
         '''
@@ -447,11 +469,9 @@ class BATS():
 
         samples = mcmc.get_samples()
 
-        last_state = mcmc.last_state
-        inv_mass_matrix = last_state.adapt_state.inverse_mass_matrix
-        mass_sqrt = last_state.adapt_state.mass_matrix_sqrt
-
-        print(inv_mass_matrix, mass_sqrt)
+        # last_state = mcmc.last_state
+        # inv_mass_matrix = last_state.adapt_state.inverse_mass_matrix
+        # mass_sqrt = last_state.adapt_state.mass_matrix_sqrt
 
         pe = mcmc.get_extra_fields()["potential_energy"]
         best_index = jnp.argmin(pe)

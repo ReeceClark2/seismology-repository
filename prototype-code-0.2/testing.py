@@ -52,21 +52,20 @@ def get_observed_data(network, station, channel, location, stream_index,
     trace.decimate(5, no_filter=False)
     trace.decimate(5, no_filter=False)
     trace.decimate(5, no_filter=False)
-    trace.decimate(2, no_filter=False)
 
 
     delta = trace.stats.delta
     N = len(trace)
     t = np.arange(N) * delta
     d = np.array(trace.data)
-    t = t[144:]
-    d = d[144:]
+    t = t[288:]
+    d = d[288:]
     return t, d
 
 
 
 min_f = 0.00025
-max_f = 0.00160
+max_f = 0.00300
 
 network = "IU"
 station = "KIP"
@@ -97,9 +96,8 @@ model = BATS(    t,
                  max_f=max_f,
                  k_type="linear",
 
-                 mode="global",
-                 min_signals=35,
-                 max_signals=36,
+                 mode="local",
+                 signals=30,
 
                  sampler="NUTS",
                  burn_in=1,
