@@ -5,7 +5,7 @@ from scipy.interpolate import griddata
 
 # 1. Load your data
 # Replace 'your_data.csv' with your actual filename
-df = pd.read_csv('BATS_model_results_17.csv')
+df = pd.read_csv('BATS_model_results_16.csv')
 
 # 1. Group by function, then find the row index of the max probability for each group
 best_indices = df.groupby('function')['probability'].idxmax()
@@ -22,14 +22,14 @@ for index, row in best_rows.iterrows():
     decay = row['decay_rate']
     prob = row['probability']
     
-    print(freq)
+    print(freq, ',')
 for index, row in best_rows.iterrows():
     func_id = int(row['function'])
     freq = row['frequency']
     decay = row['decay_rate']
     prob = row['probability']
     
-    print(decay)
+    print(decay, ',')
 
 # 2. Get a list of all unique function IDs
 function_ids = df['function'].unique()
@@ -51,7 +51,7 @@ for func_id in function_ids:
     grid_z = griddata((x, y), z, (grid_x, grid_y), method='linear')
     
     plt.figure(figsize=(8, 6))
-    heatmap = plt.contourf(grid_x, grid_y, grid_z, levels=50, cmap='viridis_r')
+    heatmap = plt.contourf(grid_x, grid_y, grid_z, levels=50, cmap='Blues')
     
     # 1. Overlay the sampling points
     plt.scatter(x, y, c='red', s=0.4, alpha=0.2, label='Samples')

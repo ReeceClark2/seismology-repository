@@ -56,7 +56,7 @@ class BATS():
             self.guess_frequencies, _ = self.get_peaks(f, abs(p))
             self.guess_frequencies = self.guess_frequencies.tolist()
         else:
-            self.guess_frequencies = guess_frequencies.tolist()
+            self.guess_frequencies = guess_frequencies
 
         if guess_decay_rates is None:
             # Calculate the decay rates from banding the guess frequencies individually in d
@@ -253,8 +253,8 @@ class BATS():
         mean_square_projection = (1 / m) * jnp.sum(h ** 2)
 
         # Define the ratios for integral limits of the three model variances 
-        R_delta = jnp.max(jnp.abs(d))                               # Amplitude variance scale
-        R_sigma = jnp.max(jnp.abs(d))                               # Noise variance scale
+        R_delta = 16.6355                           # Amplitude variance scale
+        R_sigma = 16.6355                        # Noise variance scale
         R_gamma = (0.5 / jnp.mean(jnp.diff(t))) * (t[-1] - t[0])    # Band width variance scale
 
         q = jnp.concatenate([jnp.array(model_frequencies), jnp.array(model_decay_rates)])
@@ -301,7 +301,7 @@ class BATS():
         factor = ((m / 2) * jnp.log(2 * jnp.pi)) - (0.5 * jnp.sum(jnp.log(eigenvalues))) - m * jnp.log(R_gamma)
         delta_term = (jsp.gammaln(m / 2))           - (jnp.log(2 * jnp.log(R_delta))) - (m / 2)           * jnp.log((m * mean_square_projection) / 2)
         sigma_term = (jsp.gammaln((N - m - r) / 2)) - (jnp.log(2 * jnp.log(R_sigma))) - ((N - m - r) / 2) * jnp.log((N * mean_square_data - m * mean_square_projection) / 2)
-        gamma_term = - (2 * r) * jnp.log(R_gamma)
+        gamma_term = - r * jnp.log(R_gamma)
 
         log_global_likelihood = delta_term + sigma_term + gamma_term + factor
 
@@ -736,8 +736,8 @@ if __name__ == "__main__":
 
 # -------------------------------------------------------------------------------
 
-    minimum_frequency = 0.0005       # Minimum frequency (Hz)
-    maximum_frequency = 0.0012       # Maximum frequency (Hz)
+    minimum_frequency = 0.00025       # Minimum frequency (Hz)
+    maximum_frequency = 0.00050       # Maximum frequency (Hz)
 
     network = "IU"                   # Network
     station = "KIP"                  # Station
@@ -751,13 +751,13 @@ if __name__ == "__main__":
     # File path may need to be changed depending on root directory
     file_path = f"timeseries_Russia/{network}_{station}_TS.ascii" 
 
-    lower_bound_model_functions = 17
-    upper_bound_model_functions = 17
+    lower_bound_model_functions = 14
+    upper_bound_model_functions = 14
 
-    B = 10                 # Number of burn-in samples
-    M = 500                 # Number of typical set samples
-    L = 30                    # Number of Leapfrog integrations per sample
-    epsilon = 0.005          # Step size of Leapfrog integrations
+    B = 1_000                 # Number of burn-in samples
+    M = 4_000                 # Number of typical set samples
+    L = 30                  # Number of Leapfrog integrations per sample
+    epsilon = 0.003         # Step size of Leapfrog integrations
     
     data = "synthetic"
 
@@ -771,5 +771,19 @@ if __name__ == "__main__":
     elif data == "synthetic":
         t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
 
-    model = BATS(t, d, minimum_frequency=minimum_frequency, maximum_frequency=maximum_frequency)
+    model = BATS(t, d, guess_frequencies=[  0.0003045019,
+                                            0.0003066781,
+                                            0.0003089431,
+                                            0.0003112822,
+                                            0.0003136809,
+                                            0.0004009226,
+                                            0.0004044749,
+                                            0.0004070251,
+                                            0.0004658832,
+                                            0.0004667200,
+                                            0.0004675568,
+                                            0.0004692303,
+                                            0.0004700670,
+                                            0.0004709037],
+    minimum_frequency=minimum_frequency, maximum_frequency=maximum_frequency)
     model.run(lower_bound_model_functions=lower_bound_model_functions, upper_bound_model_functions=upper_bound_model_functions, B=B, M=M, L=L, epsilon=epsilon)

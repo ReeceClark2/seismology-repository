@@ -37,8 +37,8 @@ def get_synthetic_data(filename, minimum_frequency=None, maximum_frequency=None)
 
     d = signal.filtfilt(b, a, detrended)
 
-    # t = t[144:]
-    # d = d[144:]
+    t = t[144:]
+    d = d[144:]
 
     return t, d
 
@@ -216,8 +216,8 @@ def get_fft(t, d, minimum_frequency=None, maximum_frequency=None):
         return frequencies[mask], power[mask]
 
 
-minimum_frequency = 0.0005     # Minimum frequency (Hz)
-maximum_frequency = 0.0012     # Maximum frequency (Hz)
+minimum_frequency = 0.00025     # Minimum frequency (Hz)
+maximum_frequency = 0.00050     # Maximum frequency (Hz)
 
 network = "IU"                  # Network
 station = "KIP"                 # Station
@@ -230,21 +230,43 @@ end_time = UTCDateTime('2025-08-11T05:24:50')       # End time
 
 file_path = f"timeseries_Russia/{network}_{station}_TS.ascii" 
 
-t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, minimum_frequency, maximum_frequency)
-# t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
+# t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, minimum_frequency, maximum_frequency)
+t, d = get_synthetic_data(file_path, minimum_frequency, maximum_frequency)
 # d = np.sin(2 * np.pi * 0.0011 * t) + np.sin(2 * np.pi * 0.0007 * t) + np.sin(2 * np.pi * 0.0009 * t)
 
-model_frequencies = [
-    0.0008146543377901, 0.0009427651393473, 0.0009447533952135, 0.0006426282150699, 0.0006459406497157, 
-    0.0008395379785234, 0.0008423188720411, 0.0010396741910682, 0.0010364924080598, 0.0006460364750220, 
-    0.0006508961651642, 0.0006846456387499, 0.0006843798713934, 0.0006755903116709
-]
+model_frequencies = [0.0003044994611961 ,
+0.0003066804035244 ,
+0.0003089341825538 ,
+0.0003112775019278 ,
+0.0003136883206003 ,
+0.0003762155398743 ,
+0.0003793960202441 ,
+0.0004008387465814 ,
+0.0004038590962333 ,
+0.0004072333674745 ,
+0.0004650169695755 ,
+0.00046626989846 ,
+0.0004673605089774 ,
+0.0004695084692237 ,
+0.0004704588943728 ,
+0.00047153228944877]
 
-model_decay_rates = [
-    0.0000005084484921, 0.0000041179925748, 0.0000468724556667, 0.0000054184184974, 0.0000087759101338, 
-    0.0000043545628236, 0.0000082438151346, 0.0000121257909676, 0.0000142483803974, 0.0000214094131967, 
-    0.0000152861593340, 0.0000075731028185, 0.0000630123961435, 0.0000300282154905
-]
+model_decay_rates = [1.9163084493039013e-06 ,
+1.922269689898142e-06 ,
+1.902217500042049e-06 ,
+1.9109182034289395e-06 ,
+1.8987269407241965e-06 ,
+# 5.57021306630348e-06 ,
+# 2.5183139895070952e-06 ,
+3.2176333675699853e-06 ,
+3.259493572574154e-06 ,
+3.236590157720355e-06 ,
+3.5131872501391622e-06 ,
+3.459689317620141e-06 ,
+3.479291493302834e-06 ,
+3.338413541946791e-06 ,
+3.305910390824854e-06 ,
+3.4746922183865285e-06]
 
 log_probability, SNR, estimated_noise_variance, parameter_uncertainties, h, H = get_model_statistics(t, d, model_frequencies, model_decay_rates)
 
