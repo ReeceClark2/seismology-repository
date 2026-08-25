@@ -174,15 +174,6 @@ class BATS():
         else:   
             f, p = self._get_fft()
 
-        # Plot the combined FFT
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        plt.plot(f, np.abs(p))
-        plt.title("Combined FFT (Full data ≤ 1.5 MHz, 40% data > 1.5 MHz)")
-        plt.xlabel("Frequency")
-        plt.ylabel("Magnitude")
-        plt.show()
-
         f_peaks, _ = self._get_peaks(f, np.abs(p), limit=self.signals)
         self.f_init = f_peaks
 
@@ -313,6 +304,10 @@ class BATS():
             peak_t = peak_t[valid_mask]
             peak_d = peak_d[valid_mask]
 
+            print(min_f, max_f)
+            plt.scatter(peak_t, np.log(peak_d))
+            plt.show()
+
             res = stats.linregress(np.array(peak_t), np.array(np.log(peak_d)))
 
             # Find the decay rate with linear regression in semilog space
@@ -434,12 +429,13 @@ class BATS():
         f_lo = fs - (self.std * f_bw)
         f_hi = fs + (self.std * f_bw)
 
-        k_lo = ks - (self.std * k_bw)
-        k_hi = ks + (self.std * k_bw)
+        print(ks, k_bw, self.std)
+        k_lo = jnp.array(ks) - (self.std * jnp.array(k_bw))
+        k_hi = jnp.array(ks) + (self.std * jnp.array(k_bw))
 
         k_lo = jnp.maximum(k_lo, 0)
         k_hi = jnp.maximum(k_hi, 1e-6)
-        k_init = jnp.maximum(ks, 1e-12)
+        k_init = jnp.maximum(jnp.array(ks), 1e-12)
 
         eps_f = 1e-6 * f_bw
         eps_k = 1e-6 * k_bw

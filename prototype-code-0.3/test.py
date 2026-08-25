@@ -10,7 +10,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import multiprocessing
 import numpy as np
-from BATS import BATS
+from dracula import Dracula
 import matplotlib.pyplot as plt
 
 
@@ -35,6 +35,25 @@ if __name__ == '__main__':
     fs = [4.3, 5.1, 8.7, 9.4, 9.4]
     ks = [0.03, 0.01, 0.015, 0.027, 0.0325]
 
-    model = BATS(t, d, min_f=0.2, max_f=13, mode="global", min_signals=3, max_signals=5, burn_in=1000, typical_set=2000, dense_mass=False, f_bw=[2,2,2,2,2], k_bw=[0.1,0.1,0.1,0.1,0.1])
-
-    model.launch()
+    print("Initializing Dracula...")
+    model = Dracula(t, d, fs, ks)
+    
+    try:
+        print("Dispatching workers...")
+        # Note: If this still crashes, modify your Dracula.dispatch() method 
+        # to include the 'sequential_debug=True' fallback loop I showed you 
+        # previously to catch the exact error.
+        results = model.dispatch(
+            workers=5, 
+            min_signals=3, 
+            max_signals=5, 
+            f_bw=4, 
+            k_bw=0.02
+        )
+        print("Run complete!")
+        print(results)
+        
+    except Exception as e:
+        import traceback
+        print("Caught a fatal error:")
+        traceback.print_exc()
