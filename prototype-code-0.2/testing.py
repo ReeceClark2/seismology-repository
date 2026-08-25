@@ -1,40 +1,113 @@
-import os
+import csv
+import math
+import time
 
-# 1. Force math backends (like NumPy/OpenBLAS) to single-thread 
-#    to prevent them from deadlocking inside worker processes.
-#    MUST be set before importing numpy!
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-import multiprocessing
 import numpy as np
+import pandas as pd
+from scipy import signal as sp_signal
+
+from obspy.core import UTCDateTime
+from obspy.clients.fdsn import Client
+
 from BATS import BATS
+
 import matplotlib.pyplot as plt
 
 
-if __name__ == '__main__':
-    # 2. Force fresh process creation instead of copying memory.
-    #    This prevents C-level segfaults in NumPy/SciPy during fork.
-    multiprocessing.set_start_method('spawn', force=True)
-    
-    print("Generating data...")
-    rng = np.random.default_rng()
+def get_synthetic_data(filename, min_f=None, max_f=None):
+    data = pd.read_csv(filename, sep=' ', header=None, encoding='ascii')
+    t = data.iloc[:, 0].values
+    d = data.iloc[:, 1].values
 
-    t = np.linspace(0, 1_000, 30_000)
-    e = rng.uniform(low=-1, high=1, size=30_000)
-    d = (2 * np.sin(2 * np.pi * 4 * t) * np.e ** (-0.010 * t) + 
-         3 * np.sin(2 * np.pi * 5 * t) * np.e ** (-0.005 * t) + 
-         4 * np.sin(2 * np.pi * 8.95 * t) * np.e ** (-0.020 * t) +
-         3 * np.sin(2 * np.pi * 9.05 * t) * np.e ** (-0.025 * t) + e)
+    delta = np.mean(np.diff(t))
+    fs = 1.0 / delta
+    nyquist = 0.5 * fs
+    low = min_f / nyquist
+    high = max_f / nyquist
 
-    plt.plot(t, d)
-    plt.show()
+    b, a = sp_signal.butter(4, [low, high], btype='band')
+    detrended = sp_signal.detrend(d)
+    d = sp_signal.filtfilt(b, a, detrended)
 
-    fs = [4.3, 5.1, 8.7, 9.4, 9.4]
-    ks = [0.03, 0.01, 0.015, 0.027, 0.0325]
+    t = t[288:]
+    d = d[1440:]
+    return t, d
 
-    model = BATS(t, d, min_f=0.2, max_f=13, mode="global", min_signals=3, max_signals=5, burn_in=1000, typical_set=2000, dense_mass=False, f_bw=[2,2,2,2,2], k_bw=[0.1,0.1,0.1,0.1,0.1])
 
-    model.launch()
+def get_observed_data(network, station, channel, location, stream_index,
+                      start_time, end_time, min_f, max_f):
+    client = Client('IRIS')
+    inventory = client.get_stations(network=network, station=station,
+                                    location=location, channel=channel,
+                                    starttime=start_time, endtime=end_time,
+                                    level='response')
+    stream = client.get_waveforms(network=network, station=station,
+                                  location=location, channel=channel,
+                                  starttime=start_time, endtime=end_time)
+    trace = stream[stream_index]
+    trace.detrend('constant')
+    trace.remove_response(inventory=inventory, output="ACC")
+    if min_f and max_f:
+        trace.filter('bandpass', freqmin=min_f, freqmax=max_f)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(2, no_filter=False)
+
+
+    delta = trace.stats.delta
+    N = len(trace)
+    t = np.arange(N) * delta
+    d = np.array(trace.data)
+    t = t[144:]
+    d = d[144:]
+    return t, d
+
+
+
+min_f = 0.00025
+max_f = 0.00160
+
+network = "IU"
+station = "KIP"
+channel = "LHZ"
+location = "00"
+
+stream_index = 0
+start_time = UTCDateTime('2025-07-31T06:24:50')
+end_time = UTCDateTime('2025-08-11T05:24:50')
+
+file_path = f"../timeseries-kamchatka/{network}_{station}_TS.ascii"
+
+data = "observed"
+
+if data == "observed":
+    t, d = get_observed_data(network, station, channel, location,
+                                stream_index, start_time, end_time,
+                                min_f, max_f)
+else:
+    t, d = get_synthetic_data(file_path, min_f, max_f)
+
+f_bw = 1e-4 * np.ones(50)
+k_bw = 1e-5 * np.ones(50)
+
+model = BATS(    t, 
+                 d, 
+                 min_f=min_f, 
+                 max_f=max_f,
+                 k_type="linear",
+
+                 mode="local",
+                 signals=35,
+
+                 sampler="NUTS",
+                 burn_in=500,
+                 typical_set=1_000,
+                 acceptance=0.8,
+                 dense_mass=True,
+                 boundaries=True,
+                 f_bw=f_bw,
+                 k_bw=k_bw,
+                 std=5)
+
+model.launch()

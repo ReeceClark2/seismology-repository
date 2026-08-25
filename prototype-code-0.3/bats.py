@@ -51,7 +51,7 @@ def bats_model(t, d, f_loc, f_scale, k_loc, k_scale):
     fs = numpyro.sample("fs", dist.Normal(f_loc, f_scale))
     
     # If ks represents decay or rate that must stay strictly non-negative,
-    # consider dist.TruncatedNormal(k_loc, k_scale, low=0.0)
+    # consider dist.TruncatedNormal(k_loc, k_scale, low=0.0)We
     ks = numpyro.sample("ks", dist.Normal(k_loc, k_scale))
     
     # Custom likelihood factor
