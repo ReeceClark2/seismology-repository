@@ -3,6 +3,8 @@ import os
 from colony import Colony, run_bats_worker
 import jax.numpy as jnp
 from bats import statistics
+import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
 
 
 class Dracula():
