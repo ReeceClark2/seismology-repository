@@ -44,6 +44,7 @@ results = model.dispatch(
     k_bw=1e-5,
     W=1000,             # NUTS warmup
     S=2000,             # NUTS samples
+    prior_n_std=5,      # TruncatedNormal walls at mean ± n_std * scale
     sort_signals=True,
     output_dir="dracula_output",
 )
@@ -53,6 +54,8 @@ print(n_stats.SNR, results.extras["output_dir"])
 ```
 
 `f_bw` and `k_bw` may be a single scalar (used for every mode) or an array aligned with `f_init` / `k_init`. If omitted, Colony defaults to `1e-3` and `1e-5`.
+
+Frequencies and decay rates are sampled from `TruncatedNormal` priors with hard walls at `mean ± prior_n_std * scale` (default 5). Decay rates are also truncated below at 0.
 
 NumPyro knobs can be passed as `**kwargs` without listing every sampler argument:
 

@@ -138,6 +138,9 @@ def positioned_tqdm(desc: str, position: int | None) -> Iterator[None]:
     import tqdm.auto
     import tqdm.std
 
+    tqdm.tqdm.monitor_interval = 0
+    tqdm.auto.tqdm.monitor_interval = 0
+
     original_std = tqdm.std.tqdm
     original_auto = tqdm.auto.tqdm
 
@@ -307,15 +310,23 @@ def bats_model(
     f_scale: jax.Array,
     k_loc: jax.Array,
     k_scale: jax.Array,
+    prior_n_std: float = 5.0,
 ) -> None:
-    # Gaussian priors centered at f_loc / k_loc
-    fs = numpyro.sample("fs", dist.Normal(f_loc, f_scale).to_event(1))
-    
-    # If ks represents decay or rate that must stay strictly non-negative,
-    # consider dist.TruncatedNormal(k_loc, k_scale, low=0.0)
-    ks = numpyro.sample("ks", dist.Normal(k_loc, k_scale).to_event(1))
-    
-    # Custom likelihood factor
+    n_std = jnp.asarray(prior_n_std, dtype=f_loc.dtype)
+    f_low = f_loc - n_std * f_scale
+    f_high = jnp.maximum(f_loc + n_std * f_scale, f_low + 1e-12)
+    k_low = jnp.maximum(0.0, k_loc - n_std * k_scale)
+    k_high = jnp.maximum(k_loc + n_std * k_scale, k_low + 1e-12)
+
+    fs = numpyro.sample(
+        "fs",
+        dist.TruncatedNormal(f_loc, f_scale, low=f_low, high=f_high).to_event(1),
+    )
+    ks = numpyro.sample(
+        "ks",
+        dist.TruncatedNormal(k_loc, k_scale, low=k_low, high=k_high).to_event(1),
+    )
+
     numpyro.factor("bretthorst", get_log_prob(t, d, fs, ks))
 
 
@@ -558,11 +569,14 @@ class BATS:
         seed: int = 0,
         progress_desc: str | None = None,
         progress_position: int | None = None,
+        prior_n_std: float = 5.0,
         **kwargs: Any,
     ) -> BATSResult:
         n = int(self.f_init.shape[0])
         f_bw = broadcast_bandwidth(f_bw, n, "f_bw")
         k_bw = broadcast_bandwidth(k_bw, n, "k_bw")
+        if prior_n_std <= 0:
+            raise ValueError(f"prior_n_std must be > 0, got {prior_n_std}")
 
         nuts_kwargs, mcmc_kwargs, run_kwargs = split_numpyro_kwargs(kwargs)
 
@@ -608,6 +622,7 @@ class BATS:
                 f_bw,
                 self.k_init,
                 k_bw,
+                prior_n_std,
                 extra_fields=extra_fields,
                 **run_kwargs,
             )
