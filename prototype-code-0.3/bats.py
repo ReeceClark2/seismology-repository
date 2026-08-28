@@ -50,6 +50,38 @@ def log_prob(t, d, fs, ks):
     return 0.5 * (m - N) * jnp.log(1.0 - ratio)
 
 
+@jax.jit
+def get_model(t, d, fs, ks):
+    omegas = fs * 2.0 * jnp.pi
+    
+    r = omegas.shape[0]
+    m = 2 * r
+    N = d.shape[0]
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    gram = G @ G.T
+
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+
+    # Bretthorst Eq. 3.6: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    model = jnp.zeros(len(H))
+    for ind, _ in enumerate(h):
+        model += h[ind] * H[ind]
+
+    return model
+
+
 def bats_model(t, d, f_loc, f_scale, k_loc, k_scale):
     # Gaussian priors centered at f_loc / k_loc
     fs = numpyro.sample("fs", dist.Normal(f_loc, f_scale).to_event(1))
