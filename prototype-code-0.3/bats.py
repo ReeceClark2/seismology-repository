@@ -75,7 +75,7 @@ def get_model(t, d, fs, ks):
     # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
-    model = jnp.zeros(len(H))
+    model = jnp.zeros(len(t))
     for ind, _ in enumerate(h):
         model += h[ind] * H[ind]
 
