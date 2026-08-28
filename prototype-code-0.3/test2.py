@@ -1,13 +1,11 @@
-from bats import statistics, log_prob
+from bats import get_statistics
 from dracula import Dracula
 
-import jax
 import jax.numpy as jnp
 from obspy.core import UTCDateTime
 from obspy.clients.fdsn import Client
 
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 def observed_data(network, 
@@ -99,73 +97,21 @@ if __name__ == "__main__":
 
     print("Statistics started...")
 
-    stats = statistics(t, d, fs, ks)
-    p_spec = stats[3]
+    stats = get_statistics(t, d, fs, ks)
+    print("Probability: ", stats.log_prob, "\nVariance: ", stats.variance, "\nSNR: ", stats.SNR)
 
-    print("Probability: ", stats[0], "\nVariance: ", stats[1], "\nSNR: ", stats[2])
+    model = Dracula(t, d, fs, ks)
+    results = model.dispatch(
+        f_per_worker=5,
+        min_signals=len(fs) - 5,
+        max_signals=len(fs),
+        f_bw=fs_unc,
+        k_bw=ks_unc,
+        W=1000,
+        S=2000,
+        max_cores=8,
+        sort_signals=True,
+        output_dir="dracula_output",
+    )
 
-    f, p = p_spec.T
-
-    f = jnp.array(f)
-    p = jnp.array(p)
-
-    find_p_idx = jax.vmap(lambda target: jnp.argmin(jnp.abs(f - target)))
-    p_idx = find_p_idx(jnp.array(fs))
-
-    ps = p[p_idx]
-
-    sort_order = jnp.argsort(ps)[::-1]
-    sort_fs = jnp.array(fs)[sort_order]
-    sort_ps = ps[sort_order]
-    sort_ks = jnp.array(ks)[sort_order]
-    sort_fs_unc = jnp.array(fs_unc)[sort_order]
-    sort_ks_unc = jnp.array(ks_unc)[sort_order]
-
-    # Get the indices that sort f in ascending order
-    sort_indices = jnp.argsort(f)
-
-    # Apply the sorting indices to both arrays
-    f_sorted = f[sort_indices]
-    p_sorted = p[sort_indices]
-
-    # Plot the newly sorted data
-    plt.plot(f_sorted, p_sorted)
-    plt.plot(sort_fs, sort_ps)
-    plt.scatter(f_sorted, p_sorted, s=5)
-    plt.ylabel("Power")
-    plt.xlabel("Frequency (Hz)")
-    plt.title("Spectral Power Density")
-    plt.show()
-
-    model = Dracula(t, 
-                    d, 
-                    sort_fs, 
-                    sort_ks)
-    results = model.dispatch(f_per_worker=5, 
-                             min_signals=len(fs) - 5, 
-                             max_signals=len(fs), 
-                             f_bw=sort_fs_unc, 
-                             k_bw=sort_ks_unc, 
-                             W=1000,
-                             S=2000,
-                             max_cores=8)
-
-    print(results)
-
-    fitted_f, fitted_p = results[0][3].T
-    print(fitted_f)
-
-    sort_indices = jnp.argsort(fitted_f)
-    fitted_f_sorted = fitted_f[sort_indices]
-    fitted_p_sorted = fitted_p[sort_indices]
-
-    plt.plot(f_sorted, p_sorted)
-    plt.scatter(f_sorted, p_sorted, s=5)
-
-    plt.plot(fitted_f_sorted, fitted_p_sorted)
-    plt.scatter(fitted_f_sorted, fitted_p_sorted, s=5)
-
-    plt.ylabel("Power")
-    plt.xlabel("Frequency (Hz)")
-    plt.title("Spectral Power Density")
-    plt.show()
+    print("Wrote outputs to", results.extras["output_dir"])
