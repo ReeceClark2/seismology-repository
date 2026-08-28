@@ -115,7 +115,9 @@ def get_model_statistics_and_powers(t, d, fs, ks):
         C = (1 / N) * np.abs(np.sum(d[None, :] * np.exp(1j * phase_arg), axis=1)) ** 2
         
         # Bayesian power profile evaluated over the localized grid
-        power_profile = (4 / m) * (sigma_sq + C) * np.sqrt(b_diagonal_sum / (2 * np.pi * sigma)) * np.exp((-b_diagonal_sum * (f - f_space)**2) / (2 * sigma**2))
+        power_profile = (4 / m) * 
+        (sigma_sq + C) * np.sqrt(b_diagonal_sum / (2 * np.pi * sigma)) * 
+        np.exp((-b_diagonal_sum * (f - f_space)**2) / (2 * sigma**2))
         
         # Extract the absolute peak power found within this localized space
         peak_power = np.max(power_profile)
