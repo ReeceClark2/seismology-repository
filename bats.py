@@ -243,13 +243,18 @@ def get_log_prob(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> ja
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
+    # Build the non-orthogonal model matrix G
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    gram = G @ G.T
+
+    # Compress the massive time dimension N using QR decomposition
+    Q, R = jnp.linalg.qr(G.T, mode='reduced')
+
+    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
+    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    eigenvalues = S ** 2
+    eigenvectors = U
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -279,13 +284,18 @@ def get_model(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> jax.A
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
+    # Build the non-orthogonal model matrix G
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    gram = G @ G.T
+
+    # Compress the massive time dimension N using QR decomposition
+    Q, R = jnp.linalg.qr(G.T, mode='reduced')
+
+    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
+    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    eigenvalues = S ** 2
+    eigenvectors = U
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -339,13 +349,18 @@ def get_statistics(
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
+    # Build the non-orthogonal model matrix G
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    gram = G @ G.T
+
+    # Compress the massive time dimension N using QR decomposition
+    Q, R = jnp.linalg.qr(G.T, mode='reduced')
+
+    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
+    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    eigenvalues = S ** 2
+    eigenvectors = U
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -406,23 +421,27 @@ def get_statistics(
         arg = omega[:, None] * t[None, :]
         decay = jnp.exp(-a[:, None] * t[None, :])
 
-        G = jnp.vstack((
-            jnp.cos(arg) * decay,
-            jnp.sin(arg) * decay
-        ))
+        # Build the non-orthogonal model matrix G
+        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
 
-        # G G^T
-        M = G @ G.T
+        # Compress the massive time dimension N using QR decomposition
+        Q, R = jnp.linalg.qr(G.T, mode='reduced')
+
+        # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
+        U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
 
         # Data projection
         proj_d = G @ d
 
         # Scale-dependent ridge for numerical stability
-        ridge = 1e-8 * jnp.trace(M) / M.shape[0]
-        M_reg = M + ridge * jnp.eye(M.shape[0])
+        # The trace of (G @ G.T) is exactly the sum of squared singular values
+        ridge = 1e-8 * jnp.sum(S ** 2) / G.shape[0]
 
-        # Solve M_reg x = G d
-        x = jnp.linalg.solve(M_reg, proj_d)
+        # Solve (G @ G.T + ridge * I) x = proj_d using SVD components
+        # x = U (S^2 + ridge * I)^-1 U^T proj_d
+        y = U.T @ proj_d
+        z = y / (S ** 2 + ridge)
+        x = U @ z
 
         # Projection power
         return jnp.dot(proj_d, x) / m
