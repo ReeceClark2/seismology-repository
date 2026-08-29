@@ -318,6 +318,7 @@ class Dracula:
         max_cores: int | None = None,
         sort_signals: bool = True,
         output_dir: str | os.PathLike[str] | None = None,
+        prior_n_std: float = 5.0,
         **kwargs: Any,
     ) -> DraculaResult:
         n_total = int(self.f_init.shape[0])
@@ -333,6 +334,8 @@ class Dracula:
             )
         if f_per_worker < 1:
             raise ValueError(f"f_per_worker must be >= 1, got {f_per_worker}")
+        if prior_n_std <= 0:
+            raise ValueError(f"prior_n_std must be > 0, got {prior_n_std}")
 
         f_work, k_work, f_bw_work, k_bw_work, sort_extras = self._prepare_signals(
             f_bw, k_bw, sort_signals
@@ -378,6 +381,7 @@ class Dracula:
                 W=W,
                 S=S,
                 n_signals=signals,
+                prior_n_std=prior_n_std,
                 nuts_kwargs=nuts_kwargs,
                 mcmc_kwargs=mcmc_kwargs,
                 run_kwargs=run_kwargs,
@@ -412,29 +416,28 @@ class Dracula:
             else:
                 final_results[signals] = combined
 
-        with multiprocessing.Manager() as manager:
-            progress_slots = manager.Queue()
-            for slot in range(max_cores):
-                progress_slots.put(slot)
-            tqdm_lock = manager.RLock()
-            try:
-                tqdm.set_lock(tqdm_lock)
-            except Exception:
-                pass
+        tqdm.monitor_interval = 0
+        ctx = multiprocessing.get_context("spawn")
+        tqdm_lock = ctx.RLock()
+        try:
+            tqdm.set_lock(tqdm_lock)
+        except Exception:
+            pass
 
-            pipeline = tqdm(
-                total=n_models,
-                desc="Dracula",
-                position=0,
-                leave=True,
-                dynamic_ncols=True,
-                unit="job",
-            )
+        pipeline = tqdm(
+            total=n_models,
+            desc="Dracula",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            unit="job",
+        )
 
+        try:
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=max_cores,
                 initializer=init_parallel_worker,
-                initargs=(tqdm_lock, progress_slots),
+                initargs=(tqdm_lock, max_cores),
             ) as executor:
 
                 for _ in range(min(max_cores, n_models)):
@@ -498,8 +501,8 @@ class Dracula:
                                 if remaining is not None:
                                     tasks_remaining[signals] = remaining - 1
                                 launch_stats_if_ready(executor, signals)
-
-                pipeline.close()
+        finally:
+            pipeline.close()
 
         out_path = _resolve_output_dir(output_dir)
         _write_outputs(
@@ -516,6 +519,7 @@ class Dracula:
             "output_dir": str(out_path),
             "f_init": f_work,
             "k_init": k_work,
+            "prior_n_std": prior_n_std,
         }
 
         return DraculaResult(

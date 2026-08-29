@@ -1,0 +1,14 @@
+name: bats
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - tqdm
+  - jax
+  - jaxlib
+  - numpyro
+  - obspy
