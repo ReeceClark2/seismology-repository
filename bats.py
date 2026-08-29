@@ -246,18 +246,13 @@ def get_log_prob(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> ja
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G
+    # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-
-    # Compress the massive time dimension N using QR decomposition
-    Q, R = jnp.linalg.qr(G.T, mode='reduced')
-
-    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
-    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
+    gram = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues = S ** 2
-    eigenvectors = U
+    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -287,18 +282,13 @@ def get_model(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> jax.A
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G
+    # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-
-    # Compress the massive time dimension N using QR decomposition
-    Q, R = jnp.linalg.qr(G.T, mode='reduced')
-
-    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
-    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
+    gram = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues = S ** 2
-    eigenvectors = U
+    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
