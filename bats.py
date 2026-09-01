@@ -218,6 +218,7 @@ class StatisticsResult:
     SNR: jax.Array
     p_spec: jax.Array
     glob_LL: jax.Array
+    cov_mat: jax.Array
     fs: jax.Array
     ks: jax.Array
     f_unc: jax.Array
@@ -288,17 +289,14 @@ def get_model(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> jax.A
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-19)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     
     # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
-
-    model = jnp.zeros(len(t))
-    for ind, _ in enumerate(h):
-        model += h[ind] * H[ind]
+    model = h @ H
 
     return model
 
@@ -393,10 +391,13 @@ def get_statistics(
         return get_log_prob(t, d, q[:r], q[r:])
 
     q = jnp.concatenate((jnp.asarray(fs), jnp.asarray(ks)))
+
     log_prob_hessian = jax.jit(jax.hessian(log_prob_wrapper))(q)
     b_unc = (-m / 2.0) * log_prob_hessian
+
     evals_unc, evecs_unc = jnp.linalg.eigh(b_unc)
     evals_unc = jnp.maximum(evals_unc, 1e-8)
+
     param_unc = jnp.sqrt(
         jnp.maximum(variance, 0.0) * jnp.sum((evecs_unc ** 2) / evals_unc, axis=1)
     )
@@ -501,7 +502,7 @@ def get_statistics(
 
     b = (-m / 2.0) * hessian
     eigenvalues, _ = jnp.linalg.eigh(b)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-8)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
 
     factor = ((m / 2.0) * jnp.log(2.0 * jnp.pi)
                         - 0.5 * jnp.sum(jnp.log(eigenvalues))
@@ -516,12 +517,19 @@ def get_statistics(
 
     glob_LL = delta_term + sigma_term + gamma_term + factor
 
+    # Covariance Matrix -------------------------------------------
+
+    inv_b_unc = (evecs_unc / evals_unc) @ evecs_unc.T
+    
+    cov_mat = (m / 2.0) * inv_b_unc
+
     return StatisticsResult(
         log_prob=log_prob,
         variance=variance,
         SNR=SNR,
         p_spec=p_spec,
         glob_LL=glob_LL,
+        cov_mat=cov_mat,
         fs=fs,
         ks=ks,
         f_unc=f_unc,
