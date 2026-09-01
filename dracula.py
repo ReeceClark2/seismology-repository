@@ -319,6 +319,7 @@ class Dracula:
         sort_signals: bool = True,
         output_dir: str | os.PathLike[str] | None = None,
         prior_n_std: float = 5.0,
+        unbounded: bool = False,
         **kwargs: Any,
     ) -> DraculaResult:
         n_total = int(self.f_init.shape[0])
@@ -382,6 +383,7 @@ class Dracula:
                 S=S,
                 n_signals=signals,
                 prior_n_std=prior_n_std,
+                unbounded=unbounded,
                 nuts_kwargs=nuts_kwargs,
                 mcmc_kwargs=mcmc_kwargs,
                 run_kwargs=run_kwargs,
@@ -520,6 +522,7 @@ class Dracula:
             "f_init": f_work,
             "k_init": k_work,
             "prior_n_std": prior_n_std,
+            "unbounded": unbounded,
         }
 
         return DraculaResult(

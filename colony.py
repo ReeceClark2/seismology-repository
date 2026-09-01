@@ -74,6 +74,7 @@ class BATSTask:
     freq_lo: int = 1
     freq_hi: int = 1
     prior_n_std: float = 5.0
+    unbounded: bool = False
 
 
 @dataclass
@@ -90,6 +91,7 @@ class ColonyJob:
     S: int
     n_signals: int
     prior_n_std: float = 5.0
+    unbounded: bool = False
     nuts_kwargs: dict[str, Any] = field(default_factory=dict)
     mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
     run_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -104,6 +106,7 @@ def run_colony_worker(job: ColonyJob) -> tuple[int, list[BATSTask]]:
         job.W,
         job.S,
         prior_n_std=job.prior_n_std,
+        unbounded=job.unbounded,
         nuts_kwargs=job.nuts_kwargs,
         mcmc_kwargs=job.mcmc_kwargs,
         run_kwargs=job.run_kwargs,
@@ -128,6 +131,7 @@ def run_bats_worker(task: BATSTask) -> BATSResult:
             progress_desc=desc,
             progress_position=slot + 1,
             prior_n_std=task.prior_n_std,
+            unbounded=task.unbounded,
             nuts_kwargs=task.nuts_kwargs,
             mcmc_kwargs=task.mcmc_kwargs,
             run_kwargs=task.run_kwargs,
@@ -208,6 +212,7 @@ class Colony:
         W: int = 1_000,
         S: int = 2_000,
         prior_n_std: float = 5.0,
+        unbounded: bool = False,
         **kwargs: Any,
     ) -> list[BATSTask]:
         n = int(self.f_init.shape[0])
@@ -277,6 +282,7 @@ class Colony:
                     freq_lo=start + 1,
                     freq_hi=end,
                     prior_n_std=prior_n_std,
+                    unbounded=unbounded,
                 )
             )
 
