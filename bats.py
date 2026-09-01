@@ -312,24 +312,25 @@ def bats_model(
     prior_n_std: float = 5.0,
     unbounded: bool = False,
 ) -> None:
+
+    n_std = jnp.asarray(prior_n_std, dtype=f_loc.dtype)
+    
+    f_low = f_loc - n_std * f_scale
+    f_high = jnp.maximum(f_loc + n_std * f_scale, f_low + 1e-12)
+
+    k_low = jnp.maximum(0.0, k_loc - n_std * k_scale)
+    k_high = jnp.maximum(k_loc + n_std * k_scale, k_low + 1e-12)
     
     if unbounded:
         fs = numpyro.sample(
             "fs",
-            dist.ImproperUniform(constraints.real, (), event_shape=f_loc.shape)
+            dist.Uniform(f_low, f_high).to_event(1),
         )
         ks = numpyro.sample(
             "ks",
-            dist.ImproperUniform(constraints.positive, (), event_shape=k_loc.shape)
+            dist.Uniform(k_low, k_high).to_event(1),
         )
     else:
-        # Standard bounded Gaussian priors
-        n_std = jnp.asarray(prior_n_std, dtype=f_loc.dtype)
-        f_low = f_loc - n_std * f_scale
-        f_high = jnp.maximum(f_loc + n_std * f_scale, f_low + 1e-12)
-        k_low = jnp.maximum(0.0, k_loc - n_std * k_scale)
-        k_high = jnp.maximum(k_loc + n_std * k_scale, k_low + 1e-12)
-
         fs = numpyro.sample(
             "fs",
             dist.TruncatedNormal(f_loc, f_scale, low=f_low, high=f_high).to_event(1),
