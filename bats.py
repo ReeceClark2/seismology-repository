@@ -413,41 +413,42 @@ def get_statistics(
         return (1 / N) * jnp.abs(jnp.sum(d * jnp.exp(1j * phase))) ** 2
 
     C = jax.lax.map(compute_C_single, f_space)
-    
+
+    @jax.remat
     def ms_projection_wrapper(q):
         f = q[:r]
         a = q[r:]  # decay rates; assumed positive
 
         omega = 2.0 * jnp.pi * f
-
         arg = omega[:, None] * t[None, :]
         decay = jnp.exp(-a[:, None] * t[None, :])
 
-        # Build the non-orthogonal model matrix G
+        # Build the non-orthogonal model matrix G (m x N)
         G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
 
-        # Compress the massive time dimension N using QR decomposition
-        Q, R = jnp.linalg.qr(G.T, mode='reduced')
+        # 1. Compress N immediately using primitive dot products
+        # JAX autodiff handles this with near-zero memory overhead
+        proj_d = G @ d         # shape: (m,)
+        M = G @ G.T            # shape: (m, m)
 
-        # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
-        U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
+        # 2. Eigendecomposition on the tiny m x m matrix
+        # This is mathematically identical to S**2 and U from your SVD(R.T)
+        eigenvalues, eigenvectors = jnp.linalg.eigh(M)
 
-        # Data projection
-        proj_d = G @ d
+        # 3. Scale-dependent ridge for numerical stability
+        ridge = 1e-8 * jnp.sum(eigenvalues) / M.shape[0]
 
-        # Scale-dependent ridge for numerical stability
-        # The trace of (G @ G.T) is exactly the sum of squared singular values
-        ridge = 1e-8 * jnp.sum(S ** 2) / G.shape[0]
-
-        # Solve (G @ G.T + ridge * I) x = proj_d using SVD components
-        # x = U (S^2 + ridge * I)^-1 U^T proj_d
-        y = U.T @ proj_d
-        z = y / (S ** 2 + ridge)
-        x = U @ z
+        # 4. Solve the regularized system
+        # y = eigenvectors.T @ proj_d
+        # z = y / (eigenvalues + ridge)
+        # x = eigenvectors @ z
+        y = eigenvectors.T @ proj_d
+        z = y / (eigenvalues + ridge)
+        x = eigenvectors @ z
 
         # Projection power
         return jnp.dot(proj_d, x) / m
-
+    
     hessian = jax.jit(
         jax.hessian(ms_projection_wrapper)
     )(q)
