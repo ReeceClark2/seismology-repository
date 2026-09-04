@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+<<<<<<< HEAD
+=======
 import multiprocessing
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +22,19 @@ from bats import (
     split_numpyro_kwargs,
 )
 
+<<<<<<< HEAD
+_PROGRESS_SLOTS: Any = None
+
+
+def init_parallel_worker(tqdm_lock: Any, progress_slots: Any) -> None:
+    """Initializer for process-pool workers: tqdm lock + reusable bar rows."""
+    global _PROGRESS_SLOTS
+    _PROGRESS_SLOTS = progress_slots
+    try:
+        from tqdm.auto import tqdm
+
+        tqdm.set_lock(tqdm_lock)
+=======
 _PROGRESS_MAX: int = 1
 
 
@@ -36,11 +52,22 @@ def init_parallel_worker(tqdm_lock: Any, max_cores: int) -> None:
         if tqdm_lock is not None:
             tqdm.tqdm.set_lock(tqdm_lock)
             tqdm_auto.set_lock(tqdm_lock)
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
     except Exception:
         pass
 
 
 def acquire_progress_slot() -> int:
+<<<<<<< HEAD
+    if _PROGRESS_SLOTS is None:
+        return 0
+    return int(_PROGRESS_SLOTS.get())
+
+
+def release_progress_slot(position: int) -> None:
+    if _PROGRESS_SLOTS is not None:
+        _PROGRESS_SLOTS.put(position)
+=======
     ident = multiprocessing.current_process()._identity
     if ident:
         return int(ident[0] - 1) % _PROGRESS_MAX
@@ -49,6 +76,7 @@ def acquire_progress_slot() -> int:
 
 def release_progress_slot(position: int) -> None:
     return
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
 
 
 @dataclass
@@ -73,8 +101,10 @@ class BATSTask:
     n_signals: int = 0
     freq_lo: int = 1
     freq_hi: int = 1
+<<<<<<< HEAD
+=======
     prior_n_std: float = 5.0
-    unbounded: bool = False
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
 
 
 @dataclass
@@ -90,8 +120,10 @@ class ColonyJob:
     W: int
     S: int
     n_signals: int
+<<<<<<< HEAD
+=======
     prior_n_std: float = 5.0
-    unbounded: bool = False
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
     nuts_kwargs: dict[str, Any] = field(default_factory=dict)
     mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
     run_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -105,8 +137,10 @@ def run_colony_worker(job: ColonyJob) -> tuple[int, list[BATSTask]]:
         job.k_bw,
         job.W,
         job.S,
+<<<<<<< HEAD
+=======
         prior_n_std=job.prior_n_std,
-        unbounded=job.unbounded,
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
         nuts_kwargs=job.nuts_kwargs,
         mcmc_kwargs=job.mcmc_kwargs,
         run_kwargs=job.run_kwargs,
@@ -130,8 +164,10 @@ def run_bats_worker(task: BATSTask) -> BATSResult:
             task.seed,
             progress_desc=desc,
             progress_position=slot + 1,
+<<<<<<< HEAD
+=======
             prior_n_std=task.prior_n_std,
-            unbounded=task.unbounded,
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
             nuts_kwargs=task.nuts_kwargs,
             mcmc_kwargs=task.mcmc_kwargs,
             run_kwargs=task.run_kwargs,
@@ -211,8 +247,10 @@ class Colony:
         k_bw: float | ArrayLike | None = None,
         W: int = 1_000,
         S: int = 2_000,
+<<<<<<< HEAD
+=======
         prior_n_std: float = 5.0,
-        unbounded: bool = False,
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
         **kwargs: Any,
     ) -> list[BATSTask]:
         n = int(self.f_init.shape[0])
@@ -223,8 +261,11 @@ class Colony:
             f_bw = 1e-3
         if k_bw is None:
             k_bw = 1e-5
+<<<<<<< HEAD
+=======
         if prior_n_std <= 0:
             raise ValueError(f"prior_n_std must be > 0, got {prior_n_std}")
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
 
         f_bw = broadcast_bandwidth(f_bw, n, "f_bw")[self._order]
         k_bw = broadcast_bandwidth(k_bw, n, "k_bw")[self._order]
@@ -281,8 +322,10 @@ class Colony:
                     n_signals=n,
                     freq_lo=start + 1,
                     freq_hi=end,
+<<<<<<< HEAD
+=======
                     prior_n_std=prior_n_std,
-                    unbounded=unbounded,
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
                 )
             )
 
