@@ -63,10 +63,10 @@ if __name__ == "__main__":
     
     # Time frame covering background + event
     start_time = UTCDateTime('2025-07-31T06:24:50')
-    end_time = UTCDateTime('2025-08-3T05:24:50')
+    end_time = UTCDateTime('2025-08-6T05:24:50')
 
-    min_f=0.002695
-    max_f=0.002745
+    min_f=0.000780
+    max_f=0.000830
 
     t, d = observed_data(network, 
                          station, 
@@ -80,8 +80,8 @@ if __name__ == "__main__":
 
     bats = BATS(t, d, [0,1], [2,3])
     result = bats.run_grid_search(
-        min_f=0.002695,
-        max_f=0.002745,
+        min_f=0.000780,
+        max_f=0.000830,
         min_k=1e-5,
         max_k=6e-5,
         f_points=500,
@@ -110,13 +110,13 @@ if __name__ == "__main__":
     model = Dracula(
         t,
         d,
-        sorted_fs[:5][::-1],
-        sorted_ks[:5][::-1], 
+        sorted_fs[::-1],
+        sorted_ks[::-1], 
     )
     model.dispatch(
         f_per_worker=5,
         min_signals=1,
-        max_signals=5,
+        max_signals=len(sorted_fs),
         f_bw=0.000015,
         k_bw=3e-5,
         W=1_000,
