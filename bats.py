@@ -17,7 +17,6 @@ from numpy.typing import ArrayLike
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.distributions import constraints
 from numpyro.infer import MCMC, NUTS, init_to_value
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -139,9 +138,12 @@ def positioned_tqdm(desc: str, position: int | None) -> Iterator[None]:
     import tqdm.auto
     import tqdm.std
 
+<<<<<<< HEAD
+=======
     tqdm.tqdm.monitor_interval = 0
     tqdm.auto.tqdm.monitor_interval = 0
 
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
     original_std = tqdm.std.tqdm
     original_auto = tqdm.auto.tqdm
 
@@ -219,7 +221,6 @@ class StatisticsResult:
     SNR: jax.Array
     p_spec: jax.Array
     glob_LL: jax.Array
-    cov_mat: jax.Array
     fs: jax.Array
     ks: jax.Array
     f_unc: jax.Array
@@ -268,10 +269,9 @@ def get_log_prob(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> ja
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
-    ratio = sum_sq_proj / jnp.maximum(sum_sq_data, 1e-30)
-    ratio = jnp.clip(ratio, 0.0, 1.0 - 1e-12)
-
-    return 0.5 * (m - N) * jnp.log1p(-ratio)
+    ratio = sum_sq_proj / sum_sq_data
+    
+    return 0.5 * (m - N) * jnp.log(1.0 - ratio)
 
 
 @jax.jit
@@ -291,14 +291,17 @@ def get_model(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> jax.A
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-19)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     
     # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
-    model = h @ H
+
+    model = jnp.zeros(len(t))
+    for ind, _ in enumerate(h):
+        model += h[ind] * H[ind]
 
     return model
 
@@ -310,37 +313,35 @@ def bats_model(
     f_scale: jax.Array,
     k_loc: jax.Array,
     k_scale: jax.Array,
-    prior_n_std: float = 5.0,
-    unbounded: bool = False,
+<<<<<<< HEAD
 ) -> None:
-
-    n_std = jnp.asarray(prior_n_std, dtype=f_loc.dtype)
+    # Gaussian priors centered at f_loc / k_loc
+    fs = numpyro.sample("fs", dist.Normal(f_loc, f_scale).to_event(1))
     
+    # If ks represents decay or rate that must stay strictly non-negative,
+    # consider dist.TruncatedNormal(k_loc, k_scale, low=0.0)
+    ks = numpyro.sample("ks", dist.Normal(k_loc, k_scale).to_event(1))
+    
+    # Custom likelihood factor
+=======
+    prior_n_std: float = 5.0,
+) -> None:
+    n_std = jnp.asarray(prior_n_std, dtype=f_loc.dtype)
     f_low = f_loc - n_std * f_scale
     f_high = jnp.maximum(f_loc + n_std * f_scale, f_low + 1e-12)
-
     k_low = jnp.maximum(0.0, k_loc - n_std * k_scale)
     k_high = jnp.maximum(k_loc + n_std * k_scale, k_low + 1e-12)
-    
-    if unbounded:
-        fs = numpyro.sample(
-            "fs",
-            dist.Uniform(f_low, f_high).to_event(1),
-        )
-        ks = numpyro.sample(
-            "ks",
-            dist.Uniform(k_low, k_high).to_event(1),
-        )
-    else:
-        fs = numpyro.sample(
-            "fs",
-            dist.TruncatedNormal(f_loc, f_scale, low=f_low, high=f_high).to_event(1),
-        )
-        ks = numpyro.sample(
-            "ks",
-            dist.TruncatedNormal(k_loc, k_scale, low=k_low, high=k_high).to_event(1),
-        )
 
+    fs = numpyro.sample(
+        "fs",
+        dist.TruncatedNormal(f_loc, f_scale, low=f_low, high=f_high).to_event(1),
+    )
+    ks = numpyro.sample(
+        "ks",
+        dist.TruncatedNormal(k_loc, k_scale, low=k_low, high=k_high).to_event(1),
+    )
+
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
     numpyro.factor("bretthorst", get_log_prob(t, d, fs, ks))
 
 
@@ -364,18 +365,13 @@ def get_statistics(
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G
+    # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-
-    # Compress the massive time dimension N using QR decomposition
-    Q, R = jnp.linalg.qr(G.T, mode='reduced')
-
-    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
-    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
+    gram = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues = S ** 2
-    eigenvectors = U
+    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -407,13 +403,10 @@ def get_statistics(
         return get_log_prob(t, d, q[:r], q[r:])
 
     q = jnp.concatenate((jnp.asarray(fs), jnp.asarray(ks)))
-
     log_prob_hessian = jax.jit(jax.hessian(log_prob_wrapper))(q)
     b_unc = (-m / 2.0) * log_prob_hessian
-
     evals_unc, evecs_unc = jnp.linalg.eigh(b_unc)
     evals_unc = jnp.maximum(evals_unc, 1e-8)
-
     param_unc = jnp.sqrt(
         jnp.maximum(variance, 0.0) * jnp.sum((evecs_unc ** 2) / evals_unc, axis=1)
     )
@@ -429,42 +422,37 @@ def get_statistics(
         return (1 / N) * jnp.abs(jnp.sum(d * jnp.exp(1j * phase))) ** 2
 
     C = jax.lax.map(compute_C_single, f_space)
-
-    @jax.remat
+    
     def ms_projection_wrapper(q):
         f = q[:r]
         a = q[r:]  # decay rates; assumed positive
 
         omega = 2.0 * jnp.pi * f
+
         arg = omega[:, None] * t[None, :]
         decay = jnp.exp(-a[:, None] * t[None, :])
 
-        # Build the non-orthogonal model matrix G (m x N)
-        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+        G = jnp.vstack((
+            jnp.cos(arg) * decay,
+            jnp.sin(arg) * decay
+        ))
 
-        # 1. Compress N immediately using primitive dot products
-        # JAX autodiff handles this with near-zero memory overhead
-        proj_d = G @ d         # shape: (m,)
-        M = G @ G.T            # shape: (m, m)
+        # G G^T
+        M = G @ G.T
 
-        # 2. Eigendecomposition on the tiny m x m matrix
-        # This is mathematically identical to S**2 and U from your SVD(R.T)
-        eigenvalues, eigenvectors = jnp.linalg.eigh(M)
+        # Data projection
+        proj_d = G @ d
 
-        # 3. Scale-dependent ridge for numerical stability
-        ridge = 1e-8 * jnp.sum(eigenvalues) / M.shape[0]
+        # Scale-dependent ridge for numerical stability
+        ridge = 1e-8 * jnp.trace(M) / M.shape[0]
+        M_reg = M + ridge * jnp.eye(M.shape[0])
 
-        # 4. Solve the regularized system
-        # y = eigenvectors.T @ proj_d
-        # z = y / (eigenvalues + ridge)
-        # x = eigenvectors @ z
-        y = eigenvectors.T @ proj_d
-        z = y / (eigenvalues + ridge)
-        x = eigenvectors @ z
+        # Solve M_reg x = G d
+        x = jnp.linalg.solve(M_reg, proj_d)
 
         # Projection power
         return jnp.dot(proj_d, x) / m
-    
+
     hessian = jax.jit(
         jax.hessian(ms_projection_wrapper)
     )(q)
@@ -519,7 +507,7 @@ def get_statistics(
 
     b = (-m / 2.0) * hessian
     eigenvalues, _ = jnp.linalg.eigh(b)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-8)
 
     factor = ((m / 2.0) * jnp.log(2.0 * jnp.pi)
                         - 0.5 * jnp.sum(jnp.log(eigenvalues))
@@ -534,19 +522,12 @@ def get_statistics(
 
     glob_LL = delta_term + sigma_term + gamma_term + factor
 
-    # Covariance Matrix -------------------------------------------
-
-    inv_b_unc = (evecs_unc / evals_unc) @ evecs_unc.T
-    
-    cov_mat = (m / 2.0) * inv_b_unc
-
     return StatisticsResult(
         log_prob=log_prob,
         variance=variance,
         SNR=SNR,
         p_spec=p_spec,
         glob_LL=glob_LL,
-        cov_mat=cov_mat,
         fs=fs,
         ks=ks,
         f_unc=f_unc,
@@ -603,15 +584,20 @@ class BATS:
         seed: int = 0,
         progress_desc: str | None = None,
         progress_position: int | None = None,
+<<<<<<< HEAD
+=======
         prior_n_std: float = 5.0,
-        unbounded: bool = False,
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
         **kwargs: Any,
     ) -> BATSResult:
         n = int(self.f_init.shape[0])
         f_bw = broadcast_bandwidth(f_bw, n, "f_bw")
         k_bw = broadcast_bandwidth(k_bw, n, "k_bw")
+<<<<<<< HEAD
+=======
         if prior_n_std <= 0:
             raise ValueError(f"prior_n_std must be > 0, got {prior_n_std}")
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
 
         nuts_kwargs, mcmc_kwargs, run_kwargs = split_numpyro_kwargs(kwargs)
 
@@ -657,8 +643,10 @@ class BATS:
                 f_bw,
                 self.k_init,
                 k_bw,
+<<<<<<< HEAD
+=======
                 prior_n_std,
-                unbounded,
+>>>>>>> 82a7f30ef2f3dbec83b64c87262f89e548389ebc
                 extra_fields=extra_fields,
                 **run_kwargs,
             )

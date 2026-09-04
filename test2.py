@@ -1,7 +1,6 @@
 from bats import get_statistics
-from dracula import Dracula, StatisticsResult
+from dracula import Dracula
 
-import numpy as np
 import jax.numpy as jnp
 from obspy.core import UTCDateTime
 from obspy.clients.fdsn import Client
@@ -103,22 +102,16 @@ if __name__ == "__main__":
 
     model = Dracula(t, d, fs, ks)
     results = model.dispatch(
-        f_per_worker=10,
-        min_signals=len(fs) - 25,
-        max_signals=len(fs) - 23,
+        f_per_worker=5,
+        min_signals=len(fs) - 5,
+        max_signals=len(fs),
         f_bw=fs_unc,
         k_bw=ks_unc,
-        W=100,
-        S=200,
+        W=1000,
+        S=2000,
         max_cores=8,
         sort_signals=True,
         output_dir="dracula_output",
     )
 
     print("Wrote outputs to", results.extras["output_dir"])
-
-    statistics = results.by_n[len(fs) - 23]
-
-    # Verify it finished successfully and isn't None
-    if isinstance(statistics, StatisticsResult):
-        np.savetxt("matrix_output.csv", stats.cov_mat, delimiter=",")
