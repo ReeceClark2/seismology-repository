@@ -1,4 +1,4 @@
-from bats import get_statistics
+from bats import get_statistics, BATS
 from dracula import Dracula, StatisticsResult
 
 import numpy as np
@@ -65,8 +65,8 @@ if __name__ == "__main__":
     start_time = UTCDateTime('2025-07-31T06:24:50')
     end_time = UTCDateTime('2025-08-3T05:24:50')
 
-    min_f = 0.003
-    max_f = 0.004
+    min_f=0.002695
+    max_f=0.002745
 
     t, d = observed_data(network, 
                          station, 
@@ -78,47 +78,50 @@ if __name__ == "__main__":
                          min_f, 
                          max_f)
 
-    print("Data collected!")
-
-    df = pd.read_csv("data/earth_normal_modes_table.csv")
-
-    condition = (
-        (df["f_obs"] > 1e6 * min_f)
-        & (df["f_obs"] < 1e6 * max_f)
-        & df["f_obs"].notna()
-        & df["k_obs"].notna()
+    bats = BATS(t, d, [0,1], [2,3])
+    result = bats.run_grid_search(
+        min_f=0.002695,
+        max_f=0.002745,
+        min_k=1e-5,
+        max_k=6e-5,
+        f_points=500,
+        k_points=500,
+        signals=5,
+        apply_bandpass=False,
+        selection="best",
+        diagnostics=True,
     )
 
-    df = df[condition]
+    print(result.fs)
+    print(result.ks)
+    print(result.extras["selected_log_prob"])
 
-    fs = df['f_obs'].values / 1e6
-    ks = df['k_obs'].values
-    fs_unc = df['f_unc'].values / 1e6
-    ks_unc = df['k_unc'].values
+    fs = result.fs
+    ks = result.ks
+    log_probs = result.extras["selected_log_prob"]
 
-    print("Statistics started...")
+    sort_indices = jnp.argsort(log_probs)[::-1]
 
-    stats = get_statistics(t, d, fs, ks)
-    print("Probability: ", stats.log_prob, "\nVariance: ", stats.variance, "\nSNR: ", stats.SNR)
+    # 3. Apply the sorted indices to your arrays
+    sorted_fs = fs[sort_indices]
+    sorted_ks = ks[sort_indices]
+    sorted_log_probs = log_probs[sort_indices]
 
-    model = Dracula(t, d, fs, ks)
-    results = model.dispatch(
-        f_per_worker=10,
-        min_signals=len(fs) - 25,
-        max_signals=len(fs) - 23,
-        f_bw=fs_unc,
-        k_bw=ks_unc,
-        W=100,
-        S=200,
-        max_cores=8,
-        sort_signals=True,
-        output_dir="dracula_output",
+    model = Dracula(
+        t,
+        d,
+        sorted_fs[:5][::-1],
+        sorted_ks[:5][::-1], 
     )
-
-    print("Wrote outputs to", results.extras["output_dir"])
-
-    statistics = results.by_n[len(fs) - 23]
-
-    # Verify it finished successfully and isn't None
-    if isinstance(statistics, StatisticsResult):
-        np.savetxt("matrix_output.csv", stats.cov_mat, delimiter=",")
+    model.dispatch(
+        f_per_worker=5,
+        min_signals=1,
+        max_signals=5,
+        f_bw=0.000015,
+        k_bw=3e-5,
+        W=1_000,
+        S=2_000,
+        sort_signals=False,
+        prior_n_std=1,
+        unbounded=True
+    )

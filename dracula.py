@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from datetime import datetime
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -47,7 +48,11 @@ def _nearest_power(p_spec: ArrayLike, frequencies: ArrayLike) -> np.ndarray:
 
 
 def _resolve_output_dir(output_dir: str | os.PathLike[str] | None) -> Path:
-    path = Path(output_dir) if output_dir is not None else Path.cwd() / "dracula_output"
+    path = Path(output_dir) if output_dir is not None else Path.cwd() / "dracula_"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = path.parent / f"{path.name}_{timestamp}"
+
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -1,7 +1,8 @@
 __pycache__/
 *.py[cod]
 .DS_Store
-dracula_output/
 output/
 data/
 scripting/
+diagnostics_*/
+dracula_*/
