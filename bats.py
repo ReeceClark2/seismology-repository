@@ -268,9 +268,10 @@ def get_log_prob(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> ja
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
-    ratio = sum_sq_proj / sum_sq_data
-    
-    return 0.5 * (m - N) * jnp.log(1.0 - ratio)
+    ratio = sum_sq_proj / jnp.maximum(sum_sq_data, 1e-30)
+    ratio = jnp.clip(ratio, 0.0, 1.0 - 1e-12)
+
+    return 0.5 * (m - N) * jnp.log1p(-ratio)
 
 
 @jax.jit
