@@ -122,20 +122,20 @@ def _plot_grid_probability_diagnostic(
         linewidths=2.0,
         color="red",
         label=(
-            f"Selected {selection}\n"
-            f"f={selected_f:.7g} Hz\n"
-            f"k={selected_k:.7g}"
+            f"Selected\n"
+            f"f={selected_f:.6g} Hz\n"
+            f"k={selected_k:.6g}"
         ),
     )
 
     colorbar = fig.colorbar(mesh, ax=ax)
-    colorbar.set_label("Bretthorst log probability")
+    colorbar.set_label("Log Probability")
 
     ax.set_xlabel("Decay rate")
     ax.set_ylabel("Frequency (Hz)")
     ax.set_title(
-        f"Signal {signal_number}: grid-search probability\n"
-        f"Selected log probability = {selected_probability:.7g}"
+        f"Grid Search Probability for Signal {signal_number}\n"
+        f"Selected Log Probability = {selected_probability:.7g}"
     )
     ax.legend(loc="best")
 
@@ -253,6 +253,73 @@ def _hann_fft(
     return frequencies[mask], amplitude[mask]
 
 
+def _plot_timeseries_diagnostic(
+    path: Path,
+    t: ArrayLike,
+    data_before: ArrayLike,
+    data_after: ArrayLike,
+    model: ArrayLike,
+    selected_f: float,
+    selected_k: float,
+    signal_number: int,
+) -> None:
+    """Save time-domain data before and after model subtraction."""
+    t_np = np.asarray(t, dtype=float).ravel()
+    before_np = np.asarray(data_before, dtype=float).ravel()
+    after_np = np.asarray(data_after, dtype=float).ravel()
+    model_np = np.asarray(model, dtype=float).ravel()
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(12, 7),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+
+    axes[0].plot(
+        t_np,
+        before_np,
+        color="black",
+        linewidth=0.8,
+        label="Before Model Subtraction",
+    )
+    axes[0].plot(
+        t_np,
+        model_np,
+        color="red",
+        linewidth=0.3,
+        label="Selected Model",
+    )
+    axes[0].set_ylabel("Intensity")
+    axes[0].set_title(
+        f"Signal {signal_number} Removal Time Domain\n"
+        f"f={selected_f:.6g} Hz, k={selected_k:.6g}"
+    )
+    axes[0].legend(loc="best")
+    # axes[0].grid(alpha=0.2)
+
+    axes[1].plot(
+        t_np,
+        after_np,
+        color="C0",
+        linewidth=0.8,
+        label="After Model Subtraction",
+    )
+    axes[1].axhline(0.0, color="gray", linewidth=0.7)
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("Residual")
+    axes[1].legend(loc="best")
+    # axes[1].grid(alpha=0.2)
+
+    fig.tight_layout()
+
+    try:
+        fig.savefig(path, dpi=175, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+
+
 def _plot_fourier_diagnostic(
     path: Path,
     t: ArrayLike,
@@ -288,7 +355,7 @@ def _plot_fourier_diagnostic(
         amplitude_before,
         color="0.35",
         linewidth=1.0,
-        label="Before model subtraction",
+        label="Before Model Subtraction",
     )
 
     ax.plot(
@@ -296,7 +363,7 @@ def _plot_fourier_diagnostic(
         amplitude_after,
         color="C0",
         linewidth=1.0,
-        label="After model subtraction",
+        label="After Model Subtraction",
     )
 
     ax.axvline(
@@ -309,12 +376,11 @@ def _plot_fourier_diagnostic(
 
     ax.set_xlim(min_f, max_f)
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Hann-windowed FFT amplitude")
+    ax.set_ylabel("Power")
     ax.set_title(
-        f"Signal {signal_number}: Fourier space before and after subtraction"
+        f"Signal {signal_number} Removal Frequency Domain"
     )
     ax.legend(loc="best")
-    ax.grid(alpha=0.2)
 
     fig.tight_layout()
     fig.savefig(path, dpi=175, bbox_inches="tight")
@@ -822,6 +888,7 @@ def get_statistics(
     # explicit mean square data (msd) and mean square projection (msp).
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
+    mean_sq_param = (1 / m) * jnp.sum(fs ** 2 + ks ** 2)
 
     ratio = (m / N) * mean_sq_proj / mean_sq_data
 
@@ -946,25 +1013,38 @@ def get_statistics(
     R_delta = float(jnp.max(jnp.abs(d)))
     R_sigma = float(jnp.max(jnp.abs(d)))
 
+    dt = float(jnp.mean(jnp.diff(t)))
+    T = float(t[-1] - t[0])
+
+    f_min = 1.0 / T
+    f_max = 1.0 / (2.0 * dt)  # Nyquist frequency
+
+    k_min = 1.0 / T
+    k_max = 1.0 / dt
+
+    R_gamma_f = jnp.log(f_max / f_min)
+    R_gamma_k = jnp.log(k_max / k_min)
+
+    R_gamma = (R_gamma_f ** r) * (R_gamma_k ** r)
+
     log_R_delta = jnp.maximum(jnp.log(R_delta), 1e-12)
     log_R_sigma = jnp.maximum(jnp.log(R_sigma), 1e-12)
-
-    R_gamma = (0.5 / float(jnp.mean(jnp.diff(t)))) * float(t[-1] - t[0])
+    log_R_gamma = jnp.maximum(jnp.log(R_gamma), 1e-12)
 
     b = (-m / 2.0) * hessian
     eigenvalues, _ = jnp.linalg.eigh(b)
     eigenvalues = jnp.maximum(eigenvalues, 1e-12)
 
-    factor = ((m / 2.0) * jnp.log(2.0 * jnp.pi)
-                        - 0.5 * jnp.sum(jnp.log(eigenvalues))
-                        - m * jnp.log(R_gamma))
+    factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
     delta_term = (jsp.gammaln(m / 2.0)
                     - jnp.log(2.0 * log_R_delta)
                     - (m / 2.0) * jnp.log((m * mean_sq_proj) / 2.0))
     sigma_term = (jsp.gammaln((N - m - r) / 2.0)
                     - jnp.log(2.0 * log_R_sigma)
-                    - ((N - m - r) / 2.0) * jnp.log((N * mean_sq_data - m * mean_sq_proj) / 2.0))
-    gamma_term = -(2.0 * r) * jnp.log(R_gamma)
+                    + ((m + r - N) / 2.0) * jnp.log((N * mean_sq_data - m * mean_sq_proj) / 2.0))
+    gamma_term = (jsp.gammaln(r / 2.0)
+                  - jnp.log(2.0 * log_R_gamma)
+                  - (r / 2.0) * jnp.log((r * mean_sq_param) / 2.0))
 
     glob_LL = delta_term + sigma_term + gamma_term + factor
 
@@ -972,7 +1052,7 @@ def get_statistics(
 
     inv_b_unc = (evecs_unc / evals_unc) @ evecs_unc.T
     
-    cov_mat = (m / 2.0) * inv_b_unc
+    cov_mat = inv_b_unc
 
     return StatisticsResult(
         log_prob=log_prob,
@@ -1244,12 +1324,14 @@ class BATS:
             int(f_points),
             dtype=jnp.float64,
         )
-        k_space = jnp.linspace(
-            min_k,
-            max_k,
+        k_space = jnp.exp(
+        jnp.linspace(
+            jnp.log(min_k),
+            jnp.log(max_k),
             int(k_points),
             dtype=jnp.float64,
         )
+    )
         f_grid, k_grid = jnp.meshgrid(
             f_space,
             k_space,
@@ -1346,6 +1428,23 @@ class BATS:
                     selected_f_float = float(selected_f)
                     selected_k_float = float(selected_k)
                     selected_probability_float = float(selected_probability)
+
+                    _plot_timeseries_diagnostic(
+                        path=(
+                            diagnostics_path
+                            / (
+                                f"signal_{diagnostic_number:03d}"
+                                "_timeseries_before_after.png"
+                            )
+                        ),
+                        t=self.t,
+                        data_before=data_before,
+                        data_after=data_after,
+                        model=selected_model,
+                        selected_f=float(selected_f),
+                        selected_k=float(selected_k),
+                        signal_number=diagnostic_number,
+                    )
 
                     _plot_grid_probability_diagnostic(
                         path=(
