@@ -1,127 +1,208 @@
-from bats import get_statistics, BATS
-from dracula import Dracula, StatisticsResult
+import csv
+import multiprocessing
+from pathlib import Path
 
 import numpy as np
-import jax.numpy as jnp
 from obspy.core import UTCDateTime
-from obspy.clients.fdsn import Client
+import jax
 
-import pandas as pd
-
-
-def observed_data(network, 
-                  station, 
-                  channel, 
-                  location, 
-                  stream_index, 
-                  start_time, 
-                  end_time,
-                  min_f,
-                  max_f
-                  ):
-    
-    client = Client('IRIS')
-
-    inventory = client.get_stations(network=network, station=station, location=location, 
-                                            channel=channel, starttime=start_time, endtime=end_time, level='response')
-    
-    stream = client.get_waveforms(network=network, station=station, location=location, 
-                                        channel=channel, starttime=start_time, endtime=end_time)
-    
-    trace = stream[stream_index]
-    trace.detrend('constant')
-    trace.remove_response(inventory=inventory, output="ACC")
-    
-    trace.decimate(5, no_filter=False)
-    trace.decimate(5, no_filter=False)
-
-    trace.filter('bandpass', freqmin=min_f, freqmax=max_f)
-
-    delta = trace.stats.delta 
-    N = len(trace)
-
-    t = jnp.arange(N) * delta
-    d = jnp.array(trace.data)
-
-    return t, d
+from bats import get_statistics
+from dracula import Dracula
+from initial_conditions import observed_data
 
 
-def synthetic_data():
+def read_initial_conditions(
+    csv_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read frequency and decay-rate initial conditions from the grid CSV."""
+    csv_path = Path(csv_path)
 
-    # TODO: implement synthetic data fetching
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    pass
+    rows = []
+
+    with csv_path.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+
+        required_columns = {
+            "subband_index",
+            "signal_index",
+            "frequency_hz",
+            "decay_rate",
+        }
+
+        missing = required_columns.difference(reader.fieldnames or [])
+
+        if missing:
+            raise ValueError(
+                f"CSV is missing required columns: {sorted(missing)}"
+            )
+
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                subband_index = int(row["subband_index"])
+                signal_index = int(row["signal_index"])
+                frequency = float(row["frequency_hz"])
+                decay_rate = float(row["decay_rate"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid value on CSV line {line_number}"
+                ) from error
+
+            if not np.isfinite(frequency):
+                raise ValueError(
+                    f"Non-finite frequency on CSV line {line_number}"
+                )
+
+            if not np.isfinite(decay_rate):
+                raise ValueError(
+                    f"Non-finite decay rate on CSV line {line_number}"
+                )
+
+            if frequency <= 0.0:
+                raise ValueError(
+                    f"Frequency must be positive on line {line_number}"
+                )
+
+            if decay_rate < 0.0:
+                raise ValueError(
+                    f"Decay rate cannot be negative on line {line_number}"
+                )
+
+            rows.append(
+                (
+                    subband_index,
+                    signal_index,
+                    frequency,
+                    decay_rate,
+                )
+            )
+
+    if not rows:
+        raise ValueError(f"No initial conditions found in {csv_path}")
+
+    # Preserve deterministic subband/signal ordering.
+    rows.sort(key=lambda item: (item[0], item[1]))
+
+    frequencies = np.asarray(
+        [row[2] for row in rows],
+        dtype=float,
+    )
+    decay_rates = np.asarray(
+        [row[3] for row in rows],
+        dtype=float,
+    )
+
+    return frequencies, decay_rates
 
 
-
-if __name__ == "__main__":
+def main():
+    # Use the same observed-data parameters as initial_conditions.py.
     network = "IU"
     station = "KIP"
     location = "00"
     channel = "LHZ"
     stream_index = 0
-    
-    # Time frame covering background + event
-    start_time = UTCDateTime('2025-07-31T06:24:50')
-    end_time = UTCDateTime('2025-08-6T05:24:50')
 
-    min_f=0.000780
-    max_f=0.000830
+    start_time = UTCDateTime("2025-07-29T23:24:50")
+    end_time = UTCDateTime("2025-08-06T05:24:50")
 
-    t, d = observed_data(network, 
-                         station, 
-                         channel, 
-                         location, 
-                         stream_index, 
-                         start_time, 
-                         end_time, 
-                         min_f, 
-                         max_f)
+    min_f = 0.0030
+    max_f = 0.0040
 
-    bats = BATS(t, d, [0,1], [2,3])
-    result = bats.run_grid_search(
-        min_f=0.000780,
-        max_f=0.000830,
-        min_k=1e-5,
-        max_k=6e-5,
-        f_points=500,
-        k_points=500,
-        signals=5,
-        apply_bandpass=False,
-        selection="best",
-        diagnostics=True,
+    csv_path = Path("data/all_subband_grid_results.csv")
+
+    print("Downloading and preparing observed data...")
+
+    t, d = observed_data(
+        network=network,
+        station=station,
+        channel=channel,
+        location=location,
+        stream_index=stream_index,
+        start_time=start_time,
+        end_time=end_time,
+        min_f=min_f,
+        max_f=max_f,
     )
 
-    print(result.fs)
-    print(result.ks)
-    print(result.extras["selected_log_prob"])
+    frequencies, decay_rates = read_initial_conditions(csv_path)
 
-    fs = result.fs
-    ks = result.ks
-    log_probs = result.extras["selected_log_prob"]
+    print(
+        f"Testing get_statistics for {frequencies.size} signals "
+        f"({2 * frequencies.size} parameters)..."
+    )
 
-    sort_indices = jnp.argsort(log_probs)[::-1]
-
-    # 3. Apply the sorted indices to your arrays
-    sorted_fs = fs[sort_indices]
-    sorted_ks = ks[sort_indices]
-    sorted_log_probs = log_probs[sort_indices]
-
-    model = Dracula(
+    initial_stats = get_statistics(
         t,
         d,
-        sorted_fs[::-1],
-        sorted_ks[::-1], 
+        frequencies,
+        decay_rates,
     )
-    model.dispatch(
-        f_per_worker=5,
+
+    # Force all asynchronous JAX calculations to finish now.
+    for value in (
+        initial_stats.log_prob,
+        initial_stats.variance,
+        initial_stats.SNR,
+        initial_stats.p_spec,
+        initial_stats.glob_LL,
+        initial_stats.cov_mat,
+        initial_stats.f_unc,
+        initial_stats.k_unc,
+    ):
+        jax.block_until_ready(value)
+
+    print(
+        "Initial statistics completed successfully: "
+        f"SNR={float(initial_stats.SNR):.6g}, "
+        f"log_prob={float(initial_stats.log_prob):.6g}, "
+        f"glob_LL={float(initial_stats.glob_LL):.6g}"
+    )
+
+    del initial_stats
+
+    print(f"Loaded {frequencies.size} initial conditions")
+    print(
+        f"Frequency range: "
+        f"{frequencies.min():.8g}–{frequencies.max():.8g} Hz"
+    )
+    print(
+        f"Decay-rate range: "
+        f"{decay_rates.min():.8g}–{decay_rates.max():.8g}"
+    )
+
+    model = Dracula(
+        t=t,
+        d=d,
+        f_init=frequencies,
+        k_init=decay_rates,
+    )
+
+    # Adjust these arguments as needed.
+    result = model.dispatch(
+        f_per_worker=8,
         min_signals=1,
-        max_signals=len(sorted_fs),
-        f_bw=0.000015,
-        k_bw=3e-5,
+        max_signals=50,
+        f_bw=2.5e-5,
+        k_bw=2,
         W=1_000,
         S=2_000,
+        calc_stats=True,
+        stats_at_end=True,
+        max_cores=32,
+
         sort_signals=False,
-        prior_n_std=1,
-        unbounded=True
+
+        output_dir="dracula_output",
+        prior_n_std=1.0,
+        unbounded=True,
     )
+
+    print(f"Results saved to: {result.extras['output_dir']}")
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
