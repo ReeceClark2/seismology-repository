@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.distributions import constraints
+from numpyro.distributions import constraints, transforms
 from numpyro.infer import MCMC, NUTS, init_to_value
 
 import tqdm
@@ -819,26 +819,52 @@ def bats_model(
     f_low = f_loc - n_std * f_scale
     f_high = jnp.maximum(f_loc + n_std * f_scale, f_low + 1e-12)
 
-    k_low = jnp.maximum(0.0, k_loc - n_std * k_scale)
-    k_high = jnp.maximum(k_loc + n_std * k_scale, k_low + 1e-12)
+    # k_loc must be positive for log-space sampling.
+    k_floor = jnp.asarray(1e-12, dtype=k_loc.dtype)
+    k_loc_safe = jnp.maximum(k_loc, k_floor)
     
+    log_k_loc = jnp.log(k_loc_safe)
+    log_k_low = log_k_loc - n_std * k_scale
+    log_k_high = log_k_loc + n_std * k_scale
+
     if unbounded:
         fs = numpyro.sample(
             "fs",
             dist.Uniform(f_low, f_high).to_event(1),
         )
+
         ks = numpyro.sample(
             "ks",
-            dist.Uniform(k_low, k_high).to_event(1),
+            dist.TransformedDistribution(
+                dist.Uniform(
+                    log_k_low,
+                    log_k_high,
+                ).to_event(1),
+                transforms.ExpTransform(),
+            ),
         )
     else:
         fs = numpyro.sample(
             "fs",
-            dist.TruncatedNormal(f_loc, f_scale, low=f_low, high=f_high).to_event(1),
+            dist.TruncatedNormal(
+                f_loc,
+                f_scale,
+                low=f_low,
+                high=f_high,
+            ).to_event(1),
         )
+
         ks = numpyro.sample(
             "ks",
-            dist.TruncatedNormal(k_loc, k_scale, low=k_low, high=k_high).to_event(1),
+            dist.TransformedDistribution(
+                dist.TruncatedNormal(
+                    log_k_loc,
+                    k_scale,
+                    low=log_k_low,
+                    high=log_k_high,
+                ).to_event(1),
+                transforms.ExpTransform(),
+            ),
         )
 
     numpyro.factor("bretthorst", get_log_prob(t, d, fs, ks))
