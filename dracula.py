@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime
 
+import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,8 +33,6 @@ from colony import (
     run_bats_worker,
     run_colony_worker,
 )
-
-multiprocessing.set_start_method("spawn", force=True)
 
 
 def _np(value: Any) -> np.ndarray:
@@ -320,6 +319,7 @@ class Dracula:
         W: int = 1_000,
         S: int = 2_000,
         calc_stats: bool = True,
+        stats_at_end: bool = False,
         max_cores: int | None = None,
         sort_signals: bool = True,
         output_dir: str | os.PathLike[str] | None = None,
@@ -363,6 +363,7 @@ class Dracula:
         final_results: dict[int, StatisticsResult | BATSResult | None] = {
             s: None for s in range(min_signals, max_signals + 1)
         }
+        deferred_statistics: dict[int, BATSResult] = {}
         f_init_by_n = {s: f_work[:s] for s in range(min_signals, max_signals + 1)}
         k_init_by_n = {s: k_work[:s] for s in range(min_signals, max_signals + 1)}
 
@@ -401,27 +402,56 @@ class Dracula:
             executor: concurrent.futures.ProcessPoolExecutor,
             signals: int,
         ) -> None:
-            if tasks_remaining[signals] != 0 or not grouped_results[signals]:
+            """Combine completed BATS jobs and schedule or defer statistics."""
+            if tasks_remaining[signals] != 0:
                 return
+
+            if not grouped_results[signals]:
+                final_results[signals] = None
+                return
+
             colony_res = sorted(
                 grouped_results[signals],
-                key=lambda r: r.seed if r.seed is not None else 0,
+                key=lambda result: (
+                    result.seed if result.seed is not None else 0
+                ),
             )
-            flat_fs = jnp.concatenate([r.fs for r in colony_res])
-            flat_ks = jnp.concatenate([r.ks for r in colony_res])
-            combined = BATSResult(fs=flat_fs, ks=flat_ks)
-            if calc_stats:
-                stats_future = executor.submit(
-                    get_statistics,
-                    self.t,
-                    self.d,
-                    flat_fs,
-                    flat_ks,
-                )
-                future_metadata[stats_future] = ("stats", signals)
-                pending_futures.add(stats_future)
-            else:
+
+            flat_fs = jnp.concatenate(
+                [result.fs for result in colony_res]
+            )
+            flat_ks = jnp.concatenate(
+                [result.ks for result in colony_res]
+            )
+
+            combined = BATSResult(
+                fs=flat_fs,
+                ks=flat_ks,
+            )
+
+            # Release the individual BATS results once they have been combined.
+            grouped_results[signals].clear()
+
+            if not calc_stats:
                 final_results[signals] = combined
+                return
+
+            if stats_at_end:
+                # Only retain the small frequency/decay arrays. Statistics will run
+                # after the process pool has shut down and released worker memory.
+                deferred_statistics[signals] = combined
+                return
+
+            stats_future = executor.submit(
+                get_statistics,
+                self.t,
+                self.d,
+                combined.fs,
+                combined.ks,
+            )
+
+            future_metadata[stats_future] = ("stats", signals)
+            pending_futures.add(stats_future)
 
         tqdm.monitor_interval = 0
         ctx = multiprocessing.get_context("spawn")
@@ -443,6 +473,7 @@ class Dracula:
         try:
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=max_cores,
+                mp_context=ctx,
                 initializer=init_parallel_worker,
                 initargs=(tqdm_lock, max_cores),
             ) as executor:
@@ -463,19 +494,32 @@ class Dracula:
                             if task_type == "colony":
                                 _, colony_tasks = future.result()
                                 tasks_remaining[signals] = len(colony_tasks)
+
                                 extra_jobs = len(colony_tasks) + (
-                                    1 if calc_stats and colony_tasks else 0
+                                    1
+                                    if calc_stats and colony_tasks
+                                    else 0
                                 )
-                                pipeline.total = (pipeline.total or 0) + extra_jobs
+                                pipeline.total = (
+                                    pipeline.total or 0
+                                ) + extra_jobs
+
                                 pipeline.set_postfix_str(
-                                    f"N={signals} colony ready ({len(colony_tasks)} BATS)",
+                                    f"N={signals} colony ready "
+                                    f"({len(colony_tasks)} BATS)",
                                     refresh=True,
                                 )
                                 pipeline.update(1)
 
                                 for task in colony_tasks:
-                                    bats_future = executor.submit(run_bats_worker, task)
-                                    future_metadata[bats_future] = ("bats", signals)
+                                    bats_future = executor.submit(
+                                        run_bats_worker,
+                                        task,
+                                    )
+                                    future_metadata[bats_future] = (
+                                        "bats",
+                                        signals,
+                                    )
                                     pending_futures.add(bats_future)
 
                                 if not colony_tasks:
@@ -486,9 +530,11 @@ class Dracula:
                             elif task_type == "bats":
                                 result = future.result()
                                 grouped_results[signals].append(result)
+
                                 remaining = tasks_remaining[signals]
                                 if remaining is not None:
                                     tasks_remaining[signals] = remaining - 1
+
                                 pipeline.update(1)
                                 launch_stats_if_ready(executor, signals)
 
@@ -496,18 +542,71 @@ class Dracula:
                                 final_results[signals] = future.result()
                                 pipeline.update(1)
 
-                        except Exception as e:
+                        except Exception as error:
                             print(
-                                f"Task '{task_type}' for {signals} signals failed with error: {e}"
+                                f"Task {task_type!r} for {signals} "
+                                f"signals failed: {error}"
                             )
                             pipeline.update(1)
+
                             if task_type == "colony":
                                 submit_colony(executor)
-                            elif task_type == "bats" and tasks_remaining[signals] is not None:
-                                remaining = tasks_remaining[signals]
-                                if remaining is not None:
-                                    tasks_remaining[signals] = remaining - 1
-                                launch_stats_if_ready(executor, signals)
+
+                            elif (
+                                task_type == "bats"
+                                and tasks_remaining[signals] is not None
+                            ):
+                                tasks_remaining[signals] -= 1
+                                launch_stats_if_ready(
+                                    executor,
+                                    signals,
+                                )
+
+            # The executor has now shut down. Its worker processes and their
+            # memory allocations are gone before statistics calculations begin.
+            if calc_stats and stats_at_end:
+                for signals in sorted(deferred_statistics):
+                    combined = deferred_statistics[signals]
+
+                    pipeline.set_postfix_str(
+                        f"N={signals} sequential statistics",
+                        refresh=True,
+                    )
+
+                    try:
+                        stats = get_statistics(
+                            self.t,
+                            self.d,
+                            combined.fs,
+                            combined.ks,
+                        )
+
+                        # Ensure all result arrays finish before launching the next job.
+                        jax.block_until_ready(
+                            (
+                                stats.log_prob,
+                                stats.variance,
+                                stats.SNR,
+                                stats.p_spec,
+                                stats.glob_LL,
+                                stats.cov_mat,
+                                stats.f_unc,
+                                stats.k_unc,
+                            )
+                        )
+
+                        final_results[signals] = stats
+
+                    except Exception as error:
+                        final_results[signals] = None
+                        print(
+                            f"Sequential statistics for N={signals} "
+                            f"failed: {error}"
+                        )
+                    finally:
+                        deferred_statistics.pop(signals, None)
+                        pipeline.update(1)
+
         finally:
             pipeline.close()
 
@@ -528,6 +627,7 @@ class Dracula:
             "k_init": k_work,
             "prior_n_std": prior_n_std,
             "unbounded": unbounded,
+            "stats_at_end": bool(stats_at_end),
         }
 
         return DraculaResult(
