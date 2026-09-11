@@ -366,7 +366,7 @@ def get_noise_floor(
     if kept_psd.size == 0:
         raise RuntimeError("RCR rejected every PSD value")
 
-    mean_psd = float(np.mean(kept_psd))
+    mean_psd = 1.44 * float(np.median(kept_psd))
     bandwidth = max_f - min_f
 
     rms_noise = np.sqrt(mean_psd * bandwidth)
@@ -690,4 +690,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

@@ -794,13 +794,16 @@ def get_model(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> jax.A
     eigenvalues = jnp.maximum(eigenvalues, 1e-19)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    T = (eigenvectors / jnp.sqrt(eigenvalues)).T
     
-    # Bretthorst Eq. 3.13: projection amplitudes h
+    H = T @ G
     h = H @ d
     model = h @ H
 
-    return model
+    # Transform orthogonal amplitudes (h) back to physical amplitudes (A)
+    B = h @ T
+
+    return B, model
 
 
 def bats_model(
@@ -822,7 +825,7 @@ def bats_model(
     # k_loc must be positive for log-space sampling.
     k_floor = jnp.asarray(1e-12, dtype=k_loc.dtype)
     k_loc_safe = jnp.maximum(k_loc, k_floor)
-    
+
     log_k_loc = jnp.log(k_loc_safe)
     log_k_low = log_k_loc - n_std * k_scale
     log_k_high = log_k_loc + n_std * k_scale
@@ -875,222 +878,463 @@ def get_statistics(
     d: ArrayLike,
     fs: ArrayLike,
     ks: ArrayLike,
+    *,
+    calc_log_prob: bool = True,
+    calc_variance: bool = True,
+    calc_snr: bool = True,
+    calc_p_spec: bool = True,
+    calc_glob_ll: bool = True,
+    calc_cov_mat: bool = True,
+    calc_f_unc: bool = True,
+    calc_k_unc: bool = True,
 ) -> StatisticsResult:
+    """Calculate selected Bretthorst statistics.
+
+    Disabled results are returned as ``None``. Intermediate quantities may
+    still be calculated when they are dependencies of an enabled result.
+
+    For example, SNR requires the residual variance internally. Setting
+    ``calc_variance=False`` prevents the variance from being returned, but
+    it will still be calculated if ``calc_snr=True``.
+    """
     t = as_1d_float(t, "t")
     d = as_1d_float(d, "d")
     fs = as_1d_float(fs, "fs")
     ks = as_1d_float(ks, "ks")
 
-    omegas = fs * 2.0 * jnp.pi
-    
-    r = omegas.shape[0]
+    if t.shape[0] != d.shape[0]:
+        raise ValueError(
+            "t and d must have the same length, "
+            f"got {t.shape[0]} and {d.shape[0]}"
+        )
+
+    if fs.shape[0] != ks.shape[0]:
+        raise ValueError(
+            "fs and ks must have the same length, "
+            f"got {fs.shape[0]} and {ks.shape[0]}"
+        )
+
+    r = int(fs.shape[0])
     m = 2 * r
-    N = d.shape[0]
+    N = int(d.shape[0])
 
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
+    if r < 1:
+        raise ValueError("At least one frequency and decay rate are required")
 
-    # Build the non-orthogonal model matrix G
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    # Output values remain None unless their corresponding flag is enabled.
+    log_prob_out: jax.Array | None = None
+    variance_out: jax.Array | None = None
+    snr_out: jax.Array | None = None
+    p_spec_out: jax.Array | None = None
+    glob_ll_out: jax.Array | None = None
+    cov_mat_out: jax.Array | None = None
+    f_unc_out: jax.Array | None = None
+    k_unc_out: jax.Array | None = None
 
-    # Compress the massive time dimension N using QR decomposition
-    Q, R = jnp.linalg.qr(G.T, mode='reduced')
+    # Internal values may be needed as dependencies without being returned.
+    variance_internal: jax.Array | None = None
+    mean_sq_data: jax.Array | None = None
+    mean_sq_proj: jax.Array | None = None
 
-    # Run SVD on the tiny R.T matrix to avoid OOM errors in the Hessian
-    U, S, Vt = jnp.linalg.svd(R.T, full_matrices=False)
-
-    # Eigendecomposition for orthogonalization
-    eigenvalues = S ** 2
-    eigenvectors = U
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
-    h = H @ d
-
-    # Calculate the ratio of the squared projections to the squared data.
-    # Note: The m and N terms cancel out here compared to calculating the 
-    # explicit mean square data (msd) and mean square projection (msp).
-    mean_sq_data = (1 / N) * jnp.sum(d ** 2)
-    mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / m) * jnp.sum(fs ** 2 + ks ** 2)
-
-    ratio = (m / N) * mean_sq_proj / mean_sq_data
-
-    log_prob = 0.5 * (m - N) * jnp.log(1.0 - ratio)
-
-    # Variance --------------------------------------------------
-    
-    variance = (1 / (N - m - 2)) * (jnp.sum(d ** 2) - jnp.sum(h ** 2))
-
-    # SNR -------------------------------------------------------
-    
-    SNR = ((m / N) * (1 + mean_sq_proj / variance)) ** (0.5)
-
-    # Uncertainties (Bretthorst Eq. 4.11 and 4.13) -------------
-
-    def log_prob_wrapper(q):
-        return get_log_prob(t, d, q[:r], q[r:])
-
-    q = jnp.concatenate((jnp.asarray(fs), jnp.asarray(ks)))
-
-    log_prob_hessian = jax.jit(jax.hessian(log_prob_wrapper))(q)
-    b_unc = (-m / 2.0) * log_prob_hessian
-
-    evals_unc, evecs_unc = jnp.linalg.eigh(b_unc)
-    evals_unc = jnp.maximum(evals_unc, 1e-8)
-
-    param_unc = jnp.sqrt(
-        jnp.maximum(variance, 0.0) * jnp.sum((evecs_unc ** 2) / evals_unc, axis=1)
+    needs_variance = any(
+        (
+            calc_variance,
+            calc_snr,
+            calc_p_spec,
+            calc_f_unc,
+            calc_k_unc,
+        )
     )
-    f_unc = param_unc[:r]
-    k_unc = param_unc[r:]
 
-    # Power Spectrum ---------------------------------------------
+    needs_projection = any(
+        (
+            calc_log_prob,
+            needs_variance,
+            calc_glob_ll,
+        )
+    )
 
-    f_space = jnp.append(jnp.linspace(0.98 * min(fs), 1.02 * max(fs), 10_000), fs)
+    # ------------------------------------------------------------------
+    # Shared signal projection
+    # ------------------------------------------------------------------
+    if needs_projection:
+        omegas = fs * 2.0 * jnp.pi
 
-    def compute_C_single(f_val):
-        phase = 2 * jnp.pi * f_val * t
-        return (1 / N) * jnp.abs(jnp.sum(d * jnp.exp(1j * phase))) ** 2
+        arg = omegas[:, None] * t[None, :]
+        decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    C = jax.lax.map(compute_C_single, f_space)
+        # Non-orthogonal model matrix.
+        G = jnp.vstack(
+            (
+                jnp.cos(arg) * decay,
+                jnp.sin(arg) * decay,
+            )
+        )
 
-    @jax.remat
-    def ms_projection_wrapper(q):
-        f = q[:r]
-        a = q[r:]  # decay rates; assumed positive
+        # Compress the time dimension before decomposing.
+        _, R = jnp.linalg.qr(G.T, mode="reduced")
+        U, singular_values, _ = jnp.linalg.svd(
+            R.T,
+            full_matrices=False,
+        )
 
-        omega = 2.0 * jnp.pi * f
-        arg = omega[:, None] * t[None, :]
-        decay = jnp.exp(-a[:, None] * t[None, :])
+        eigenvalues = jnp.maximum(
+            singular_values**2,
+            1e-30,
+        )
+        eigenvectors = U
 
-        # Build the non-orthogonal model matrix G (m x N)
-        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+        # Bretthorst Eq. 3.6 and Eq. 3.13.
+        H = (
+            eigenvectors / jnp.sqrt(eigenvalues)
+        ).T @ G
+        h = H @ d
 
-        # 1. Compress N immediately using primitive dot products
-        # JAX autodiff handles this with near-zero memory overhead
-        proj_d = G @ d         # shape: (m,)
-        M = G @ G.T            # shape: (m, m)
+        sum_sq_data = jnp.sum(d**2)
+        sum_sq_proj = jnp.sum(h**2)
 
-        # 2. Eigendecomposition on the tiny m x m matrix
-        # This is mathematically identical to S**2 and U from your SVD(R.T)
-        eigenvalues, eigenvectors = jnp.linalg.eigh(M)
+        mean_sq_data = sum_sq_data / N
+        mean_sq_proj = sum_sq_proj / m
 
-        # 3. Scale-dependent ridge for numerical stability
-        ridge = 1e-8 * jnp.sum(eigenvalues) / M.shape[0]
+        projection_ratio = (
+            (m / N) * mean_sq_proj / mean_sq_data
+        )
 
-        # 4. Solve the regularized system
-        # y = eigenvectors.T @ proj_d
-        # z = y / (eigenvalues + ridge)
-        # x = eigenvectors @ z
-        y = eigenvectors.T @ proj_d
-        z = y / (eigenvalues + ridge)
-        x = eigenvectors @ z
+        if calc_log_prob:
+            log_prob_out = (
+                0.5
+                * (m - N)
+                * jnp.log(1.0 - projection_ratio)
+            )
 
-        # Projection power
-        return jnp.dot(proj_d, x) / m
-    
-    hessian = jax.jit(
-        jax.hessian(ms_projection_wrapper)
-    )(q)
+        if needs_variance:
+            variance_internal = (
+                sum_sq_data - sum_sq_proj
+            ) / (N - m - 2)
 
-    hessian_diag = jnp.diag(hessian)[:r]
-    b_diagonal = (-m / 2.0) * hessian_diag
+            if calc_variance:
+                variance_out = variance_internal
 
-    # p_space = (2 * (variance + jnp.sum(C)) * 
-    #           jnp.sum((b_diagonal[:, None] / (2 * jnp.pi * variance)) ** (1 / 2) * 
-    #           jnp.exp((-b_diagonal[:, None] * (fs[:, None] - f_space) ** 2) / (2 * variance)), axis=0))
+        if calc_snr:
+            assert variance_internal is not None
 
-    # 1. SAFEGUARDS: Prevent log(negative) and log(0)
-    # Force b_diagonal to be strictly positive and > 0
-    safe_b_diag = jnp.maximum(jnp.abs(b_diagonal), 1e-30)
+            snr_out = jnp.sqrt(
+                (m / N)
+                * (
+                    1.0
+                    + mean_sq_proj / variance_internal
+                )
+            )
 
-    # Force variance to be > 0 to prevent division by zero or log(0)
-    safe_var = jnp.maximum(variance, 1e-30)
+    # ------------------------------------------------------------------
+    # Parameter Hessian, uncertainties, and covariance matrix
+    # ------------------------------------------------------------------
+    needs_parameter_hessian = any(
+        (
+            calc_f_unc,
+            calc_k_unc,
+            calc_cov_mat,
+        )
+    )
 
-    # 2. Compute the log of the amplitude factor using safe variables
-    log_amplitude = 0.5 * (jnp.log(safe_b_diag[:, None]) - jnp.log(2 * jnp.pi * safe_var))
+    if needs_parameter_hessian:
 
-    # 3. The exponent uses the safe variables
-    exponent = (-safe_b_diag[:, None] * (fs[:, None] - f_space) ** 2) / (2 * safe_var)
+        def log_prob_wrapper(q: jax.Array) -> jax.Array:
+            return get_log_prob(
+                t,
+                d,
+                q[:r],
+                q[r:],
+            )
 
-    # 4. Combine them in log space
-    X = log_amplitude + exponent
+        q = jnp.concatenate((fs, ks))
 
-    # 5. Use the LSE trick directly
-    log_inner_sum = logsumexp(X, axis=0)
+        log_prob_hessian = jax.jit(
+            jax.hessian(log_prob_wrapper)
+        )(q)
 
-    # 6. Compute the log of the leading constant scalar
-    # Also safeguard the sum of C just in case it dipped negative
-    safe_C_sum = jnp.maximum(jnp.sum(jnp.nan_to_num(C)), 0.0)
-    log_constant = jnp.log(2 * (safe_var + safe_C_sum))
+        b_unc = (-m / 2.0) * log_prob_hessian
 
-    # 7. Add them together to get the final log-spectrum
-    log_p_space = log_constant + log_inner_sum
+        evals_unc, evecs_unc = jnp.linalg.eigh(b_unc)
+        evals_unc = jnp.maximum(evals_unc, 1e-8)
 
-    # 8. Convert back to linear space
-    p_space = jnp.exp(log_p_space)
-    p_spec = jnp.column_stack((f_space, p_space))
+        if calc_f_unc or calc_k_unc:
+            assert variance_internal is not None
 
-    # Global Likelihood -----------------------------------------
+            param_unc = jnp.sqrt(
+                jnp.maximum(variance_internal, 0.0)
+                * jnp.sum(
+                    (evecs_unc**2) / evals_unc,
+                    axis=1,
+                )
+            )
 
-    R_delta = float(jnp.max(jnp.abs(d)))
-    R_sigma = float(jnp.max(jnp.abs(d)))
+            if calc_f_unc:
+                f_unc_out = param_unc[:r]
 
-    dt = float(jnp.mean(jnp.diff(t)))
-    T = float(t[-1] - t[0])
+            if calc_k_unc:
+                k_unc_out = param_unc[r:]
 
-    f_min = 1.0 / T
-    f_max = 1.0 / (2.0 * dt)  # Nyquist frequency
+        if calc_cov_mat:
+            inv_b_unc = (
+                evecs_unc / evals_unc
+            ) @ evecs_unc.T
 
-    k_min = 1.0 / T
-    k_max = 1.0 / dt
+            cov_mat_out = (m / 2.0) * inv_b_unc
 
-    R_gamma_f = jnp.log(f_max / f_min)
-    R_gamma_k = jnp.log(k_max / k_min)
+    # ------------------------------------------------------------------
+    # Mean-square projection Hessian shared by the power spectrum and
+    # global likelihood.
+    # ------------------------------------------------------------------
+    projection_hessian: jax.Array | None = None
 
-    R_gamma = (R_gamma_f ** r) * (R_gamma_k ** r)
+    if calc_p_spec or calc_glob_ll:
+        q = jnp.concatenate((fs, ks))
 
-    log_R_delta = jnp.maximum(jnp.log(R_delta), 1e-12)
-    log_R_sigma = jnp.maximum(jnp.log(R_sigma), 1e-12)
-    log_R_gamma = jnp.maximum(jnp.log(R_gamma), 1e-12)
+        @jax.remat
+        def ms_projection_wrapper(
+            parameters: jax.Array,
+        ) -> jax.Array:
+            frequencies = parameters[:r]
+            decay_rates = parameters[r:]
 
-    b = (-m / 2.0) * hessian
-    eigenvalues, _ = jnp.linalg.eigh(b)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+            omega = 2.0 * jnp.pi * frequencies
+            arg = omega[:, None] * t[None, :]
+            decay = jnp.exp(
+                -decay_rates[:, None] * t[None, :]
+            )
 
-    factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
-    delta_term = (jsp.gammaln(m / 2.0)
-                    - jnp.log(2.0 * log_R_delta)
-                    - (m / 2.0) * jnp.log((m * mean_sq_proj) / 2.0))
-    sigma_term = (jsp.gammaln((N - m - r) / 2.0)
-                    - jnp.log(2.0 * log_R_sigma)
-                    + ((m + r - N) / 2.0) * jnp.log((N * mean_sq_data - m * mean_sq_proj) / 2.0))
-    gamma_term = (jsp.gammaln(r / 2.0)
-                  - jnp.log(2.0 * log_R_gamma)
-                  - (r / 2.0) * jnp.log((r * mean_sq_param) / 2.0))
+            G = jnp.vstack(
+                (
+                    jnp.cos(arg) * decay,
+                    jnp.sin(arg) * decay,
+                )
+            )
 
-    glob_LL = delta_term + sigma_term + gamma_term + factor
+            proj_d = G @ d
+            gram = G @ G.T
 
-    # Covariance Matrix -------------------------------------------
+            eigenvalues, eigenvectors = jnp.linalg.eigh(
+                gram
+            )
 
-    inv_b_unc = (evecs_unc / evals_unc) @ evecs_unc.T
-    
-    cov_mat = inv_b_unc
+            ridge = (
+                1e-8
+                * jnp.sum(eigenvalues)
+                / gram.shape[0]
+            )
+
+            y = eigenvectors.T @ proj_d
+            z = y / (eigenvalues + ridge)
+            coefficients = eigenvectors @ z
+
+            return jnp.dot(
+                proj_d,
+                coefficients,
+            ) / m
+
+        projection_hessian = jax.jit(
+            jax.hessian(ms_projection_wrapper)
+        )(q)
+
+    # ------------------------------------------------------------------
+    # Power spectrum
+    # ------------------------------------------------------------------
+    if calc_p_spec:
+        assert variance_internal is not None
+        assert projection_hessian is not None
+
+        f_space = jnp.append(
+            jnp.linspace(
+                0.98 * jnp.min(fs),
+                1.02 * jnp.max(fs),
+                10_000,
+            ),
+            fs,
+        )
+
+        def compute_C_single(
+            frequency: jax.Array,
+        ) -> jax.Array:
+            phase = 2.0 * jnp.pi * frequency * t
+
+            return (
+                jnp.abs(
+                    jnp.sum(
+                        d * jnp.exp(1j * phase)
+                    )
+                )
+                ** 2
+                / N
+            )
+
+        C = jax.lax.map(
+            compute_C_single,
+            f_space,
+        )
+
+        hessian_diag = jnp.diag(
+            projection_hessian
+        )[:r]
+
+        b_diagonal = (
+            -m / 2.0
+        ) * hessian_diag
+
+        safe_b_diag = jnp.maximum(
+            jnp.abs(b_diagonal),
+            1e-30,
+        )
+        safe_variance = jnp.maximum(
+            variance_internal,
+            1e-30,
+        )
+
+        log_amplitude = 0.5 * (
+            jnp.log(safe_b_diag[:, None])
+            - jnp.log(
+                2.0
+                * jnp.pi
+                * safe_variance
+            )
+        )
+
+        exponent = (
+            -safe_b_diag[:, None]
+            * (fs[:, None] - f_space) ** 2
+            / (2.0 * safe_variance)
+        )
+
+        log_inner_sum = logsumexp(
+            log_amplitude + exponent,
+            axis=0,
+        )
+
+        safe_C_sum = jnp.maximum(
+            jnp.sum(
+                jnp.nan_to_num(C)
+            ),
+            0.0,
+        )
+
+        log_constant = jnp.log(
+            2.0
+            * (
+                safe_variance
+                + safe_C_sum
+            )
+        )
+
+        p_space = jnp.exp(
+            log_constant + log_inner_sum
+        )
+
+        p_spec_out = jnp.column_stack(
+            (
+                f_space,
+                p_space,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Global likelihood
+    # ------------------------------------------------------------------
+    if calc_glob_ll:
+        assert projection_hessian is not None
+        assert mean_sq_data is not None
+        assert mean_sq_proj is not None
+
+        R_delta = float(
+            jnp.max(jnp.abs(d))
+        )
+        R_sigma = float(
+            jnp.max(jnp.abs(d))
+        )
+
+        log_R_delta = jnp.maximum(
+            jnp.log(R_delta),
+            1e-12,
+        )
+        log_R_sigma = jnp.maximum(
+            jnp.log(R_sigma),
+            1e-12,
+        )
+
+        mean_dt = float(
+            jnp.mean(jnp.diff(t))
+        )
+        duration = float(t[-1] - t[0])
+
+        R_gamma = (
+            0.5 / mean_dt
+        ) * duration
+
+        b = (
+            -m / 2.0
+        ) * projection_hessian
+
+        global_eigenvalues, _ = jnp.linalg.eigh(b)
+        global_eigenvalues = jnp.maximum(
+            global_eigenvalues,
+            1e-12,
+        )
+
+        factor = (
+            (m / 2.0) * jnp.log(2.0 * jnp.pi)
+            - 0.5
+            * jnp.sum(
+                jnp.log(global_eigenvalues)
+            )
+            - m * jnp.log(R_gamma)
+        )
+
+        delta_term = (
+            jsp.gammaln(m / 2.0)
+            - jnp.log(2.0 * log_R_delta)
+            - (m / 2.0)
+            * jnp.log(
+                (m * mean_sq_proj) / 2.0
+            )
+        )
+
+        sigma_term = (
+            jsp.gammaln(
+                (N - m - r) / 2.0
+            )
+            - jnp.log(2.0 * log_R_sigma)
+            - ((N - m - r) / 2.0)
+            * jnp.log(
+                (
+                    N * mean_sq_data
+                    - m * mean_sq_proj
+                )
+                / 2.0
+            )
+        )
+
+        gamma_term = (
+            -(2.0 * r)
+            * jnp.log(R_gamma)
+        )
+
+        glob_ll_out = (
+            delta_term
+            + sigma_term
+            + gamma_term
+            + factor
+        )
 
     return StatisticsResult(
-        log_prob=log_prob,
-        variance=variance,
-        SNR=SNR,
-        p_spec=p_spec,
-        glob_LL=glob_LL,
-        cov_mat=cov_mat,
+        log_prob=log_prob_out,
+        variance=variance_out,
+        SNR=snr_out,
+        p_spec=p_spec_out,
+        glob_LL=glob_ll_out,
+        cov_mat=cov_mat_out,
         fs=fs,
         ks=ks,
-        f_unc=f_unc,
-        k_unc=k_unc,
+        f_unc=f_unc_out,
+        k_unc=k_unc_out,
     )
 
 
