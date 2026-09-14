@@ -30,7 +30,6 @@ import matplotlib.pyplot as plt
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.distributions import constraints, transforms
 from numpyro.infer import MCMC, NUTS, init_to_value
 
 import tqdm
@@ -106,7 +105,7 @@ def _plot_grid_probability_diagnostic(
     fig, ax = plt.subplots(figsize=(10, 7))
 
     mesh = ax.pcolormesh(
-        k_np,
+        np.log(np.maximum(k_np, DECAY_FLOOR)),
         f_np,
         probability_plot,
         shading="auto",
@@ -115,7 +114,7 @@ def _plot_grid_probability_diagnostic(
     )
 
     ax.scatter(
-        [selected_k],
+        [np.log(max(selected_k, DECAY_FLOOR))],
         [selected_f],
         marker="x",
         s=100,
@@ -124,14 +123,14 @@ def _plot_grid_probability_diagnostic(
         label=(
             f"Selected\n"
             f"f={selected_f:.6g} Hz\n"
-            f"k={selected_k:.6g}"
+            f"ln(k)={np.log(max(selected_k, DECAY_FLOOR)):.6g}"
         ),
     )
 
     colorbar = fig.colorbar(mesh, ax=ax)
     colorbar.set_label("Log Probability")
 
-    ax.set_xlabel("Decay rate")
+    ax.set_xlabel("ln(k)")
     ax.set_ylabel("Frequency (Hz)")
     ax.set_title(
         f"Grid Search Probability for Signal {signal_number}\n"
@@ -527,12 +526,153 @@ def _evaluate_single_signal_grid(
     )
 
 
+def evaluate_frequency_decay_grid(
+    t: ArrayLike,
+    d: ArrayLike,
+    min_f: float,
+    max_f: float,
+    min_k: float,
+    max_k: float,
+    f_points: int = 250,
+    k_points: int = 250,
+    grid_batch_size: int = 4_096,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate the one-signal Bretthorst log probability on an (f, ln k) grid.
+
+    Returns ``f_space``, ``k_space``, ``log_k_space``, and a 2-D probability
+    array with shape ``(f_points, k_points)``.
+    """
+    if min_k <= 0.0 or max_k <= 0.0:
+        raise ValueError("min_k and max_k must be strictly positive")
+    t_arr = jnp.asarray(t, dtype=jnp.float64)
+    d_arr = jnp.asarray(d, dtype=jnp.float64)
+    f_space = jnp.linspace(min_f, max_f, int(f_points), dtype=jnp.float64)
+    log_k_space = jnp.linspace(
+        jnp.log(min_k),
+        jnp.log(max_k),
+        int(k_points),
+        dtype=jnp.float64,
+    )
+    k_space = jnp.exp(log_k_space)
+    f_grid, k_grid = jnp.meshgrid(f_space, k_space, indexing="ij")
+    flat_f = jnp.ravel(f_grid)
+    flat_k = jnp.ravel(k_grid)
+    n_grid = int(flat_f.shape[0])
+    n_batches = (n_grid + grid_batch_size - 1) // grid_batch_size
+    padding = n_batches * grid_batch_size - n_grid
+    if padding:
+        flat_f_pad = jnp.pad(flat_f, (0, padding), mode="edge")
+        flat_k_pad = jnp.pad(flat_k, (0, padding), mode="edge")
+    else:
+        flat_f_pad = flat_f
+        flat_k_pad = flat_k
+    probabilities = jnp.ravel(
+        _evaluate_single_signal_grid(
+            t_arr,
+            d_arr,
+            flat_f_pad.reshape(n_batches, grid_batch_size),
+            flat_k_pad.reshape(n_batches, grid_batch_size),
+        )
+    )[:n_grid]
+    return (
+        np.asarray(f_space),
+        np.asarray(k_space),
+        np.asarray(log_k_space),
+        np.asarray(probabilities).reshape(int(f_points), int(k_points)),
+    )
+
+
+DECAY_FLOOR = 1e-12
+IMPOSED_SURFACES: tuple[str, ...] = ("gaussian", "uniform")
+BOUNDS_MODES: tuple[str, ...] = ("bandwidth", "initial_subband")
+
+
 def as_1d_float(value: ArrayLike, name: str) -> jax.Array:
     """Coerce ``value`` to a 1-D float64 JAX array."""
     array = jnp.ravel(jnp.asarray(value, dtype=jnp.float64))
     if array.ndim != 1:
         raise ValueError(f"{name} must be a scalar or 1-D array, got shape {array.shape}")
     return array
+
+
+def resolve_imposed_surface(
+    imposed_surface: str | None = None,
+    unbounded: bool | None = None,
+) -> str:
+    """Return ``gaussian`` or ``uniform``, mapping deprecated ``unbounded``."""
+    if imposed_surface is not None and unbounded is not None:
+        mapped = "uniform" if unbounded else "gaussian"
+        if mapped != str(imposed_surface):
+            raise ValueError(
+                "imposed_surface conflicts with deprecated unbounded; "
+                "provide only one"
+            )
+        warnings.warn(
+            "unbounded is deprecated; use imposed_surface="
+            f"{mapped!r}",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        imposed_surface = mapped
+    elif unbounded is not None:
+        warnings.warn(
+            "unbounded is deprecated; use imposed_surface="
+            f"{'uniform' if unbounded else 'gaussian'!r}",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        imposed_surface = "uniform" if unbounded else "gaussian"
+    elif imposed_surface is None:
+        imposed_surface = "gaussian"
+
+    surface = str(imposed_surface)
+    if surface not in IMPOSED_SURFACES:
+        raise ValueError(
+            "imposed_surface must be one of "
+            f"{IMPOSED_SURFACES}, got {imposed_surface!r}"
+        )
+    return surface
+
+
+def resolve_bounds_mode(bounds_mode: str = "bandwidth") -> str:
+    mode = str(bounds_mode)
+    if mode not in BOUNDS_MODES:
+        raise ValueError(
+            "bounds_mode must be one of "
+            f"{BOUNDS_MODES}, got {bounds_mode!r}"
+        )
+    return mode
+
+
+def physical_to_log_k(
+    k: ArrayLike,
+    decay_floor: float = DECAY_FLOOR,
+    name: str = "k",
+) -> jax.Array:
+    """Convert strictly positive physical decay rates to natural log."""
+    values = jnp.asarray(k, dtype=jnp.float64)
+    floor = jnp.asarray(decay_floor, dtype=jnp.float64)
+    if float(np.asarray(decay_floor)) <= 0.0:
+        raise ValueError(f"decay_floor must be > 0, got {decay_floor}")
+    if bool(np.any(np.asarray(values) <= 0.0)):
+        raise ValueError(f"{name} must be strictly positive; never evaluate log(0)")
+    return jnp.log(jnp.maximum(values, floor))
+
+
+def log_k_to_physical(log_k: ArrayLike) -> jax.Array:
+    """Convert natural-log decay to physical k = exp(log_k)."""
+    return jnp.exp(jnp.asarray(log_k, dtype=jnp.float64))
+
+
+def multiplicative_decay_interval(
+    k: ArrayLike,
+    sigma_log_k: ArrayLike,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Return ``(factor, k_lower, k_upper)`` from log-space uncertainty."""
+    k_arr = jnp.asarray(k, dtype=jnp.float64)
+    sigma = jnp.asarray(sigma_log_k, dtype=jnp.float64)
+    factor = jnp.exp(sigma)
+    return factor, k_arr / factor, k_arr * factor
 
 
 def prefix_bandwidth(
@@ -697,6 +837,7 @@ class BATSResult:
     """
     fs: jax.Array
     ks: jax.Array
+    log_ks: jax.Array | None = None
     seed: int | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -724,6 +865,11 @@ class StatisticsResult:
     ks: jax.Array
     f_unc: jax.Array
     k_unc: jax.Array
+    log_ks: jax.Array | None = None
+    sigma_log_k: jax.Array | None = None
+    k_uncertainty_factor: jax.Array | None = None
+    k_lower: jax.Array | None = None
+    k_upper: jax.Array | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __getitem__(self, key: str) -> Any:
@@ -814,39 +960,33 @@ def bats_model(
     k_loc: jax.Array,
     k_scale: jax.Array,
     prior_n_std: float = 5.0,
-    unbounded: bool = False,
+    imposed_surface: str = "gaussian",
+    decay_floor: float = DECAY_FLOOR,
 ) -> None:
 
     n_std = jnp.asarray(prior_n_std, dtype=f_loc.dtype)
-    
+
     f_low = f_loc - n_std * f_scale
     f_high = jnp.maximum(f_loc + n_std * f_scale, f_low + 1e-12)
 
-    # k_loc must be positive for log-space sampling.
-    k_floor = jnp.asarray(1e-12, dtype=k_loc.dtype)
-    k_loc_safe = jnp.maximum(k_loc, k_floor)
+    floor = jnp.asarray(decay_floor, dtype=k_loc.dtype)
+    k_loc_safe = jnp.maximum(k_loc, floor)
 
     log_k_loc = jnp.log(k_loc_safe)
     log_k_low = log_k_loc - n_std * k_scale
     log_k_high = log_k_loc + n_std * k_scale
 
-    if unbounded:
+    surface = str(imposed_surface)
+    if surface == "uniform":
         fs = numpyro.sample(
             "fs",
             dist.Uniform(f_low, f_high).to_event(1),
         )
-
-        ks = numpyro.sample(
-            "ks",
-            dist.TransformedDistribution(
-                dist.Uniform(
-                    log_k_low,
-                    log_k_high,
-                ).to_event(1),
-                transforms.ExpTransform(),
-            ),
+        log_ks = numpyro.sample(
+            "log_ks",
+            dist.Uniform(log_k_low, log_k_high).to_event(1),
         )
-    else:
+    elif surface == "gaussian":
         fs = numpyro.sample(
             "fs",
             dist.TruncatedNormal(
@@ -856,20 +996,22 @@ def bats_model(
                 high=f_high,
             ).to_event(1),
         )
-
-        ks = numpyro.sample(
-            "ks",
-            dist.TransformedDistribution(
-                dist.TruncatedNormal(
-                    log_k_loc,
-                    k_scale,
-                    low=log_k_low,
-                    high=log_k_high,
-                ).to_event(1),
-                transforms.ExpTransform(),
-            ),
+        log_ks = numpyro.sample(
+            "log_ks",
+            dist.TruncatedNormal(
+                log_k_loc,
+                k_scale,
+                low=log_k_low,
+                high=log_k_high,
+            ).to_event(1),
+        )
+    else:
+        raise ValueError(
+            "imposed_surface must be one of "
+            f"{IMPOSED_SURFACES}, got {imposed_surface!r}"
         )
 
+    ks = numpyro.deterministic("ks", jnp.exp(log_ks))
     numpyro.factor("bretthorst", get_log_prob(t, d, fs, ks))
 
 
@@ -887,6 +1029,7 @@ def get_statistics(
     calc_cov_mat: bool = True,
     calc_f_unc: bool = True,
     calc_k_unc: bool = True,
+    decay_floor: float = DECAY_FLOOR,
 ) -> StatisticsResult:
     """Calculate selected Bretthorst statistics.
 
@@ -930,6 +1073,11 @@ def get_statistics(
     cov_mat_out: jax.Array | None = None
     f_unc_out: jax.Array | None = None
     k_unc_out: jax.Array | None = None
+    sigma_log_k_out: jax.Array | None = None
+    k_factor_out: jax.Array | None = None
+    k_lower_out: jax.Array | None = None
+    k_upper_out: jax.Array | None = None
+    log_ks_out = physical_to_log_k(ks, decay_floor=decay_floor, name="ks")
 
     # Internal values may be needed as dependencies without being returned.
     variance_internal: jax.Array | None = None
@@ -1040,14 +1188,16 @@ def get_statistics(
     if needs_parameter_hessian:
 
         def log_prob_wrapper(q: jax.Array) -> jax.Array:
+            frequencies = q[:r]
+            log_decay = q[r:]
             return get_log_prob(
                 t,
                 d,
-                q[:r],
-                q[r:],
+                frequencies,
+                jnp.exp(log_decay),
             )
 
-        q = jnp.concatenate((fs, ks))
+        q = jnp.concatenate((fs, log_ks_out))
 
         log_prob_hessian = jax.jit(
             jax.hessian(log_prob_wrapper)
@@ -1073,7 +1223,13 @@ def get_statistics(
                 f_unc_out = param_unc[:r]
 
             if calc_k_unc:
-                k_unc_out = param_unc[r:]
+                sigma_log_k_out = param_unc[r:]
+                k_factor_out, k_lower_out, k_upper_out = (
+                    multiplicative_decay_interval(ks, sigma_log_k_out)
+                )
+                # Linear k_unc is a first-order compatibility field, not a
+                # log-space uncertainty converted by exponentiation.
+                k_unc_out = ks * sigma_log_k_out
 
         if calc_cov_mat:
             inv_b_unc = (
@@ -1335,6 +1491,16 @@ def get_statistics(
         ks=ks,
         f_unc=f_unc_out,
         k_unc=k_unc_out,
+        log_ks=log_ks_out,
+        sigma_log_k=sigma_log_k_out,
+        k_uncertainty_factor=k_factor_out,
+        k_lower=k_lower_out,
+        k_upper=k_upper_out,
+        extras={
+            "parameter_order": ("f", "log_k"),
+            "covariance_space": "frequency_and_log_decay",
+            "decay_floor": float(decay_floor),
+        },
     )
 
 
@@ -1388,7 +1554,9 @@ class BATS:
         progress_desc: str | None = None,
         progress_position: int | None = None,
         prior_n_std: float = 5.0,
-        unbounded: bool = False,
+        unbounded: bool | None = None,
+        imposed_surface: str | None = None,
+        decay_floor: float = DECAY_FLOOR,
         **kwargs: Any,
     ) -> BATSResult:
         n = int(self.f_init.shape[0])
@@ -1396,10 +1564,21 @@ class BATS:
         k_bw = broadcast_bandwidth(k_bw, n, "k_bw")
         if prior_n_std <= 0:
             raise ValueError(f"prior_n_std must be > 0, got {prior_n_std}")
+        surface = resolve_imposed_surface(
+            imposed_surface=imposed_surface,
+            unbounded=unbounded,
+        )
+        log_k_init = physical_to_log_k(
+            self.k_init,
+            decay_floor=decay_floor,
+            name="k_init",
+        )
 
         nuts_kwargs, mcmc_kwargs, run_kwargs = split_numpyro_kwargs(kwargs)
 
-        init_strategy = init_to_value(values={"fs": self.f_init, "ks": self.k_init})
+        init_strategy = init_to_value(
+            values={"fs": self.f_init, "log_ks": log_k_init}
+        )
 
         nuts_config: dict[str, Any] = {
             "init_strategy": init_strategy,
@@ -1442,7 +1621,8 @@ class BATS:
                 self.k_init,
                 k_bw,
                 prior_n_std,
-                unbounded,
+                surface,
+                decay_floor,
                 extra_fields=extra_fields,
                 **run_kwargs,
             )
@@ -1451,17 +1631,31 @@ class BATS:
 
         extra_fields_out = mcmc.get_extra_fields()
         pe = extra_fields_out["potential_energy"]
-        best_ind = jnp.argmin(pe)
+        pe_arr = jnp.asarray(pe)
+        finite = jnp.isfinite(pe_arr)
+        filled = jnp.where(finite, pe_arr, jnp.inf)
+        best_ind = jnp.argmin(filled)
 
         best_fs = samples["fs"][best_ind]
+        best_log_ks = samples["log_ks"][best_ind]
         best_ks = samples["ks"][best_ind]
 
         extras = {
             "potential_energy": pe,
             "best_index": best_ind,
+            "n_finite_samples": int(jnp.sum(finite)),
+            "imposed_surface": surface,
+            "decay_floor": float(decay_floor),
+            "k_bw_space": "log_k",
         }
 
-        return BATSResult(fs=best_fs, ks=best_ks, seed=int(seed), extras=extras)
+        return BATSResult(
+            fs=best_fs,
+            ks=best_ks,
+            log_ks=best_log_ks,
+            seed=int(seed),
+            extras=extras,
+        )
 
 
     def run_grid_search(
@@ -1535,8 +1729,13 @@ class BATS:
             raise ValueError(
                 f"min_f ({min_f}) must be less than max_f ({max_f})"
             )
-        if min_k < 0:
-            raise ValueError(f"min_k must be non-negative, got {min_k}")
+        if min_k <= 0:
+            raise ValueError(
+                f"min_k must be strictly positive, got {min_k}; "
+                "decay-rate grids are built in ln(k) and never evaluate log(0)"
+            )
+        if max_k <= 0:
+            raise ValueError(f"max_k must be strictly positive, got {max_k}")
         if min_k > max_k:
             raise ValueError(
                 f"min_k ({min_k}) must be <= max_k ({max_k})"
@@ -1594,14 +1793,13 @@ class BATS:
             int(f_points),
             dtype=jnp.float64,
         )
-        k_space = jnp.exp(
-        jnp.linspace(
+        log_k_space = jnp.linspace(
             jnp.log(min_k),
             jnp.log(max_k),
             int(k_points),
             dtype=jnp.float64,
         )
-    )
+        k_space = jnp.exp(log_k_space)
         f_grid, k_grid = jnp.meshgrid(
             f_space,
             k_space,
@@ -1794,6 +1992,7 @@ class BATS:
             "bandpass_order": int(bandpass_order),
             "f_space": f_space,
             "k_space": k_space,
+            "log_k_space": log_k_space,
             "f_points": int(f_points),
             "k_points": int(k_points),
             "grid_batch_size": int(grid_batch_size),
@@ -1809,6 +2008,7 @@ class BATS:
         return BATSResult(
             fs=result_fs,
             ks=result_ks,
+            log_ks=jnp.log(result_ks),
             extras=extras,
         )
     

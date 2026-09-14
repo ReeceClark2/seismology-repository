@@ -1,18 +1,21 @@
 from dataclasses import dataclass
 
 import numpy as np
-import rcrpy
 from obspy.clients.fdsn import Client
 from obspy.core import UTCDateTime
-from scipy.signal import butter, sosfiltfilt
 
 import csv
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from dracula import Dracula
-from bats import BATS
+from bats import BATS, DECAY_FLOOR
+from subbands import (
+    bandpass_subband,
+    find_runs,
+    get_noise_floor,
+    select_highest_amplitude_run,
+)
 
 
 @dataclass
@@ -31,7 +34,7 @@ def estimate_min_decay_rate(
     d,
     threshold,
 ) -> float:
-    """Estimate k from A(T) = A(0) exp(-kT), constrained to k >= 0."""
+    """Estimate k from A(T) = A(0) exp(-kT), floored above zero."""
     t = np.asarray(t, dtype=float).ravel()
     d = np.asarray(d, dtype=float).ravel()
 
@@ -42,11 +45,11 @@ def estimate_min_decay_rate(
         raise ValueError("Subband duration must be positive")
 
     if peak <= 0.0 or threshold <= 0.0:
-        return 0.0
+        return float(DECAY_FLOOR)
 
     # k = log(A_initial / A_final) / duration.
     # If peak <= threshold, there is no positive lower bound on k.
-    return max(0.0, np.log(peak / threshold) / duration)
+    return float(max(DECAY_FLOOR, np.log(peak / threshold) / duration))
 
 
 def save_subband_grid_results(
@@ -226,276 +229,6 @@ def observed_data(
     return t, d
 
 
-def bandpass_subband(
-    t,
-    d,
-    min_f,
-    max_f,
-    order=4,
-):
-    """Apply a zero-phase Butterworth bandpass to one subband."""
-    t = np.asarray(t, dtype=float).ravel()
-    d = np.asarray(d, dtype=float).ravel()
-
-    if t.size != d.size:
-        raise ValueError("t and d must have the same length")
-
-    if t.size < 2:
-        raise ValueError("At least two samples are required")
-
-    dt_values = np.diff(t)
-
-    if np.any(dt_values <= 0):
-        raise ValueError("t must be strictly increasing")
-
-    sampling_rate = 1.0 / float(np.median(dt_values))
-    nyquist = sampling_rate / 2.0
-
-    if min_f <= 0.0:
-        raise ValueError(f"min_f must be positive, got {min_f}")
-
-    if max_f >= nyquist:
-        raise ValueError(
-            f"max_f ({max_f}) must be below Nyquist ({nyquist})"
-        )
-
-    if min_f >= max_f:
-        raise ValueError(
-            f"min_f ({min_f}) must be below max_f ({max_f})"
-        )
-
-    sos = butter(
-        order,
-        [min_f, max_f],
-        btype="bandpass",
-        fs=sampling_rate,
-        output="sos",
-    )
-
-    return sosfiltfilt(sos, d)
-
-
-def get_noise_floor(
-    t,
-    d,
-    min_f,
-    max_f,
-    fft_points=2000,
-):
-    """Return the band-limited RMS noise and its three-sigma threshold."""
-    t = np.asarray(t, dtype=float).ravel()
-    d = np.asarray(d, dtype=float).ravel()
-
-    if t.size != d.size:
-        raise ValueError("t and d must have the same length")
-
-    if t.size < 2:
-        raise ValueError("At least two samples are required")
-
-    if fft_points < 2:
-        raise ValueError("fft_points must be at least 2")
-
-    dt_values = np.diff(t)
-
-    if np.any(dt_values <= 0):
-        raise ValueError("t must be strictly increasing")
-
-    dt = float(np.median(dt_values))
-    sampling_rate = 1.0 / dt
-    nyquist = sampling_rate / 2.0
-
-    if not 0.0 <= min_f < max_f <= nyquist:
-        raise ValueError(
-            f"Expected 0 <= min_f < max_f <= {nyquist}, "
-            f"got {min_f} and {max_f}"
-        )
-
-    # Choose enough zero-padding to provide approximately fft_points
-    # frequency samples within this subband.
-    desired_df = (max_f - min_f) / (fft_points - 1)
-    required_fft_length = int(np.ceil(sampling_rate / desired_df))
-
-    fft_length = max(d.size, required_fft_length)
-    fft_length = 1 << (fft_length - 1).bit_length()
-
-    window = np.hanning(d.size)
-    window_power = np.sum(window**2)
-
-    fft_values = np.fft.rfft(
-        d * window,
-        n=fft_length,
-    )
-
-    frequencies = np.fft.rfftfreq(
-        fft_length,
-        d=dt,
-    )
-
-    # One-sided power spectral density.
-    psd = np.abs(fft_values) ** 2 / (
-        sampling_rate * window_power
-    )
-
-    if fft_length % 2 == 0:
-        psd[1:-1] *= 2.0
-    else:
-        psd[1:] *= 2.0
-
-    band_mask = (
-        (frequencies >= min_f)
-        & (frequencies <= max_f)
-        & np.isfinite(psd)
-    )
-
-    psd_band = psd[band_mask]
-
-    if psd_band.size < 3:
-        raise ValueError(
-            "Too few PSD values were found in the requested subband"
-        )
-
-    # Reject elevated spectral powers as one-sided contaminants.
-    rejection = rcrpy.RCR(
-        rcrpy.RejectionTech.LS_MODE_68
-    )
-    rejection.perform_rejection(psd_band.tolist())
-
-    flags = np.asarray(rejection.result.flags, dtype=bool)
-    kept_psd = psd_band[flags]
-
-    if kept_psd.size == 0:
-        raise RuntimeError("RCR rejected every PSD value")
-
-    mean_psd = 1.44 * float(np.median(kept_psd))
-    bandwidth = max_f - min_f
-
-    rms_noise = np.sqrt(mean_psd * bandwidth)
-    three_sigma = 3.0 * rms_noise
-
-    return float(rms_noise), float(three_sigma)
-
-
-def find_runs(
-    t,
-    d,
-    noise_floor,
-    n_points=20,
-    n_sigma=3.0,
-):
-    """Find signal runs terminated by n_points consecutively below threshold."""
-    t = np.asarray(t, dtype=float).ravel()
-    d = np.asarray(d, dtype=float).ravel()
-
-    if t.size != d.size:
-        raise ValueError("t and d must have the same length")
-
-    if n_points < 1:
-        raise ValueError("n_points must be at least 1")
-
-    threshold = n_sigma * noise_floor
-    above_threshold = np.abs(d) >= threshold
-
-    runs = []
-    start = None
-    below_count = 0
-
-    for index, is_above in enumerate(above_threshold):
-        if start is None:
-            if is_above:
-                start = index
-                below_count = 0
-            continue
-
-        if is_above:
-            # The signal rose above the threshold before enough consecutive
-            # quiet samples accumulated, so it remains the same run.
-            below_count = 0
-        else:
-            below_count += 1
-
-            if below_count >= n_points:
-                quiet_start = index - n_points + 1
-                end = quiet_start - 1
-
-                if end >= start:
-                    runs.append(
-                        {
-                            "start_index": int(start),
-                            "end_index": int(end),
-                            "length": int(end - start + 1),
-                            "start_time": float(t[start]),
-                            "end_time": float(t[end]),
-                        }
-                    )
-
-                start = None
-                below_count = 0
-
-    # Keep a run that remains active through the end of the data.
-    if start is not None:
-        end = t.size - 1
-
-        runs.append(
-            {
-                "start_index": int(start),
-                "end_index": int(end),
-                "length": int(end - start + 1),
-                "start_time": float(t[start]),
-                "end_time": float(t[end]),
-            }
-        )
-
-    return runs
-
-
-def select_highest_amplitude_run(
-    t,
-    d,
-    runs,
-):
-    """Select the strongest run and trim it to start at its largest peak."""
-    if not runs:
-        return None
-
-    t = np.asarray(t, dtype=float).ravel()
-    d = np.asarray(d, dtype=float).ravel()
-
-    def peak_amplitude(run):
-        start = run["start_index"]
-        stop = run["end_index"] + 1
-        return float(np.max(np.abs(d[start:stop])))
-
-    selected_run = max(runs, key=peak_amplitude)
-
-    run_start = selected_run["start_index"]
-    run_stop = selected_run["end_index"] + 1
-
-    # Locate the greatest absolute amplitude within the selected run.
-    local_peak_index = int(
-        np.argmax(np.abs(d[run_start:run_stop]))
-    )
-    peak_index = run_start + local_peak_index
-
-    # Keep the decay beginning at the largest-amplitude sample.
-    selected_t_absolute = t[peak_index:run_stop].copy()
-    selected_d = d[peak_index:run_stop].copy()
-
-    if selected_t_absolute.size < 2:
-        return None
-
-    # Make the peak occur at t=0 for the decaying BATS model.
-    selected_t = selected_t_absolute - selected_t_absolute[0]
-
-    return {
-        "t": selected_t,
-        "d": selected_d,
-        "peak_amplitude": float(np.abs(d[peak_index])),
-        "peak_index": int(peak_index),
-        "original_start_time": float(selected_t_absolute[0]),
-        "original_end_time": float(selected_t_absolute[-1]),
-    }
-
-
 def extract_selected_subbands(
     t,
     d,
@@ -528,7 +261,7 @@ def extract_selected_subbands(
             order=filter_order,
         )
 
-        noise_floor, three_sigma = get_noise_floor(
+        noise_floor, three_sigma, _method = get_noise_floor(
             t,
             d_subband,
             min_f=subband_min,

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 import multiprocessing
+import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import jax.numpy as jnp
 import numpy as np
@@ -16,10 +17,52 @@ from bats import (
     as_1d_float,
     broadcast_bandwidth,
     progress_bar_label,
+    resolve_imposed_surface,
     split_numpyro_kwargs,
 )
 
 _PROGRESS_MAX: int = 1
+
+ProgressMode = Literal["none", "main", "detailed"]
+PROGRESS_MODES: tuple[str, ...] = ("none", "main", "detailed")
+
+
+def resolve_progress_mode(progress_mode: str) -> ProgressMode:
+    mode = str(progress_mode)
+    if mode not in PROGRESS_MODES:
+        raise ValueError(
+            "progress_mode must be one of "
+            f"{PROGRESS_MODES}, got {progress_mode!r}"
+        )
+    return mode  # type: ignore[return-value]
+
+
+def nested_progress_enabled(progress_mode: str) -> bool:
+    return resolve_progress_mode(progress_mode) == "detailed"
+
+
+def resolve_signals_per_worker(
+    signals_per_worker: int | None = None,
+    f_per_worker: int | None = None,
+) -> int:
+    """Return ``signals_per_worker``, accepting deprecated ``f_per_worker``."""
+    if signals_per_worker is not None and f_per_worker is not None:
+        raise ValueError(
+            "Provide only one of signals_per_worker or f_per_worker"
+        )
+    if signals_per_worker is None and f_per_worker is None:
+        raise TypeError("signals_per_worker is required")
+    if f_per_worker is not None:
+        warnings.warn(
+            "f_per_worker is deprecated; use signals_per_worker",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        signals_per_worker = f_per_worker
+    value = int(signals_per_worker)
+    if value < 1:
+        raise ValueError(f"signals_per_worker must be >= 1, got {value}")
+    return value
 
 
 def init_parallel_worker(tqdm_lock: Any, max_cores: int) -> None:
@@ -74,7 +117,9 @@ class BATSTask:
     freq_lo: int = 1
     freq_hi: int = 1
     prior_n_std: float = 5.0
-    unbounded: bool = False
+    imposed_surface: str = "gaussian"
+    progress_mode: str = "detailed"
+    n_chains: int = 1
 
 
 @dataclass
@@ -84,14 +129,16 @@ class ColonyJob:
     d: ArrayLike
     f_init: ArrayLike
     k_init: ArrayLike
-    f_per_worker: int
+    signals_per_worker: int
     f_bw: float | ArrayLike | None
     k_bw: float | ArrayLike | None
     W: int
     S: int
     n_signals: int
     prior_n_std: float = 5.0
-    unbounded: bool = False
+    imposed_surface: str = "gaussian"
+    progress_mode: str = "detailed"
+    n_chains: int = 1
     nuts_kwargs: dict[str, Any] = field(default_factory=dict)
     mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
     run_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -100,13 +147,15 @@ class ColonyJob:
 def run_colony_worker(job: ColonyJob) -> tuple[int, list[BATSTask]]:
     colony = Colony(job.t, job.d, job.f_init, job.k_init)
     tasks = colony.get_tasks(
-        job.f_per_worker,
+        job.signals_per_worker,
         job.f_bw,
         job.k_bw,
         job.W,
         job.S,
         prior_n_std=job.prior_n_std,
-        unbounded=job.unbounded,
+        imposed_surface=job.imposed_surface,
+        progress_mode=job.progress_mode,
+        n_chains=job.n_chains,
         nuts_kwargs=job.nuts_kwargs,
         mcmc_kwargs=job.mcmc_kwargs,
         run_kwargs=job.run_kwargs,
@@ -116,26 +165,73 @@ def run_colony_worker(job: ColonyJob) -> tuple[int, list[BATSTask]]:
     return job.n_signals, tasks
 
 
+def _minimum_finite_potential_energy(result: BATSResult) -> float:
+    pe = np.asarray(result.extras.get("potential_energy"), dtype=float).ravel()
+    finite = pe[np.isfinite(pe)]
+    if finite.size == 0:
+        return float("inf")
+    return float(np.min(finite))
+
+
 def run_bats_worker(task: BATSTask) -> BATSResult:
     slot = acquire_progress_slot()
     try:
         n_signals = task.n_signals or int(len(task.f_init))
+        show_nested = nested_progress_enabled(task.progress_mode)
         desc = progress_bar_label(task.freq_lo, task.freq_hi, n_signals)
+        mcmc_kwargs = dict(task.mcmc_kwargs)
+        if not show_nested:
+            mcmc_kwargs["progress_bar"] = False
+        mcmc_kwargs["num_chains"] = 1
+        n_chains = max(1, int(getattr(task, "n_chains", 1)))
         model = BATS(task.t, task.d, task.f_init, task.k_init)
-        return model.run_nuts(
-            task.f_bw,
-            task.k_bw,
-            task.W,
-            task.S,
-            task.seed,
-            progress_desc=desc,
-            progress_position=slot + 1,
-            prior_n_std=task.prior_n_std,
-            unbounded=task.unbounded,
-            nuts_kwargs=task.nuts_kwargs,
-            mcmc_kwargs=task.mcmc_kwargs,
-            run_kwargs=task.run_kwargs,
+        best: BATSResult | None = None
+        best_pe = float("inf")
+        diagnostics: list[dict[str, Any]] = []
+        for chain in range(n_chains):
+            seed = int(task.seed) * 1009 + chain
+            chain_desc = desc if n_chains == 1 else f"{desc} chain {chain + 1}/{n_chains}"
+            result = model.run_nuts(
+                task.f_bw,
+                task.k_bw,
+                task.W,
+                task.S,
+                seed,
+                progress_desc=chain_desc if show_nested else None,
+                progress_position=(slot + 1) if show_nested else None,
+                prior_n_std=task.prior_n_std,
+                imposed_surface=task.imposed_surface,
+                nuts_kwargs=task.nuts_kwargs,
+                mcmc_kwargs=mcmc_kwargs,
+                run_kwargs=task.run_kwargs,
+            )
+            min_pe = _minimum_finite_potential_energy(result)
+            diagnostics.append(
+                {
+                    "chunk_seed": int(task.seed),
+                    "chain": int(chain),
+                    "seed": seed,
+                    "freq_lo": int(task.freq_lo),
+                    "freq_hi": int(task.freq_hi),
+                    "min_potential_energy": min_pe
+                    if np.isfinite(min_pe)
+                    else None,
+                    "n_finite_samples": int(
+                        result.extras.get("n_finite_samples", 0)
+                    ),
+                }
+            )
+            if min_pe < best_pe:
+                best_pe = min_pe
+                best = result
+        if best is None:
+            raise RuntimeError("NUTS produced no chain results")
+        best.extras["chain_diagnostics"] = diagnostics
+        best.extras["n_chains"] = n_chains
+        best.extras["selected_min_potential_energy"] = (
+            best_pe if np.isfinite(best_pe) else None
         )
+        return best
     finally:
         release_progress_slot(slot)
 
@@ -206,18 +302,29 @@ class Colony:
 
     def get_tasks(
         self,
-        f_per_worker: int,
+        signals_per_worker: int | None = None,
         f_bw: float | ArrayLike | None = None,
         k_bw: float | ArrayLike | None = None,
         W: int = 1_000,
         S: int = 2_000,
         prior_n_std: float = 5.0,
-        unbounded: bool = False,
+        unbounded: bool | None = None,
+        imposed_surface: str | None = None,
+        f_per_worker: int | None = None,
+        progress_mode: str = "detailed",
+        n_chains: int = 1,
         **kwargs: Any,
     ) -> list[BATSTask]:
         n = int(self.f_init.shape[0])
-        if f_per_worker < 1:
-            raise ValueError(f"f_per_worker must be >= 1, got {f_per_worker}")
+        chunk_size = resolve_signals_per_worker(
+            signals_per_worker=signals_per_worker,
+            f_per_worker=f_per_worker,
+        )
+        progress_mode = resolve_progress_mode(progress_mode)
+        surface = resolve_imposed_surface(
+            imposed_surface=imposed_surface,
+            unbounded=unbounded,
+        )
 
         if f_bw is None:
             f_bw = 1e-3
@@ -230,9 +337,11 @@ class Colony:
         k_bw = broadcast_bandwidth(k_bw, n, "k_bw")[self._order]
 
         nuts_kwargs, mcmc_kwargs, run_kwargs = split_numpyro_kwargs(kwargs)
+        n_chains = max(1, int(n_chains))
+        mcmc_kwargs = dict(mcmc_kwargs)
+        mcmc_kwargs["num_chains"] = 1
 
-        workers = math.ceil(n / f_per_worker) if n else 0
-        chunk_size = int(f_per_worker)
+        workers = math.ceil(n / chunk_size) if n else 0
         tasks: list[BATSTask] = []
         fs_sample = infer_sampling_rate(self.t)
         nyq = 0.5 * fs_sample
@@ -282,7 +391,9 @@ class Colony:
                     freq_lo=start + 1,
                     freq_hi=end,
                     prior_n_std=prior_n_std,
-                    unbounded=unbounded,
+                    imposed_surface=surface,
+                    progress_mode=progress_mode,
+                    n_chains=n_chains,
                 )
             )
 
