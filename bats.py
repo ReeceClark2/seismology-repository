@@ -803,7 +803,7 @@ def get_model(t: jax.Array, d: jax.Array, fs: jax.Array, ks: jax.Array) -> jax.A
     # Transform orthogonal amplitudes (h) back to physical amplitudes (A)
     B = h @ T
 
-    return B, model
+    return model
 
 
 def bats_model(
