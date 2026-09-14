@@ -122,7 +122,7 @@ def run_bats_worker(task: BATSTask) -> BATSResult:
         n_signals = task.n_signals or int(len(task.f_init))
         desc = progress_bar_label(task.freq_lo, task.freq_hi, n_signals)
         model = BATS(task.t, task.d, task.f_init, task.k_init)
-        return model.run_NUTS(
+        return model.run_nuts(
             task.f_bw,
             task.k_bw,
             task.W,
