@@ -91,8 +91,8 @@ def main():
         d,
         f_min=0.003,
         f_max=0.004,
-        k_min=1e-6,
-        k_max=2e-4,
+        k_min=1.9e-6,
+        k_max=1.1e-4,
         max_workers=20
     )
 
@@ -140,4 +140,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

@@ -109,6 +109,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     signals.append(signal_candidate)
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
+    reason = "depth"
     while True:
         signal_detected = False
         model = bats.get_model(subband_t, subband_d, signals)
