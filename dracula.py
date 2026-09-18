@@ -108,6 +108,8 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
     signals.append(signal_candidate)
     model = bats.get_model(subband_t, subband_d, signals)
+    utils.plot_time_series(path / f"{len(signals_with_candidate)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals_with_candidate)} Signal Model", model)
+
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
     reason = "depth"
@@ -168,7 +170,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             break
 
         log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
-        signal_detected = utils.is_signal_detected(probability_surface, log_prob, n=3)
+        signal_detected = utils.is_signal_detected(probability_surface, log_prob, n=1)
         if not signal_detected:
             reason = "rcr"
             break
