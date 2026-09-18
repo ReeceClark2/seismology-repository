@@ -327,11 +327,13 @@ def plot_signal_space(
     )
 
     if f_min is not None and f_max is not None:
-        ax.set_xlim(f_min, f_max)
+        halfwidth = f_max - f_min
+        ax.set_xlim(f_min - halfwidth / 2, f_max + halfwidth / 2)
 
     # Do not take the logarithm here. Matplotlib expects data values.
     if k_min is not None and k_max is not None:
-        ax.set_ylim(k_min, k_max)
+        halfwidth = k_max - k_min
+        ax.set_ylim(k_min - halfwidth / 2, k_max + halfwidth / 2)
 
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Decay Rate")

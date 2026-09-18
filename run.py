@@ -49,7 +49,7 @@ def observed_data(
         "bandpass",
         freqmin=min_f,
         freqmax=max_f,
-        corners=16,
+        corners=2,
         zerophase=True,
     )
 
@@ -100,7 +100,9 @@ def main():
         f_points=50,
         k_points=50
     )
-    nuts_kwargs = dict()
+    nuts_kwargs = dict(
+        target_accept_prob=0.90,
+    )
     mcmc_kwargs = dict(
         num_warmup=20,
         num_samples=40,
@@ -113,9 +115,11 @@ def main():
         run_kwargs=run_kwargs,
     )
 
-    nuts_kwargs = dict()
+    nuts_kwargs = dict(
+        target_accept_prob=0.85,
+    )
     mcmc_kwargs = dict(
-        num_warmup=200,
+        num_warmup=100,
         num_samples=400,
         num_chains=1,
     )
@@ -127,8 +131,9 @@ def main():
     )
 
     model.execute(
-        subband_count=20, 
+        subband_count=5, 
         subband_scaling_factor=0.9,
+        depth=6,
         grid_search_args=grid_search_args,
         nuts_args_init=nuts_args_init,
 
