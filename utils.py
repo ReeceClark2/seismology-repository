@@ -61,9 +61,14 @@ def unpack_signals(signals):
 
     return fs, ks
 
-def is_signal_detected(probability_surface):
+def is_signal_detected(probability_surface, log_prob=None):
     _, _, log_prob_space = probability_surface
     log_prob_space = log_prob_space.ravel()
+
+    if log_prob is not None:
+        log_prob_space = jnp.concatenate(
+            [log_prob_space, jnp.atleast_1d(log_prob)]
+        )
 
     r = rcrpy.RCR(rcrpy.RejectionTech.ES_MODE_DL)
     r.perform_rejection(log_prob_space)
@@ -391,6 +396,7 @@ def save_initialize_csv(path, signals_by_subband):
         "Signals",
         "Noise Variance",
         "SNR",
+        "Reason",
     ]
 
     with open(path, "w", newline="") as csvfile:
@@ -408,6 +414,7 @@ def save_initialize_csv(path, signals_by_subband):
                     "Signals": len(fs),
                     "Noise Variance": subband_data["noise_variance"],
                     "SNR": subband_data["snr"],
+                    "Reason": subband_data["reason"],
                 }
             )
 
@@ -525,4 +532,3 @@ def save_report_txt(path, signal_count, noise_variance, snr):
         file.write(f"Signal count: {signal_count}\n")
         file.write(f"Noise variance: {noise_variance}\n")
         file.write(f"SNR: {snr}\n")
-        

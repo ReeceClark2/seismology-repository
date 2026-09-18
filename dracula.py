@@ -110,6 +110,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
     while True:
+        signal_detected = False
         model = bats.get_model(subband_t, subband_d, signals)
         residual = subband_d - model
 
@@ -142,6 +143,16 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.run_kwargs,
                 rng_key_value
             )
+            signal_candidate = bats(
+                subband_t, 
+                residual, 
+                signal_candidate,
+                signal_bw,
+                nuts_args.nuts_kwargs,
+                nuts_args.mcmc_kwargs,
+                nuts_args.run_kwargs,
+                rng_key_value
+            )
             
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
         else:
@@ -151,6 +162,13 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         delta_glob_ll = glob_ll_1 - glob_ll_0
 
         if delta_glob_ll < 0:
+            reason = "glob_ll"
+            break
+
+        log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
+        signal_detected = utils.is_signal_detected(probability_surface, log_prob)
+        if not signal_detected:
+            reason = 'rcr'
             break
 
         glob_ll_0 = glob_ll_1
@@ -176,6 +194,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         "signals_bw": signals_bw,
         "noise_variance": noise_variance,
         "snr": snr,
+        "reason": reason,
     }
 
 def run_initial_conditions_worker_wrapper(
@@ -471,6 +490,7 @@ class Dracula():
                 "signals_bw": result["signals_bw"],
                 "noise_variance": result["noise_variance"],
                 "snr": result["snr"]
+                "reason": result["reason"]
             }
             for result in ordered_results
         }
