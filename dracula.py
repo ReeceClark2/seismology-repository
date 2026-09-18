@@ -143,7 +143,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.run_kwargs,
                 rng_key_value
             )
-            signal_candidate = bats(
+            signal_candidate = bats.nuts(
                 subband_t, 
                 residual, 
                 signal_candidate,
@@ -168,7 +168,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
         signal_detected = utils.is_signal_detected(probability_surface, log_prob)
         if not signal_detected:
-            reason = 'rcr'
+            reason = "rcr"
             break
 
         glob_ll_0 = glob_ll_1
@@ -489,7 +489,7 @@ class Dracula():
                 "signals": result["signals"],
                 "signals_bw": result["signals_bw"],
                 "noise_variance": result["noise_variance"],
-                "snr": result["snr"]
+                "snr": result["snr"],
                 "reason": result["reason"]
             }
             for result in ordered_results
