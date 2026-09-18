@@ -1,638 +1,716 @@
-from __future__ import annotations
-
-import concurrent.futures
-import csv
-import multiprocessing
-import os
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import chain
+from dataclasses import dataclass, asdict, field, fields
+from typing import Any, Optional
 from pathlib import Path
-from typing import Any
 from datetime import datetime
+import traceback
+import math
+from collections import defaultdict
 
-import jax
-import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
-from numpy.typing import ArrayLike
-from tqdm.auto import tqdm
 
-from bats import (
-    BATSResult,
-    StatisticsResult,
-    as_1d_float,
-    broadcast_bandwidth,
-    get_model,
-    get_statistics,
-    prefix_bandwidth,
-    rank_by_power,
-    split_numpyro_kwargs,
-)
-from colony import (
-    ColonyJob,
-    init_parallel_worker,
-    run_bats_worker,
-    run_colony_worker,
-)
+import jax.numpy as jnp
+from jax.typing import ArrayLike
 
+from tqdm import tqdm
 
-def _np(value: Any) -> np.ndarray:
-    return np.asarray(value)
-
-
-def _nearest_power(p_spec: ArrayLike, frequencies: ArrayLike) -> np.ndarray:
-    f_grid, p_grid = _np(p_spec).T
-    frequencies = _np(frequencies).ravel()
-    idx = np.array([np.argmin(np.abs(f_grid - f)) for f in frequencies])
-    return p_grid[idx]
-
-
-def _resolve_output_dir(output_dir: str | os.PathLike[str] | None) -> Path:
-    path = Path(output_dir) if output_dir is not None else Path.cwd() / "dracula_"
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = path.parent / f"{path.name}_{timestamp}"
-
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _write_signal_csv(path: Path, stats: StatisticsResult) -> None:
-    order = np.argsort(_np(stats.fs))
-    rows = zip(
-        _np(stats.fs)[order],
-        _np(stats.f_unc)[order],
-        _np(stats.ks)[order],
-        _np(stats.k_unc)[order],
-    )
-    with path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "frequencies",
-                "frequency_uncertainties",
-                "decay_rates",
-                "decay_rate_uncertainties",
-            ]
-        )
-        for row in rows:
-            writer.writerow([float(v) for v in row])
-
-
-def _write_global_csv(path: Path, by_n: dict[int, StatisticsResult | BATSResult | None]) -> None:
-    with path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["N", "SNR", "variance", "glob_LL"])
-        for n in sorted(by_n):
-            result = by_n[n]
-            if not isinstance(result, StatisticsResult):
-                continue
-            writer.writerow(
-                [
-                    int(n),
-                    float(result.SNR),
-                    float(result.variance),
-                    float(result.glob_LL),
-                ]
-            )
-
-
-def _plot_timeseries(
-    path: Path,
-    t: ArrayLike,
-    d: ArrayLike,
-    fs: ArrayLike,
-    ks: ArrayLike,
-    SNR: ArrayLike,
-    variance: ArrayLike,
-    n: int,
-) -> None:
-    t_np = _np(t)
-    d_np = _np(d)
-    model = _np(get_model(t, d, fs, ks))
-    residual = d_np - model
-
-    fig, axes = plt.subplots(
-        2,
-        1,
-        sharex=True,
-        figsize=(12, 7),
-        gridspec_kw={"height_ratios": [2, 1]},
-    )
-    axes[0].plot(t_np, d_np, color="black", lw=0.7, label="Data")
-    axes[0].plot(t_np, model, color="C0", lw=0.9, alpha=0.85, label="Model (h·H)")
-    axes[0].set_ylabel("Amplitude")
-    axes[0].legend(loc="upper right")
-    axes[0].set_title(f"N = {n} signal model")
-    axes[0].text(
-        0.02,
-        0.95,
-        f"SNR = {float(SNR):.4g}\nvariance = {float(variance):.4g}",
-        transform=axes[0].transAxes,
-        va="top",
-        ha="left",
-        fontsize=10,
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
-    )
-    axes[1].plot(t_np, residual, color="C3", lw=0.7, label="Residual (data − model)")
-    axes[1].axhline(0.0, color="gray", lw=0.6, alpha=0.7)
-    axes[1].set_ylabel("Residual")
-    axes[1].set_xlabel("Time (s)")
-    axes[1].legend(loc="upper right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_power_spectrum(
-    path: Path,
-    before: StatisticsResult,
-    after: StatisticsResult,
-    f_init: ArrayLike,
-    n: int,
-) -> None:
-    f_before, p_before = _np(before.p_spec).T
-    f_after, p_after = _np(after.p_spec).T
-    order_b = np.argsort(f_before)
-    order_a = np.argsort(f_after)
-
-    f_init_np = _np(f_init).ravel()
-    f_found = _np(after.fs).ravel()
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(
-        f_before[order_b],
-        p_before[order_b],
-        color="0.45",
-        lw=1.0,
-        label="Power spectrum (before sampling)",
-    )
-    ax.plot(
-        f_after[order_a],
-        p_after[order_a],
-        color="C0",
-        lw=1.1,
-        label="Power spectrum (after sampling)",
-    )
-    ax.scatter(
-        f_init_np,
-        _nearest_power(before.p_spec, f_init_np),
-        s=36,
-        color="black",
-        zorder=3,
-        label="Original frequencies",
-    )
-    ax.scatter(
-        f_found,
-        _nearest_power(after.p_spec, f_found),
-        s=42,
-        marker="x",
-        color="C3",
-        zorder=4,
-        label="Found frequencies",
-    )
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Power")
-    ax.set_title(f"N = {n} power spectrum")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _write_outputs(
-    output_dir: Path,
-    t: ArrayLike,
-    d: ArrayLike,
-    by_n: dict[int, StatisticsResult | BATSResult | None],
-    f_init_by_n: dict[int, Any],
-    k_init_by_n: dict[int, Any],
-) -> None:
-    _write_global_csv(output_dir / "global_stats.csv", by_n)
-
-    for n in sorted(by_n):
-        result = by_n[n]
-        if not isinstance(result, StatisticsResult):
-            continue
-
-        stem = f"N{n:03d}"
-        _write_signal_csv(output_dir / f"{stem}_signals.csv", result)
-        _plot_timeseries(
-            output_dir / f"{stem}_timeseries.png",
-            t,
-            d,
-            result.fs,
-            result.ks,
-            result.SNR,
-            result.variance,
-            n,
-        )
-        before = get_statistics(t, d, f_init_by_n[n], k_init_by_n[n])
-        _plot_power_spectrum(
-            output_dir / f"{stem}_power_spectrum.png",
-            before,
-            result,
-            f_init_by_n[n],
-            n,
-        )
+import bats
+import utils
 
 
 @dataclass
-class DraculaResult:
-    """Dispatch outputs keyed by signal count ``N``.
+class SignalSpace:
+    f_min: float
+    f_max: float
+    k_min: float
+    k_max: float
 
-    Use ``result[n]`` for the N-signal model, or ``as_list()`` for
-    ``min_signals`` … ``max_signals`` order. ``extras`` holds anything
-    added later without changing required fields.
-    """
-    by_n: dict[int, StatisticsResult | BATSResult | None]
-    min_signals: int
-    max_signals: int
-    extras: dict[str, Any] = field(default_factory=dict)
+@dataclass
+class GridSearchArgs:
+    f_points: int
+    k_points: int
 
-    def __getitem__(self, n: int) -> StatisticsResult | BATSResult | None:
-        return self.by_n[n]
+@dataclass
+class NUTSArgs:
+    nuts_kwargs: dict[str, Any] = field(default_factory=dict)
+    mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
+    run_kwargs: dict[str, Any] = field(default_factory=dict)
 
-    def __iter__(self):
-        for n in range(self.min_signals, self.max_signals + 1):
-            yield self.by_n[n]
+@dataclass
+class InitialConditionsTask:
+    t: ArrayLike
+    d: ArrayLike
+    signal_space: SignalSpace
+    depth: int
+    grid_search_args: GridSearchArgs
+    nuts_args: NUTSArgs
+    path: str
 
-    def as_list(self) -> list[StatisticsResult | BATSResult | None]:
-        return [self.by_n[s] for s in range(self.min_signals, self.max_signals + 1)]
+def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, nuts_args, path):
+    path.mkdir(parents=True, exist_ok=True)
 
+    subband_t = t.copy()
+    subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
 
-class Dracula:
-    def __init__(
-        self,
-        t: ArrayLike,
-        d: ArrayLike,
-        f_init: ArrayLike,
-        k_init: ArrayLike,
-    ) -> None:
-        self.t = as_1d_float(t, "t")
-        self.d = as_1d_float(d, "d")
-        if self.t.shape[0] != self.d.shape[0]:
-            raise ValueError(
-                f"t and d must have the same length, got {self.t.shape[0]} and {self.d.shape[0]}"
+    t_max = jnp.log(0.2) / (-signal_space.k_min)
+
+    mask = t < t_max
+
+    subband_t = subband_t[mask]
+    subband_d = subband_d[mask]
+
+    utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
+
+    signals = []
+    signal_bw = ((signal_space.f_max - signal_space.f_min) / 4, (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 4)
+    noise_variances = []
+    snrs = []
+    
+    signal_candidate, probability_surface = bats.grid_search(
+        subband_t, 
+        subband_d, 
+        grid_search_args.f_points,
+        signal_space.f_min, 
+        signal_space.f_max,
+        grid_search_args.k_points,
+        signal_space.k_min, 
+        signal_space.k_max,
+        return_probability_surface=True
+    )
+    utils.plot_probability_surface(path / f"{len(signals) + 1}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals) + 1}")
+
+    if nuts_args:
+        signals_temp = tuple(x.copy() for x in signal_candidate)
+        signal_candidate = bats.nuts(
+            subband_t, 
+            subband_d, 
+            signal_candidate,
+            signal_bw,
+            nuts_args.nuts_kwargs,
+            nuts_args.mcmc_kwargs,
+            nuts_args.run_kwargs,
+        )[0]
+
+        utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+    else:
+        utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+
+    noise_variances.append(bats.get_noise_variance(t, d, signal_candidate))
+    snrs.append(bats.get_snr(t, d, signal_candidate))
+
+    signal_detected = utils.is_signal_detected(probability_surface)
+    if not signal_detected:
+        return
+
+    signals.append(signal_candidate)
+    glob_ll_0 = bats.get_glob_ll(t, d, signals)
+
+    while True:
+        model = bats.get_model(subband_t, subband_d, signals)
+        residual = subband_d - model
+
+        utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
+
+        signal_candidate, probability_surface = bats.grid_search(
+            subband_t, 
+            residual, 
+            grid_search_args.f_points,
+            signal_space.f_min, 
+            signal_space.f_max,
+            grid_search_args.k_points,
+            signal_space.k_min, 
+            signal_space.k_max,
+            return_probability_surface=True
+        )
+        utils.plot_probability_surface(path / f"{len(signals) + 1}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals) + 1}")
+
+        signals_with_candidate = list(signals) + [signal_candidate]
+
+        if nuts_args:
+            signals_temp = signals_with_candidate.copy()
+            signals_with_candidate = bats.nuts(
+                subband_t, 
+                subband_d, 
+                signals_with_candidate,
+                signal_bw,
+                nuts_args.nuts_kwargs,
+                nuts_args.mcmc_kwargs,
+                nuts_args.run_kwargs,
             )
+            
+            utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+        else:
+            utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
-        self.f_init = as_1d_float(f_init, "f_init")
-        self.k_init = as_1d_float(k_init, "k_init")
-        if self.f_init.shape[0] != self.k_init.shape[0]:
-            raise ValueError(
-                "f_init and k_init must have the same length, "
-                f"got {self.f_init.shape[0]} and {self.k_init.shape[0]}"
-            )
+        noise_variances.append(bats.get_noise_variance(t, d, signals_with_candidate))
+        snrs.append(bats.get_snr(t, d, signals_with_candidate))
 
-    def _prepare_signals(
-        self,
-        f_bw: float | ArrayLike | None,
-        k_bw: float | ArrayLike | None,
-        sort_signals: bool,
-    ) -> tuple[Any, Any, float | Any | None, float | Any | None, dict[str, Any]]:
-        f_work = self.f_init
-        k_work = self.k_init
-        f_bw_work = f_bw
-        k_bw_work = k_bw
-        extras: dict[str, Any] = {"sort_signals": sort_signals}
+        glob_ll_1 = bats.get_glob_ll(t, d, signals_with_candidate)
+        delta_glob_ll = glob_ll_1 - glob_ll_0
 
-        if sort_signals:
-            order, powers, _ = rank_by_power(self.t, self.d, f_work, k_work)
-            f_work = f_work[order]
-            k_work = k_work[order]
-            n = int(f_work.shape[0])
-            if f_bw is not None:
-                f_bw_work = broadcast_bandwidth(f_bw, n, "f_bw")[order]
-            if k_bw is not None:
-                k_bw_work = broadcast_bandwidth(k_bw, n, "k_bw")[order]
-            extras["sort_order"] = order
-            extras["powers"] = powers[order]
+        if delta_glob_ll < 0:
+            break
 
-        return f_work, k_work, f_bw_work, k_bw_work, extras
+        glob_ll_0 = glob_ll_1
 
-    def dispatch(
-        self,
-        f_per_worker: int,
-        min_signals: int,
-        max_signals: int,
-        f_bw: float | ArrayLike | None = None,
-        k_bw: float | ArrayLike | None = None,
-        W: int = 1_000,
-        S: int = 2_000,
-        calc_stats: bool = True,
-        stats_at_end: bool = False,
-        max_cores: int | None = None,
-        sort_signals: bool = True,
-        output_dir: str | os.PathLike[str] | None = None,
-        prior_n_std: float = 5.0,
-        unbounded: bool = False,
-        **kwargs: Any,
-    ) -> DraculaResult:
-        n_total = int(self.f_init.shape[0])
-        if min_signals < 1:
-            raise ValueError(f"min_signals must be >= 1, got {min_signals}")
-        if max_signals < min_signals:
-            raise ValueError(
-                f"max_signals ({max_signals}) must be >= min_signals ({min_signals})"
-            )
-        if max_signals > n_total:
-            raise ValueError(
-                f"max_signals ({max_signals}) exceeds available signals ({n_total})"
-            )
-        if f_per_worker < 1:
-            raise ValueError(f"f_per_worker must be >= 1, got {f_per_worker}")
-        if prior_n_std <= 0:
-            raise ValueError(f"prior_n_std must be > 0, got {prior_n_std}")
+        signals = signals_with_candidate
 
-        f_work, k_work, f_bw_work, k_bw_work, sort_extras = self._prepare_signals(
-            f_bw, k_bw, sort_signals
+        if len(signals) >= depth:
+            break
+
+    utils.save_subband_csv(path / "subband_results.csv", signals_with_candidate, noise_variances, snrs)
+
+    signals_bw = [tuple(signal_bw) for _ in signals]
+
+    noise_variance = bats.get_noise_variance(t, d, signals)
+    snr = bats.get_snr(t, d, signals)
+
+    return {
+        "f_min": signal_space.f_min,
+        "f_max": signal_space.f_max,
+        "signals": signals,
+        "signals_bw": signals_bw,
+        "noise_variance": noise_variance,
+        "snr": snr,
+    }
+
+def run_initial_conditions_worker_wrapper(
+    config: InitialConditionsTask,
+):
+    config_dict = {
+        field.name: getattr(config, field.name)
+        for field in fields(config)
+    }
+
+    try:
+        return run_initial_conditions_worker(**config_dict)
+
+    except BaseException as exc:
+        worker_traceback = traceback.format_exc()
+
+        print(
+            "\n========== WORKER TRACEBACK ==========\n"
+            f"Exception type: {type(exc).__name__}\n"
+            f"Exception: {exc}\n"
+            f"{worker_traceback}"
+            "======================================\n",
+            flush=True,
         )
 
-        if max_cores is None:
-            max_cores = max(1, (os.cpu_count() or 4) - 2)
+        raise RuntimeError(
+            f"Worker failed with {type(exc).__name__}: {exc}\n\n"
+            f"Original worker traceback:\n{worker_traceback}"
+        ) from None
 
-        print(f"Limiting execution to {max_cores} concurrent workers.")
+@dataclass
+class SampleTask:
+    t: ArrayLike
+    d: ArrayLike
+    signal_space: SignalSpace
+    signals: Any
+    signals_bw: Any
+    signal_indices: list[int]
+    nuts_args: NUTSArgs
+    path: str
 
-        nuts_kwargs, mcmc_kwargs, run_kwargs = split_numpyro_kwargs(kwargs)
+def run_sample_worker(
+    t,
+    d,
+    signal_space,
+    signals,
+    signals_bw,
+    signal_indices,
+    nuts_args,
+    path
+):
+    path.mkdir(parents=True, exist_ok=True)
 
-        grouped_results: dict[int, list[BATSResult]] = {
-            s: [] for s in range(min_signals, max_signals + 1)
-        }
-        tasks_remaining: dict[int, int | None] = {
-            s: None for s in range(min_signals, max_signals + 1)
-        }
-        final_results: dict[int, StatisticsResult | BATSResult | None] = {
-            s: None for s in range(min_signals, max_signals + 1)
-        }
-        deferred_statistics: dict[int, BATSResult] = {}
-        f_init_by_n = {s: f_work[:s] for s in range(min_signals, max_signals + 1)}
-        k_init_by_n = {s: k_work[:s] for s in range(min_signals, max_signals + 1)}
+    d = utils.filter(t, d, signal_space.f_min, signal_space.f_max)
 
-        n_models = max_signals - min_signals + 1
-        colony_queue = list(range(min_signals, max_signals + 1))
+    t_max = jnp.log(0.2) / (-signal_space.k_min)
 
-        future_metadata: dict[Any, tuple[str, int]] = {}
-        pending_futures: set[concurrent.futures.Future[Any]] = set()
+    mask = t < t_max
 
-        def submit_colony(executor: concurrent.futures.ProcessPoolExecutor) -> None:
-            if not colony_queue:
-                return
-            signals = colony_queue.pop(0)
-            job = ColonyJob(
+    t = t[mask]
+    d = d[mask]
+
+    utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
+
+    signals_0 = signals.copy()
+    signals = bats.nuts(
+        t,
+        d,
+        signals,
+        signals_bw,
+        nuts_args.nuts_kwargs,
+        nuts_args.mcmc_kwargs,
+        nuts_args.run_kwargs,
+    )
+
+    utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_0, signals_bw=signals_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+
+    model = bats.get_model(t, d, signals)
+    utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
+    utils.save_block_csv(path / "block_results.csv", signals)
+
+    if len(signals) != len(signal_indices):
+        raise ValueError(
+            "Number of NUTS results does not match number of input signals: "
+            f"{len(signals)=}, {len(signal_indices)=}"
+        )
+
+    return list(zip(signal_indices, signals))
+
+def run_sample_worker_wrapper(config: SampleTask):
+    config_dict = {
+        field.name: getattr(config, field.name)
+        for field in fields(config)
+    }
+
+    try:
+        return run_sample_worker(**config_dict)
+
+    except BaseException as exc:
+        worker_traceback = traceback.format_exc()
+
+        print(
+            "\n========== WORKER TRACEBACK ==========\n"
+            f"Exception type: {type(exc).__name__}\n"
+            f"Exception: {exc}\n"
+            f"{worker_traceback}"
+            "======================================\n",
+            flush=True,
+        )
+
+        raise RuntimeError(
+            f"Worker failed with {type(exc).__name__}: {exc}\n\n"
+            f"Original worker traceback:\n{worker_traceback}"
+        ) from None
+
+class Dracula():
+    def __init__(
+            self, 
+            t: ArrayLike, 
+            d: ArrayLike,
+            f_min: float,
+            f_max: float,
+            k_min: float,
+            k_max: float,
+            max_workers: int=1
+        ):
+        self.t = jnp.asarray(t)
+        self.d = jnp.asarray(d)
+
+        self.signal_space = SignalSpace(
+            f_min=f_min,
+            f_max=f_max,
+            k_min=k_min,
+            k_max=k_max
+        )
+
+        self.max_workers = max_workers
+
+        path = Path.cwd() / "dracula"
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = path.parent / f"{path.name}_{timestamp}"
+        self.path.mkdir(parents=True, exist_ok=True)
+
+        self.default_grid_search_args = GridSearchArgs(
+            f_points=100,
+            k_points=100
+        )
+
+        nuts_kwargs = dict()
+        mcmc_kwargs = dict(
+            num_warmup=500,
+            num_samples=2_000,
+            num_chains=1
+        )
+        run_kwargs = dict()
+        self.default_nuts_args_sample = NUTSArgs(
+            nuts_kwargs=nuts_kwargs,
+            mcmc_kwargs=mcmc_kwargs,
+            run_kwargs=run_kwargs
+        )
+
+    def initialize(
+            self,
+            subband_count: int,
+            subband_scaling_factor: float,
+            depth: int,
+            grid_search_args: GridSearchArgs,
+            nuts_args: NUTSArgs,
+    ):
+        print("Finding initial conditions...")
+
+        path = self.path / "initialize"
+        path.mkdir(parents=True, exist_ok=True)
+        pbar = tqdm(total=subband_count)
+        
+        if subband_count == 1:
+            subbands = [(self.signal_space.f_min, self.signal_space.f_max)]
+
+        else:
+            bandwidth = self.signal_space.f_max - self.signal_space.f_min
+            subbands = np.empty((subband_count), dtype=object)
+            r = subband_scaling_factor ** (1 / (subband_count - 1))
+
+            if subband_scaling_factor == 1:
+                subband_width_0 = bandwidth / subband_count
+            else:
+                subband_width_0 = bandwidth * ((1 - r) / (1 - r ** subband_count))
+
+            subband_min = self.signal_space.f_min
+            for i in range(subband_count):
+                subband_width = subband_width_0 * (r ** i)
+                subband_max = subband_min + subband_width
+
+                subbands[i] = (subband_min, subband_max)
+
+                subband_min = subband_max
+
+        tasks: list[InitialConditionsTask | None] = [None] * len(subbands)
+        for ind, _ in enumerate(subbands):
+            signal_space = SignalSpace(
+                f_min=subbands[ind][0],
+                f_max=subbands[ind][1],
+                k_min=self.signal_space.k_min,
+                k_max=self.signal_space.k_max
+            )
+
+            tasks[ind] = InitialConditionsTask(
                 t=self.t,
                 d=self.d,
-                f_init=f_work[:signals],
-                k_init=k_work[:signals],
-                f_per_worker=f_per_worker,
-                f_bw=prefix_bandwidth(f_bw_work, signals, "f_bw"),
-                k_bw=prefix_bandwidth(k_bw_work, signals, "k_bw"),
-                W=W,
-                S=S,
-                n_signals=signals,
-                prior_n_std=prior_n_std,
-                unbounded=unbounded,
-                nuts_kwargs=nuts_kwargs,
-                mcmc_kwargs=mcmc_kwargs,
-                run_kwargs=run_kwargs,
-            )
-            future = executor.submit(run_colony_worker, job)
-            future_metadata[future] = ("colony", signals)
-            pending_futures.add(future)
-
-        def launch_stats_if_ready(
-            executor: concurrent.futures.ProcessPoolExecutor,
-            signals: int,
-        ) -> None:
-            """Combine completed BATS jobs and schedule or defer statistics."""
-            if tasks_remaining[signals] != 0:
-                return
-
-            if not grouped_results[signals]:
-                final_results[signals] = None
-                return
-
-            colony_res = sorted(
-                grouped_results[signals],
-                key=lambda result: (
-                    result.seed if result.seed is not None else 0
-                ),
+                signal_space=signal_space,
+                depth=depth,
+                grid_search_args=grid_search_args,
+                nuts_args=nuts_args,
+                path=path / f"subband_{ind + 1}r{subband_count}"
             )
 
-            flat_fs = jnp.concatenate(
-                [result.fs for result in colony_res]
-            )
-            flat_ks = jnp.concatenate(
-                [result.ks for result in colony_res]
-            )
+        task_results_by_index = {}
 
-            combined = BATSResult(
-                fs=flat_fs,
-                ks=flat_ks,
-            )
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_index = {
+                executor.submit(
+                    run_initial_conditions_worker_wrapper,
+                    task,
+                ): i
+                for i, task in enumerate(tasks)
+            }
 
-            # Release the individual BATS results once they have been combined.
-            grouped_results[signals].clear()
+            for future in as_completed(future_to_index):
+                pbar.update(1)
+                task_index = future_to_index[future]
 
-            if not calc_stats:
-                final_results[signals] = combined
-                return
+                try:
+                    result = future.result()
 
-            if stats_at_end:
-                # Only retain the small frequency/decay arrays. Statistics will run
-                # after the process pool has shut down and released worker memory.
-                deferred_statistics[signals] = combined
-                return
+                    if result is not None:
+                        result["subband_index"] = task_index
+                        task_results_by_index[task_index] = result
 
-            stats_future = executor.submit(
-                get_statistics,
-                self.t,
-                self.d,
-                combined.fs,
-                combined.ks,
-            )
+                except BaseException as exc:
+                    traceback_text = traceback.format_exc()
 
-            future_metadata[stats_future] = ("stats", signals)
-            pending_futures.add(stats_future)
-
-        tqdm.monitor_interval = 0
-        ctx = multiprocessing.get_context("spawn")
-        tqdm_lock = ctx.RLock()
-        try:
-            tqdm.set_lock(tqdm_lock)
-        except Exception:
-            pass
-
-        pipeline = tqdm(
-            total=n_models,
-            desc="Dracula",
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-            unit="job",
-        )
-
-        try:
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=max_cores,
-                mp_context=ctx,
-                initializer=init_parallel_worker,
-                initargs=(tqdm_lock, max_cores),
-            ) as executor:
-
-                for _ in range(min(max_cores, n_models)):
-                    submit_colony(executor)
-
-                while pending_futures:
-                    done, pending_futures = concurrent.futures.wait(
-                        pending_futures,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    print(
+                        f"\nWorker failed with {type(exc).__name__}: {exc}\n"
+                        f"{traceback_text}",
+                        flush=True,
                     )
 
-                    for future in done:
-                        task_type, signals = future_metadata.pop(future)
+                    raise RuntimeError(
+                        f"{type(exc).__name__}: {exc}\n\n"
+                        f"Worker traceback:\n{traceback_text}"
+                    ) from None
 
-                        try:
-                            if task_type == "colony":
-                                _, colony_tasks = future.result()
-                                tasks_remaining[signals] = len(colony_tasks)
+        ordered_results = [
+            task_results_by_index[i]
+            for i in sorted(task_results_by_index)
+        ]
 
-                                extra_jobs = len(colony_tasks) + (
-                                    1
-                                    if calc_stats and colony_tasks
-                                    else 0
-                                )
-                                pipeline.total = (
-                                    pipeline.total or 0
-                                ) + extra_jobs
-
-                                pipeline.set_postfix_str(
-                                    f"N={signals} colony ready "
-                                    f"({len(colony_tasks)} BATS)",
-                                    refresh=True,
-                                )
-                                pipeline.update(1)
-
-                                for task in colony_tasks:
-                                    bats_future = executor.submit(
-                                        run_bats_worker,
-                                        task,
-                                    )
-                                    future_metadata[bats_future] = (
-                                        "bats",
-                                        signals,
-                                    )
-                                    pending_futures.add(bats_future)
-
-                                if not colony_tasks:
-                                    final_results[signals] = None
-
-                                submit_colony(executor)
-
-                            elif task_type == "bats":
-                                result = future.result()
-                                grouped_results[signals].append(result)
-
-                                remaining = tasks_remaining[signals]
-                                if remaining is not None:
-                                    tasks_remaining[signals] = remaining - 1
-
-                                pipeline.update(1)
-                                launch_stats_if_ready(executor, signals)
-
-                            elif task_type == "stats":
-                                final_results[signals] = future.result()
-                                pipeline.update(1)
-
-                        except Exception as error:
-                            print(
-                                f"Task {task_type!r} for {signals} "
-                                f"signals failed: {error}"
-                            )
-                            pipeline.update(1)
-
-                            if task_type == "colony":
-                                submit_colony(executor)
-
-                            elif (
-                                task_type == "bats"
-                                and tasks_remaining[signals] is not None
-                            ):
-                                tasks_remaining[signals] -= 1
-                                launch_stats_if_ready(
-                                    executor,
-                                    signals,
-                                )
-
-            # The executor has now shut down. Its worker processes and their
-            # memory allocations are gone before statistics calculations begin.
-            if calc_stats and stats_at_end:
-                for signals in sorted(deferred_statistics):
-                    combined = deferred_statistics[signals]
-
-                    pipeline.set_postfix_str(
-                        f"N={signals} sequential statistics",
-                        refresh=True,
-                    )
-
-                    try:
-                        stats = get_statistics(
-                            self.t,
-                            self.d,
-                            combined.fs,
-                            combined.ks,
-                        )
-
-                        # Ensure all result arrays finish before launching the next job.
-                        jax.block_until_ready(
-                            (
-                                stats.log_prob,
-                                stats.variance,
-                                stats.SNR,
-                                stats.p_spec,
-                                stats.glob_LL,
-                                stats.cov_mat,
-                                stats.f_unc,
-                                stats.k_unc,
-                            )
-                        )
-
-                        final_results[signals] = stats
-
-                    except Exception as error:
-                        final_results[signals] = None
-                        print(
-                            f"Sequential statistics for N={signals} "
-                            f"failed: {error}"
-                        )
-                    finally:
-                        deferred_statistics.pop(signals, None)
-                        pipeline.update(1)
-
-        finally:
-            pipeline.close()
-
-        out_path = _resolve_output_dir(output_dir)
-        _write_outputs(
-            out_path,
-            self.t,
-            self.d,
-            final_results,
-            f_init_by_n,
-            k_init_by_n,
+        signals_init = list(
+            chain.from_iterable(
+                result["signals"]
+                for result in ordered_results
+            )
         )
 
-        extras = {
-            **sort_extras,
-            "output_dir": str(out_path),
-            "f_init": f_work,
-            "k_init": k_work,
-            "prior_n_std": prior_n_std,
-            "unbounded": unbounded,
-            "stats_at_end": bool(stats_at_end),
+        signals_bw_init = list(
+            chain.from_iterable(
+                result["signals_bw"]
+                for result in ordered_results
+            )
+        )
+
+        signals_and_bw = sorted(
+            zip(signals_init, signals_bw_init),
+            key=lambda pair: pair[0][0],  
+        )
+
+        self.signals_init, self.signals_bw_init = map(
+            list,
+            zip(*signals_and_bw)
+        )
+
+        self.signals_by_subband = {
+            result["subband_index"]: {
+                "f_min": result["f_min"],
+                "f_max": result["f_max"],
+                "signals": result["signals"],
+                "signals_bw": result["signals_bw"],
+                "noise_variance": result["noise_variance"],
+                "snr": result["snr"]
+            }
+            for result in ordered_results
         }
 
-        return DraculaResult(
-            by_n=final_results,
-            min_signals=min_signals,
-            max_signals=max_signals,
-            extras=extras,
+        utils.save_initialize_csv(path / "initialize_results.csv", signals_by_subband=self.signals_by_subband)
+
+        if self.signals_init:
+            print(f"\nFound {len(self.signals_init)} signals!")
+        else:
+            print(f"\nNo signals found in data.")
+            return
+        
+        return
+                        
+    def sample(
+            self,
+            signals: Any,
+            signals_bw: Any,
+            signals_per_block: int,
+            fill_order: int,
+            nuts_args: NUTSArgs
+    ):
+        print("Sampling...")
+
+        path = self.path / "sample"
+        path.mkdir(parents=True, exist_ok=True)
+        n_signals = len(signals)
+        block_size = signals_per_block
+        stride = block_size // (2 ** fill_order)
+
+        if stride <= 0:
+            raise ValueError("stride must be at least 1")
+
+        blocks = max(
+            1,
+            math.ceil((n_signals - block_size) / stride) + 1
         )
+
+        tasks = []
+
+        pbar = tqdm(total=blocks)
+
+        for ind in range(blocks):
+            start = int(ind * stride)
+            stop = min(start + block_size, n_signals)
+
+            signal_indices = list(range(start, stop))
+            signal_block = signals[start:stop]
+            signals_bw_block = signals_bw[start:stop]
+
+            if ind == 0:
+                f_min = self.signal_space.f_min
+            else:
+                # Boundary computed from the previous block's last signal
+                # and this block's first signal
+                previous_stop = min(start, n_signals)
+                f_min = (
+                    signals[previous_stop - 1][0] +
+                    signals[previous_stop][0]
+                ) / 2
+
+            if ind == blocks - 1 or stop >= n_signals:
+                f_max = self.signal_space.f_max
+            else:
+                f_max = (
+                    signals[stop - 1][0] +
+                    signals[stop][0]
+                ) / 2
+
+            signal_space = SignalSpace(
+                f_min=f_min,
+                f_max=f_max,
+                k_min=self.signal_space.k_min,
+                k_max=self.signal_space.k_max
+            )
+
+            tasks.append(
+                SampleTask(
+                    t=self.t,
+                    d=self.d,
+                    signal_space=signal_space,
+                    signals=signal_block,
+                    signals_bw=signals_bw_block,
+                    signal_indices=signal_indices,
+                    nuts_args=nuts_args,
+                    path=path / f"block_{ind}r{blocks}"
+                )
+            )
+
+        results_by_signal = defaultdict(list)
+
+        with ProcessPoolExecutor(
+            max_workers=self.max_workers
+        ) as executor:
+
+            future_to_task_index = {
+                executor.submit(
+                    run_sample_worker_wrapper,
+                    task,
+                ): task_index
+                for task_index, task in enumerate(tasks)
+            }
+
+            for future in as_completed(future_to_task_index):
+                pbar.update(1)
+
+                task_index = future_to_task_index[future]
+
+                try:
+                    indexed_results = future.result()
+
+                    for signal_index, result in indexed_results:
+                        results_by_signal[signal_index].append({
+                            "task_index": task_index,
+                            "result": result,
+                        })
+
+                except BaseException as exc:
+                    traceback_text = traceback.format_exc()
+
+                    print(
+                        f"\nWorker failed for task {task_index}: "
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"{traceback_text}",
+                        flush=True,
+                    )
+
+                    raise RuntimeError(
+                        f"Task {task_index} failed with "
+                        f"{type(exc).__name__}: {exc}\n\n"
+                        f"Worker traceback:\n{traceback_text}"
+                    ) from None
+        
+        self.results = results_by_signal
+
+    def report(
+            self,
+            results
+    ):
+        "Creating report..."
+
+        path = self.path / "report"
+        path.mkdir(parents=True, exist_ok=True)
+
+        utils.save_report_csv(path / "report.csv", results)
+
+        signals = utils.unpack_signal_results(results)
+
+        noise_variance = bats.get_noise_variance(self.t, self.d, signals)
+        snr = bats.get_snr(t, d, signals)
+        
+        utils.save_report_txt(path / "report.txt", len(signals), noise_variance, snr)
+
+        model = bats.get_model(t, d, signals)
+        utils.plot_time_series(path / "model_time_series.png", t, d, "Model Time Series", model)
+        utils.plot_signal_space(path / "signal_space.png", signals, "Signal Space", self.signals_init, self.signals_bw_init[0], f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, k_min=self.signal_space.k_min, k_max=self.signal_space.k_max)        
+        
+    def execute(
+            self,
+            subband_count: int = 1,
+            subband_scaling_factor: float = 1,
+            depth: int = 10,
+            grid_search_args:  Optional[GridSearchArgs] = None,
+            nuts_args_init: Optional[NUTSArgs] = None,
+
+            signals_per_block: int = 1,
+            fill_order: int = 0,
+            nuts_args_sample:  Optional[NUTSArgs] = None,
+    ):        
+        if not grid_search_args:
+            grid_search_args = self.default_grid_search_args
+        if not nuts_args_sample:
+            nuts_args_sample = self.default_nuts_args_sample
+        
+        self.initialize(
+            subband_count=subband_count,
+            subband_scaling_factor=subband_scaling_factor,
+            depth=depth,
+            grid_search_args=grid_search_args,
+            nuts_args=nuts_args_init,
+        )
+        self.sample(
+            signals=self.signals_init,
+            signals_bw=self.signals_bw_init,
+            signals_per_block=signals_per_block,
+            fill_order=fill_order,
+            nuts_args=nuts_args_sample
+        )
+        self.report(
+            self.results
+        )
+
+        print("Dracula complete!")
+
+
+if __name__ == "__main__":
+    t = np.linspace(0, 100, 2000)
+
+    f1 = 4
+    k1 = 1e-2
+    f2 = 4.5
+    k2 = 4e-3
+    f3 = 4.05
+    k3 = 7e-3
+
+    e = np.random.normal(loc=0.0, scale=3, size=len(t))
+    d = (np.sin(2 * np.pi * f1 * t) * np.exp(-k1 * t) + 
+         np.sin(2 * np.pi * f2 * t) * np.exp(-k2 * t) +
+         np.sin(2 * np.pi * f3 * t) * np.exp(-k3 * t) + 
+         e)
+
+
+    model = Dracula(
+        t, 
+        d,
+        f_min=3,
+        f_max=5,
+        k_min=1e-4,
+        k_max=3e-2,
+        max_workers=4
+    )
+
+    grid_search_args = GridSearchArgs(
+        f_points=100,
+        k_points=100
+    )
+
+    nuts_kwargs = dict()
+    mcmc_kwargs = dict(
+        num_warmup=20,
+        num_samples=20,
+        num_chains=1,
+        progress_bar=True
+    )
+    run_kwargs = dict()
+    nuts_args = NUTSArgs(
+        nuts_kwargs=nuts_kwargs,
+        mcmc_kwargs=mcmc_kwargs,
+        run_kwargs=run_kwargs,
+    )
+
+    model.execute(
+        subband_count=1, 
+        subband_scaling_factor=0.5,
+        grid_search_args=grid_search_args,
+        nuts_args_init=nuts_args,
+
+        signals_per_block=1,
+        fill_order=0,
+        nuts_args_sample=nuts_args
+    )
