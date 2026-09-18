@@ -107,15 +107,13 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         return
 
     signals.append(signal_candidate)
+    model = bats.get_model(subband_t, subband_d, signals)
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
     reason = "depth"
     while True:
         signal_detected = False
-        model = bats.get_model(subband_t, subband_d, signals)
         residual = subband_d - model
-
-        utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
 
         signal_candidate, probability_surface = bats.grid_search(
             subband_t, 
@@ -159,6 +157,9 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         else:
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
+        model = bats.get_model(subband_t, subband_d, signals_with_candidate)
+        utils.plot_time_series(path / f"{len(signals_with_candidate)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals_with_candidate)} Signal Model", model)
+
         glob_ll_1 = bats.get_glob_ll(t[mask], d[mask], signals_with_candidate)
         delta_glob_ll = glob_ll_1 - glob_ll_0
 
@@ -167,7 +168,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             break
 
         log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
-        signal_detected = utils.is_signal_detected(probability_surface, log_prob)
+        signal_detected = utils.is_signal_detected(probability_surface, log_prob, n=3)
         if not signal_detected:
             reason = "rcr"
             break
@@ -273,7 +274,7 @@ def run_sample_worker(
         rng_key_value
     )
 
-    utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_0, signals_bw=signals_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+    utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_0, signals_bw=signals_bw[0], f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
     model = bats.get_model(t, d, signals)
     utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)

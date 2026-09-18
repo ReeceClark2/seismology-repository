@@ -61,7 +61,7 @@ def unpack_signals(signals):
 
     return fs, ks
 
-def is_signal_detected(probability_surface, log_prob=None):
+def is_signal_detected(probability_surface, log_prob=None, n=5):
     _, _, log_prob_space = probability_surface
     log_prob_space = log_prob_space.ravel()
 
@@ -73,7 +73,6 @@ def is_signal_detected(probability_surface, log_prob=None):
     r = rcrpy.RCR(rcrpy.RejectionTech.ES_MODE_DL)
     r.perform_rejection(log_prob_space)
 
-    n = 5
     mu = r.result.mu
     threshold = mu + n * r.result.sigma_above
 
