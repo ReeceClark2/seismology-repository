@@ -343,7 +343,7 @@ def bats_model(
     )
 
 
-def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs):
+def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs, rng_key_value):
     f_init, k_init = utils.unpack_signals(signals)
     f_bw, k_bw = utils.unpack_signals(signals_bw)
 
@@ -357,7 +357,7 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs):
     kernel = NUTS(bats_model, **nuts_config)
     mcmc = MCMC(kernel, **mcmc_kwargs)
     mcmc.run(
-        rng_key,
+        jax.random.PRNGKey(int(rng_key_value)),
         t,
         d,
         f_init,

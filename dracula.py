@@ -82,6 +82,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     utils.plot_probability_surface(path / f"{len(signals) + 1}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals) + 1}")
 
     if nuts_args:
+        rng_key_value = len(subband_t)
         signals_temp = tuple(x.copy() for x in signal_candidate)
         signal_candidate = bats.nuts(
             subband_t, 
@@ -91,6 +92,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             nuts_args.nuts_kwargs,
             nuts_args.mcmc_kwargs,
             nuts_args.run_kwargs,
+            rng_key_value
         )[0]
 
         utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
@@ -138,6 +140,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.nuts_kwargs,
                 nuts_args.mcmc_kwargs,
                 nuts_args.run_kwargs,
+                rng_key_value
             )
             
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
@@ -237,6 +240,7 @@ def run_sample_worker(
 
     utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
 
+    rng_key_value = len(t)
     signals_0 = signals.copy()
     signals = bats.nuts(
         t,
@@ -246,6 +250,7 @@ def run_sample_worker(
         nuts_args.nuts_kwargs,
         nuts_args.mcmc_kwargs,
         nuts_args.run_kwargs,
+        rng_key_value
     )
 
     utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_0, signals_bw=signals_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
