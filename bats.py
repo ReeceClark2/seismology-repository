@@ -244,27 +244,42 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     return delta_term + sigma_term + gamma_term + log_jacobian_factor
 
 
-def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False):
-    f_space = jnp.asarray(jnp.linspace(f_min, f_max, f_points))
-    k_space = jnp.asarray(jnp.geomspace(k_min, k_max, k_points))
-    
-    f_grid, k_grid = jnp.meshgrid(f_space, k_space, indexing="ij")
+def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):
+    f_space = jnp.linspace(f_min, f_max, f_points)
+    k_space = jnp.geomspace(k_min, k_max, k_points)
 
-    signals = jnp.stack(
-        [f_grid.ravel(), k_grid.ravel()],
-        axis=-1
+    f_grid, k_grid = jnp.meshgrid(
+        f_space,
+        k_space,
+        indexing="ij",
     )
 
-    log_probs = jax.vmap(
-        lambda signal: get_log_prob(t, d, signal)
-    )(signals)
+    signal_grid = jnp.stack(
+        [f_grid.ravel(), k_grid.ravel()],
+        axis=-1,
+    )
+
+    evaluate_batch = jax.jit(
+        jax.vmap(lambda signal: get_log_prob(t, d, signal))
+    )
+
+    results = []
+
+    for start in range(0, signal_grid.shape[0], batch_size):
+        batch = signal_grid[start:start + batch_size]
+        results.append(evaluate_batch(batch))
+
+    log_probs = jnp.concatenate(results)
 
     log_prob_space = log_probs.reshape(
         f_space.size,
-        k_space.size
+        k_space.size,
     )
 
-    signal = utils.get_best_signal((f_space, k_space, log_prob_space))
+    signal = utils.get_best_signal(
+        (f_space, k_space, log_prob_space)
+    )
+
     if return_probability_surface:
         return signal, (f_space, k_space, log_prob_space)
 
@@ -332,7 +347,7 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs):
     f_init, k_init = utils.unpack_signals(signals)
     f_bw, k_bw = utils.unpack_signals(signals_bw)
 
-    init_strategy = init_to_value(values={"fs": f_init, "ks": k_init})
+    init_strategy = init_to_value(values={"fs": f_init, "log_ks": jnp.log(k_init)})
 
     nuts_config: dict[str, Any] = {
         "init_strategy": init_strategy,
@@ -342,7 +357,7 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs):
     kernel = NUTS(bats_model, **nuts_config)
     mcmc = MCMC(kernel, **mcmc_kwargs)
     mcmc.run(
-        jax.random.PRNGKey(int(42)),
+        rng_key,
         t,
         d,
         f_init,

@@ -1,4 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 from itertools import chain
 from dataclasses import dataclass, asdict, field, fields
 from typing import Any, Optional
@@ -96,15 +97,15 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     else:
         utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
-    noise_variances.append(bats.get_noise_variance(t, d, signal_candidate))
-    snrs.append(bats.get_snr(t, d, signal_candidate))
+    noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signal_candidate))
+    snrs.append(bats.get_snr(subband_t, subband_d, signal_candidate))
 
     signal_detected = utils.is_signal_detected(probability_surface)
     if not signal_detected:
         return
 
     signals.append(signal_candidate)
-    glob_ll_0 = bats.get_glob_ll(t, d, signals)
+    glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
     while True:
         model = bats.get_model(subband_t, subband_d, signals)
@@ -143,10 +144,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         else:
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
-        noise_variances.append(bats.get_noise_variance(t, d, signals_with_candidate))
-        snrs.append(bats.get_snr(t, d, signals_with_candidate))
-
-        glob_ll_1 = bats.get_glob_ll(t, d, signals_with_candidate)
+        glob_ll_1 = bats.get_glob_ll(t[mask], d[mask], signals_with_candidate)
         delta_glob_ll = glob_ll_1 - glob_ll_0
 
         if delta_glob_ll < 0:
@@ -155,11 +153,13 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         glob_ll_0 = glob_ll_1
 
         signals = signals_with_candidate
+        noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
+        snrs.append(bats.get_snr(subband_t, subband_d, signals))
 
         if len(signals) >= depth:
             break
 
-    utils.save_subband_csv(path / "subband_results.csv", signals_with_candidate, noise_variances, snrs)
+    utils.save_subband_csv(path / "subband_results.csv", signals, noise_variances, snrs)
 
     signals_bw = [tuple(signal_bw) for _ in signals]
 
@@ -392,7 +392,10 @@ class Dracula():
 
         task_results_by_index = {}
 
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=self.max_workers,
+            mp_context=mp.get_context("spawn"),
+        ) as executor:
             future_to_index = {
                 executor.submit(
                     run_initial_conditions_worker_wrapper,
@@ -555,7 +558,8 @@ class Dracula():
         results_by_signal = defaultdict(list)
 
         with ProcessPoolExecutor(
-            max_workers=self.max_workers
+            max_workers=self.max_workers,
+            mp_context=mp.get_context("spawn"),
         ) as executor:
 
             future_to_task_index = {
@@ -612,12 +616,12 @@ class Dracula():
         signals = utils.unpack_signal_results(results)
 
         noise_variance = bats.get_noise_variance(self.t, self.d, signals)
-        snr = bats.get_snr(t, d, signals)
+        snr = bats.get_snr(self.t, self.d, signals)
         
         utils.save_report_txt(path / "report.txt", len(signals), noise_variance, snr)
 
-        model = bats.get_model(t, d, signals)
-        utils.plot_time_series(path / "model_time_series.png", t, d, "Model Time Series", model)
+        model = bats.get_model(self.t, self.d, signals)
+        utils.plot_time_series(path / "model_time_series.png", self.t, self.d, "Model Time Series", model)
         utils.plot_signal_space(path / "signal_space.png", signals, "Signal Space", self.signals_init, self.signals_bw_init[0], f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, k_min=self.signal_space.k_min, k_max=self.signal_space.k_max)        
         
     def execute(

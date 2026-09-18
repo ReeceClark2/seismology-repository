@@ -93,12 +93,12 @@ def main():
         f_max=0.004,
         k_min=1e-6,
         k_max=2e-4,
-        max_workers=8
+        max_workers=20
     )
 
     grid_search_args = GridSearchArgs(
-        f_points=100,
-        k_points=100
+        f_points=50,
+        k_points=50
     )
     nuts_kwargs = dict()
     mcmc_kwargs = dict(
@@ -116,7 +116,7 @@ def main():
     nuts_kwargs = dict()
     mcmc_kwargs = dict(
         num_warmup=200,
-        num_samples=800,
+        num_samples=400,
         num_chains=1,
     )
     run_kwargs = dict()
@@ -132,7 +132,7 @@ def main():
         grid_search_args=grid_search_args,
         nuts_args_init=nuts_args_init,
 
-        signals_per_block=10,
+        signals_per_block=6,
         fill_order=1,
         nuts_args_sample=nuts_args_sample
     )
@@ -140,3 +140,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
