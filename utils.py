@@ -124,6 +124,73 @@ def unpack_signal_results(results):
 
     return averaged_signals
 
+
+def get_variance_break(
+    variances,
+    confidence_threshold=0.90,
+    log_values=True,
+):
+    y = np.asarray(variances, dtype=float).reshape(-1)
+
+    if y.size < 5:
+        return None
+
+    if not np.all(np.isfinite(y)):
+        raise ValueError("variances must contain only finite values")
+
+    if log_values:
+        if np.any(y <= 0):
+            raise ValueError(
+                "variances must be positive when log_values=True"
+            )
+        y = np.log10(y)
+
+    differences = np.diff(y)
+    x = np.arange(differences.size, dtype=float)
+
+    def line_sse(x_segment, values):
+        if values.size <= 1:
+            return 0.0
+
+        coefficients = np.polyfit(x_segment, values, deg=1)
+        residuals = values - np.polyval(coefficients, x_segment)
+        return float(residuals @ residuals)
+
+    # No-break model.
+    one_line_sse = line_sse(x, differences)
+
+    if one_line_sse <= np.finfo(float).eps:
+        return None
+
+    candidates = []
+
+    # A detectable shared break must leave at least two original points
+    # on each side. Thus, valid indices are 1 through len(y) - 2.
+    for break_index in range(1, len(y) - 1):
+        left_sse = line_sse(
+            x[:break_index],
+            differences[:break_index],
+        )
+        right_sse = line_sse(
+            x[break_index:],
+            differences[break_index:],
+        )
+
+        two_line_sse = left_sse + right_sse
+        confidence = 1.0 - two_line_sse / one_line_sse
+
+        candidates.append(
+            (confidence, break_index)
+        )
+
+    best_confidence, best_index = max(candidates)
+
+    if best_confidence < confidence_threshold:
+        return None
+
+    return best_index
+
+
 def plot_time_series(path, t, d, title, model=None):
     if model is None:
         # Single plot when no model is provided
@@ -329,15 +396,16 @@ def plot_signal_space(
     if f_min is not None and f_max is not None:
         halfwidth = f_max - f_min
         ax.set_xlim(f_min - halfwidth / 2, f_max + halfwidth / 2)
+        ax.vlines(x=[f_min, f_max], ymin=k_min, ymax=k_max, color='black', linestyle='dashed', linewidth=0.3)
 
-    # Do not take the logarithm here. Matplotlib expects data values.
-    if k_min is not None and k_max is not None:
-        halfwidth = k_max - k_min
-        k_lo = k_min - halfwidth / 2
-        k_hi = k_max + halfwidth / 2
-        if k_lo < 0:
-            k_lo = 1e-12
-        ax.set_ylim(k_lo, k_hi)
+    # # Do not take the logarithm here. Matplotlib expects data values.
+    # if k_min is not None and k_max is not None:
+    #     halfwidth = k_max - k_min
+    #     k_lo = k_min - halfwidth / 2
+    #     k_hi = k_max + halfwidth / 2
+    #     if k_lo < 0:
+    #         k_lo = 1e-12
+    #     ax.set_ylim(k_lo, k_hi)
 
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Decay Rate")

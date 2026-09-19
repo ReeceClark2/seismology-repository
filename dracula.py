@@ -192,6 +192,17 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         if len(signals) >= depth:
             break
 
+    if reason == "depth":
+        variance_break_index = utils.get_variance_break_index(noise_variances)
+
+        if variance_break_index is not None:
+            reason = "variance_break"
+            stop = variance_break_index + 1
+
+            signals = signals[:stop]
+            noise_variances = noise_variances[:stop]
+            snrs = snrs[:stop]
+            
     utils.save_subband_csv(path / "subband_results.csv", signals, noise_variances, snrs)
 
     signals_bw = [tuple(signal_bw) for _ in signals]
