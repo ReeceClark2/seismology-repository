@@ -79,7 +79,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         signal_space.k_max,
         return_probability_surface=True
     )
-    utils.plot_probability_surface(path / f"{len(signals)}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals)}")
+    utils.plot_probability_surface(path / f"{len(signals) + 1}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals) + 1}")
 
     if nuts_args:
         rng_key_value = len(subband_t)
@@ -95,9 +95,9 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             rng_key_value
         )[0]
 
-        utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signal_candidate, f"Signal Space of {len(signals)} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+        utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
     else:
-        utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signal_candidate, f"Signal Space of {len(signals)} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+        utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
     noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signal_candidate))
     snrs.append(bats.get_snr(subband_t, subband_d, signal_candidate))
@@ -110,6 +110,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     model = bats.get_model(subband_t, subband_d, signals)
     utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
 
+    total_log_prob_0 = bats.get_log_prob(t[mask], d[mask], signals)
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
     reason = "depth"
@@ -128,7 +129,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             signal_space.k_max,
             return_probability_surface=True
         )
-        utils.plot_probability_surface(path / f"{len(signals)}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals)}")
+        utils.plot_probability_surface(path / f"{len(signals) + 1}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals) + 1}")
 
         signals_with_candidate = list(signals) + [signal_candidate]
 
@@ -155,9 +156,9 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 rng_key_value
             )
             
-            utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals)} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+            utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
         else:
-            utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals)} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+            utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
         model = bats.get_model(subband_t, subband_d, signals_with_candidate)
         utils.plot_time_series(path / f"{len(signals_with_candidate)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals_with_candidate)} Signal Model", model)
@@ -175,12 +176,11 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             reason = "rcr"
             break
 
-        if len(signals_with_candidate) >= 3:
-            delta_glob_ll_next = glob_ll_0 - glob_ll_1
-
-            if delta_glob_ll_next < delta_glob_ll / 10:
-                reason = "variance_break"
-                break
+        total_log_prob = bats.get_log_prob(t[mask], d[mask], signals_with_candidate)
+        if total_log_prob < total_log_prob_0:
+            reason = "log_prob"
+            break
+        total_log_prob_0 = total_log_prob
 
         delta_glob_ll = glob_ll_0 - glob_ll_1
         glob_ll_0 = glob_ll_1
@@ -284,7 +284,7 @@ def run_sample_worker(
         rng_key_value
     )
 
-    utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signals_bw[0], f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+    utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_0, signals_bw=signals_bw[0], f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
     model = bats.get_model(t, d, signals)
     utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
