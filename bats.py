@@ -1,5 +1,8 @@
 from typing import Any
 
+from scipy.optimize import minimize
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
@@ -144,6 +147,7 @@ def get_snr(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
 
+
 def get_mean_sq_proj(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
@@ -176,7 +180,7 @@ def get_mean_sq_proj(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
     scale = 1 / min(d)
-    d *= scale
+    d = d * scale
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -242,6 +246,55 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     )
 
     return delta_term + sigma_term + gamma_term + log_jacobian_factor
+
+
+def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+    fs, ks = utils.unpack_signals(signals)
+    scale = 1 / min(d)
+    d = d * scale
+
+    omegas = fs * 2.0 * jnp.pi
+    
+    r = omegas.shape[0]
+    m = 2 * r
+    N = d.shape[0]
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+
+    # Bretthorst Eq. 3.6: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    theta, unravel = ravel_pytree(signals)
+
+    def objective(theta):
+        return get_mean_sq_proj(t, d, unravel(theta))
+
+    b = (-m / 2) * jax.hessian(objective)(theta)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
+    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    
+    signals_uncertainties_flat = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1,))
+    signals_uncertainties = unravel(signals_uncertainties_flat)
+
+    return signals_uncertainties
 
 
 def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):
@@ -387,4 +440,53 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs, rng_ke
     )
 
     return best_signals
-    
+
+
+def lbfgsb(t, d, signals ,f_min, f_max, k_min, k_max, maxiter=2_000,):
+    signals = jnp.asarray(signals)
+    original_shape = signals.shape
+
+    x0 = np.asarray(signals, dtype=np.float64).reshape(-1)
+
+    f_bounds = (f_min, f_max)
+    k_bounds = (k_min, k_max)
+
+    bounds = [
+        bound
+        for _ in range(len(x0) // 2)
+        for bound in (f_bounds, k_bounds)
+    ]
+
+    value_and_gradient = jax.jit(
+        jax.value_and_grad(
+            lambda s: -get_log_prob(t, d, s)
+        )
+    )
+
+    def objective_and_gradient(x):
+        signals_current = jnp.asarray(x).reshape(original_shape)
+
+        value, gradient = value_and_gradient(signals_current)
+
+        return (
+            float(value),
+            np.asarray(gradient, dtype=np.float64).reshape(-1),
+        )
+
+    result = minimize(
+        objective_and_gradient,
+        x0,
+        method="L-BFGS-B",
+        jac=True,
+        bounds=bounds,
+        options={
+            "maxiter": maxiter,
+            "ftol": 1e-12,
+            "gtol": 1e-8,
+        },
+    )
+
+    if not result.success:
+        print(f"L-BFGS-B warning: {result.message}")
+
+    return jnp.asarray(result.x).reshape(original_shape)

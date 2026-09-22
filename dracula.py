@@ -34,6 +34,7 @@ class GridSearchArgs:
 
 @dataclass
 class NUTSArgs:
+    seed: int
     nuts_kwargs: dict[str, Any] = field(default_factory=dict)
     mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
     run_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -62,6 +63,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     subband_d = subband_d[mask]
 
     utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
+    utils.plot_fourier_space(path / "raw_fourier_space", subband_t, subband_d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
     signals = []
     signal_bw = ((signal_space.f_max - signal_space.f_min) / 4, (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 4)
@@ -82,7 +84,6 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     utils.plot_probability_surface(path / f"{len(signals) + 1}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals) + 1}")
 
     if nuts_args:
-        rng_key_value = len(subband_t)
         signals_temp = tuple(x.copy() for x in signal_candidate)
         signal_candidate = bats.nuts(
             subband_t, 
@@ -92,7 +93,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             nuts_args.nuts_kwargs,
             nuts_args.mcmc_kwargs,
             nuts_args.run_kwargs,
-            rng_key_value
+            nuts_args.seed
         )[0]
 
         utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
@@ -109,6 +110,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     signals.append(signal_candidate)
     model = bats.get_model(subband_t, subband_d, signals)
     utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
+    utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", subband_t, subband_d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
 
     total_log_prob_0 = bats.get_log_prob(t[mask], d[mask], signals)
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
@@ -143,18 +145,18 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.nuts_kwargs,
                 nuts_args.mcmc_kwargs,
                 nuts_args.run_kwargs,
-                rng_key_value
+                nuts_args.seed
             )
-            signal_candidate = bats.nuts(
-                subband_t, 
-                residual, 
-                signal_candidate,
-                signal_bw,
-                nuts_args.nuts_kwargs,
-                nuts_args.mcmc_kwargs,
-                nuts_args.run_kwargs,
-                rng_key_value
-            )
+            # signal_candidate = bats.nuts(
+            #     subband_t, 
+            #     residual, 
+            #     signal_candidate,
+            #     signal_bw,
+            #     nuts_args.nuts_kwargs,
+            #     nuts_args.mcmc_kwargs,
+            #     nuts_args.run_kwargs,
+            #     nuts_args.seed
+            # )
             
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
         else:
@@ -162,6 +164,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
         model = bats.get_model(subband_t, subband_d, signals_with_candidate)
         utils.plot_time_series(path / f"{len(signals_with_candidate)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals_with_candidate)} Signal Model", model)
+        utils.plot_fourier_space(path / f"{len(signals_with_candidate)}_signal_fourier_space", subband_t, subband_d, f"Fourier Space for {len(signals_with_candidate)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
 
         glob_ll_1 = bats.get_glob_ll(t[mask], d[mask], signals_with_candidate)
         delta_glob_ll = glob_ll_1 - glob_ll_0
@@ -170,17 +173,17 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             reason = "glob_ll"
             break
 
-        log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
-        signal_detected = utils.is_signal_detected(probability_surface, log_prob, n=1)
-        if not signal_detected:
-            reason = "rcr"
-            break
+        # log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
+        # signal_detected = utils.is_signal_detected(probability_surface, log_prob, n=1)
+        # if not signal_detected:
+        #     reason = "rcr"
+        #     break
 
-        total_log_prob = bats.get_log_prob(t[mask], d[mask], signals_with_candidate)
-        if total_log_prob < total_log_prob_0:
-            reason = "log_prob"
-            break
-        total_log_prob_0 = total_log_prob
+        # total_log_prob = bats.get_log_prob(t[mask], d[mask], signals_with_candidate)
+        # if total_log_prob < total_log_prob_0:
+        #     reason = "log_prob"
+        #     break
+        # total_log_prob_0 = total_log_prob
 
         delta_glob_ll = glob_ll_0 - glob_ll_1
         glob_ll_0 = glob_ll_1
@@ -193,7 +196,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             break
 
     if reason == "depth":
-        variance_break_index = utils.get_variance_break_index(noise_variances)
+        variance_break_index = utils.get_variance_break(noise_variances)
 
         if variance_break_index is not None:
             reason = "variance_break"
@@ -281,8 +284,8 @@ def run_sample_worker(
     d = d[mask]
 
     utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
+    utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
-    rng_key_value = len(t)
     signals_0 = signals.copy()
     signals = bats.nuts(
         t,
@@ -292,13 +295,23 @@ def run_sample_worker(
         nuts_args.nuts_kwargs,
         nuts_args.mcmc_kwargs,
         nuts_args.run_kwargs,
-        rng_key_value
+        nuts_args.seed
+    )
+    signals = bats.lbfgsb(
+        t,
+        d,
+        signals,
+        signal_space.f_min / 1.5,
+        signal_space.f_max * 1.33,
+        signal_space.k_min / 1.5,
+        signal_space.k_max * 1.33
     )
 
     utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_0, signals_bw=signals_bw[0], f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
     model = bats.get_model(t, d, signals)
     utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
+    utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
     utils.save_block_csv(path / "block_results.csv", signals)
 
     if len(signals) != len(signal_indices):
@@ -379,7 +392,8 @@ class Dracula():
         self.default_nuts_args_sample = NUTSArgs(
             nuts_kwargs=nuts_kwargs,
             mcmc_kwargs=mcmc_kwargs,
-            run_kwargs=run_kwargs
+            run_kwargs=run_kwargs,
+            seed=42
         )
 
     def initialize(
@@ -650,28 +664,34 @@ class Dracula():
         
         self.results = results_by_signal
 
-    def report(
-            self,
-            results
-    ):
+    def report(self, results):
         "Creating report..."
 
         path = self.path / "report"
         path.mkdir(parents=True, exist_ok=True)
 
-        utils.save_report_csv(path / "report.csv", results)
-
         signals = utils.unpack_signal_results(results)
+        uncertainties = bats.get_uncertainties(self.t, self.d, signals)
+        utils.save_report_csv(path / "report_all.csv", results, uncertainties)
+
+        signals = bats.lbfgsb(self.t, self.d, signals, self.signal_space.f_min / 1.5, self.signal_space.f_max * 1.33, self.signal_space.k_min / 1.5, self.signal_space.k_max * 1.33)
+
+        averaged_results = {signal_index: [{"result": signal}] for signal_index, signal in enumerate(signals)}
+        uncertainties = bats.get_uncertainties(self.t, self.d, signals)
+
+        utils.save_report_csv(path / "report_averaged.csv", averaged_results, uncertainties)
 
         noise_variance = bats.get_noise_variance(self.t, self.d, signals)
         snr = bats.get_snr(self.t, self.d, signals)
-        
+
         utils.save_report_txt(path / "report.txt", len(signals), noise_variance, snr)
 
         model = bats.get_model(self.t, self.d, signals)
         utils.plot_time_series(path / "model_time_series.png", self.t, self.d, "Model Time Series", model)
-        utils.plot_signal_space(path / "signal_space.png", signals, "Signal Space", self.signals_init, self.signals_bw_init[0], f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, k_min=self.signal_space.k_min, k_max=self.signal_space.k_max)        
-        
+        utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", self.t, self.d, "model_fourier_space", self.signal_space.f_min, self.signal_space.f_max, 100_000, model)
+        utils.plot_signal_space(path / "signal_space.png", signals, "Signal Space", self.signals_init, self.signals_bw_init[0], f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, k_min=self.signal_space.k_min, k_max=self.signal_space.k_max)
+    
+
     def execute(
             self,
             subband_count: int = 1,
@@ -745,12 +765,13 @@ if __name__ == "__main__":
     nuts_kwargs = dict()
     mcmc_kwargs = dict(
         num_warmup=20,
-        num_samples=20,
+        num_samples=100,
         num_chains=1,
         progress_bar=True
     )
     run_kwargs = dict()
     nuts_args = NUTSArgs(
+        seed=20,
         nuts_kwargs=nuts_kwargs,
         mcmc_kwargs=mcmc_kwargs,
         run_kwargs=run_kwargs,
@@ -762,7 +783,7 @@ if __name__ == "__main__":
         grid_search_args=grid_search_args,
         nuts_args_init=nuts_args,
 
-        signals_per_block=1,
+        signals_per_block=5,
         fill_order=0,
         nuts_args_sample=nuts_args
     )

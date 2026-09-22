@@ -395,17 +395,8 @@ def plot_signal_space(
 
     if f_min is not None and f_max is not None:
         halfwidth = f_max - f_min
-        ax.set_xlim(f_min - halfwidth / 2, f_max + halfwidth / 2)
+        ax.set_xlim(f_min - halfwidth * 0.05, f_max + halfwidth * 0.05)
         ax.vlines(x=[f_min, f_max], ymin=k_min, ymax=k_max, color='black', linestyle='dashed', linewidth=0.3)
-
-    # # Do not take the logarithm here. Matplotlib expects data values.
-    # if k_min is not None and k_max is not None:
-    #     halfwidth = k_max - k_min
-    #     k_lo = k_min - halfwidth / 2
-    #     k_hi = k_max + halfwidth / 2
-    #     if k_lo < 0:
-    #         k_lo = 1e-12
-    #     ax.set_ylim(k_lo, k_hi)
 
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Decay Rate")
@@ -414,6 +405,97 @@ def plot_signal_space(
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+
+def plot_fourier_space(path, t, d, title, f_min, f_max, f_points, model=None):
+    t = np.asarray(t)
+    d = np.asarray(d)
+
+    if t.ndim != 1 or d.ndim != 1:
+        raise ValueError("t and d must be one-dimensional")
+
+    if len(t) != len(d):
+        raise ValueError("t and d must have matching lengths")
+
+    if model is not None:
+        model = np.asarray(model)
+
+        if model.ndim != 1:
+            raise ValueError("model must be one-dimensional")
+
+        if len(model) != len(t):
+            raise ValueError("model must have the same length as t and d")
+
+    if len(t) < 2:
+        raise ValueError("At least two time samples are required")
+
+    sample_interval = np.mean(np.diff(t))
+
+    window = np.hanning(len(t))
+    n_fft = max(len(t), 2 * (f_points - 1))
+
+    frequencies = np.fft.rfftfreq(
+        n_fft,
+        d=sample_interval,
+    )
+
+    normalization = np.sum(window)
+
+    data_spectrum = np.abs(
+        np.fft.rfft(d * window, n=n_fft)
+    ) / normalization
+
+    frequency_mask = (
+        (frequencies >= f_min)
+        & (frequencies <= f_max)
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(
+        frequencies[frequency_mask],
+        data_spectrum[frequency_mask],
+        color="black",
+        label="Data",
+        linewidth=0.6,
+    )
+
+    if model is not None:
+        residual = d - model
+
+        model_spectrum = np.abs(
+            np.fft.rfft(model * window, n=n_fft)
+        ) / normalization
+
+        residual_spectrum = np.abs(
+            np.fft.rfft(residual * window, n=n_fft)
+        ) / normalization
+
+        ax.plot(
+            frequencies[frequency_mask],
+            model_spectrum[frequency_mask],
+            color="red",
+            label="Model",
+            linewidth=0.6,
+        )
+
+        ax.plot(
+            frequencies[frequency_mask],
+            residual_spectrum[frequency_mask],
+            color="blue",
+            label="Residual",
+            linewidth=0.6,
+        )
+
+    ax.set_xlim(f_min, f_max)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title(title)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(path.with_suffix(".svg"))
     plt.close(fig)
 
 
@@ -518,9 +600,7 @@ def save_block_csv(path, signals):
 
 
 
-def save_report_csv(path, results):
-    # Support either the results_by_signal dictionary format or the original
-    # iterable of (signal_index, signal) pairs.
+def save_report_csv(path, results, uncertainties):
     if isinstance(results, Mapping):
         results_by_signal = results
     else:
@@ -532,19 +612,29 @@ def save_report_csv(path, results):
                 "result": signal,
             })
 
+    signal_indices = sorted(results_by_signal)
+
+    if len(signal_indices) != len(uncertainties):
+        raise ValueError(
+            "The number of uncertainty pairs must match the number "
+            "of unique signal indices."
+        )
+
+    uncertainties_by_signal = dict(
+        zip(signal_indices, uncertainties)
+    )
+
     rows = []
 
-    for signal_index, signal_entries in results_by_signal.items():
+    for signal_index in signal_indices:
+        signal_entries = results_by_signal[signal_index]
         signals = []
 
         for entry in signal_entries:
-            # Dictionary format:
             if isinstance(entry, Mapping):
                 signal = entry["result"]
                 task_index = entry.get("task_index")
             else:
-                # Also support entries of the form:
-                # (task_index, (frequency, decay_rate))
                 task_index, signal = entry
 
             frequency, decay_rate = signal
@@ -558,9 +648,6 @@ def save_report_csv(path, results):
         if not signals:
             continue
 
-        # For repeated signal indices, the range gives the absolute
-        # difference between the two most extreme values. Any middle values
-        # are therefore ignored.
         frequency_error = abs(
             max(item["frequency"] for item in signals)
             - min(item["frequency"] for item in signals)
@@ -571,17 +658,20 @@ def save_report_csv(path, results):
             - min(item["decay_rate"] for item in signals)
         )
 
-        # For a signal index occurring only once, there is no comparison.
         if len(signals) == 1:
             frequency_error = ""
             decay_rate_error = ""
 
+        frequency_uncertainty, decay_rate_uncertainty = (
+            uncertainties_by_signal[signal_index]
+        )
+
         for item in signals:
             rows.append({
                 "Frequency": item["frequency"],
-                "Frequency Uncertainty": "",
+                "Frequency Uncertainty": frequency_uncertainty,
                 "Decay Rate": item["decay_rate"],
-                "Decay Rate Uncertainty": "",
+                "Decay Rate Uncertainty": decay_rate_uncertainty,
                 "Frequency Error": frequency_error,
                 "Decay Rate Error": decay_rate_error,
             })
@@ -599,6 +689,7 @@ def save_report_csv(path, results):
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
 
 def save_report_txt(path, signal_count, noise_variance, snr):
     with open(path, "w", encoding="utf-8") as file:
