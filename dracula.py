@@ -91,16 +91,15 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             return_probability_surface=True
         )
 
-        if signals is not None:
-            signals_0 = [(jnp.asarray(signal[0]).item(), jnp.asarray(signal[1]).item()) for signal in signals]
+        signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
 
-            signal_candidate = (jnp.asarray(signal_candidate[0]).item(), jnp.asarray(signal_candidate[1]).item(),)
-
-            signals_0 = signals_0 + [signal_candidate]
-            signals = signals_0.copy()
-        else:
-            signals_0 = signal_candidate
+        if signals is None:
             signals = signal_candidate
+            signals_0 = signal_candidate
+        else:
+            signals = jnp.asarray(signals).reshape(-1, 2)
+            signals_0 = jnp.concatenate((signals, signal_candidate), axis=0)
+            signals = signals_0
 
         if model is not None:
             d = d + model
@@ -198,7 +197,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
         if len(signals) >= depth:
             break
-    print(signals, noise_variances, snrs, glob_lls)
+
     log_utils.save_subband_csv(path / "subband_results.csv", signals, noise_variances, snrs, glob_lls)
 
     index = glob_lls.index(max(glob_lls))
@@ -817,7 +816,6 @@ if __name__ == "__main__":
         subband_count=1, 
         subband_scaling_factor=0.5,
         grid_search_args=grid_search_args,
-        nuts_args_init=nuts_args,
         depth=5,
 
         signals_per_block=5,
