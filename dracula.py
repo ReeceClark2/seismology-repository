@@ -63,7 +63,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     subband_d = subband_d[mask]
 
     utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
-    utils.plot_fourier_space(path / "raw_fourier_space", subband_t, subband_d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
+    utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
     signals = []
     signal_bw = ((signal_space.f_max - signal_space.f_min) / 4, (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 4)
@@ -100,6 +100,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     else:
         utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signal_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
+    signal_candidate = bats.lbfgsb(subband_t, subband_d, signal_candidate, signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max)
     noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signal_candidate))
     snrs.append(bats.get_snr(subband_t, subband_d, signal_candidate))
 
@@ -110,9 +111,8 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     signals.append(signal_candidate)
     model = bats.get_model(subband_t, subband_d, signals)
     utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
-    utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", subband_t, subband_d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
+    utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
 
-    total_log_prob_0 = bats.get_log_prob(t[mask], d[mask], signals)
     glob_ll_0 = bats.get_glob_ll(t[mask], d[mask], signals)
 
     reason = "depth"
@@ -147,43 +147,23 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.run_kwargs,
                 nuts_args.seed
             )
-            # signal_candidate = bats.nuts(
-            #     subband_t, 
-            #     residual, 
-            #     signal_candidate,
-            #     signal_bw,
-            #     nuts_args.nuts_kwargs,
-            #     nuts_args.mcmc_kwargs,
-            #     nuts_args.run_kwargs,
-            #     nuts_args.seed
-            # )
             
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", signals_0=signals_temp, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
         else:
             utils.plot_signal_space(path / f"{len(signals) + 1}_signal_space.png", signals_with_candidate, f"Signal Space of {len(signals) + 1} Signals", f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
 
+        signals_with_candidate = bats.lbfgsb(subband_t, subband_d, signals_with_candidate, signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max)
+
         model = bats.get_model(subband_t, subband_d, signals_with_candidate)
         utils.plot_time_series(path / f"{len(signals_with_candidate)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals_with_candidate)} Signal Model", model)
-        utils.plot_fourier_space(path / f"{len(signals_with_candidate)}_signal_fourier_space", subband_t, subband_d, f"Fourier Space for {len(signals_with_candidate)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
+        utils.plot_fourier_space(path / f"{len(signals_with_candidate)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals_with_candidate)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
 
         glob_ll_1 = bats.get_glob_ll(t[mask], d[mask], signals_with_candidate)
         delta_glob_ll = glob_ll_1 - glob_ll_0
 
-        if delta_glob_ll < 0:
-            reason = "glob_ll"
-            break
-
-        # log_prob = bats.get_log_prob(subband_t, residual, signal_candidate)
-        # signal_detected = utils.is_signal_detected(probability_surface, log_prob, n=1)
-        # if not signal_detected:
-        #     reason = "rcr"
+        # if delta_glob_ll < 0:
+        #     reason = "glob_ll"
         #     break
-
-        # total_log_prob = bats.get_log_prob(t[mask], d[mask], signals_with_candidate)
-        # if total_log_prob < total_log_prob_0:
-        #     reason = "log_prob"
-        #     break
-        # total_log_prob_0 = total_log_prob
 
         delta_glob_ll = glob_ll_0 - glob_ll_1
         glob_ll_0 = glob_ll_1
@@ -196,7 +176,8 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             break
 
     if reason == "depth":
-        variance_break_index = utils.get_variance_break(noise_variances)
+        # variance_break_index = utils.get_variance_break(noise_variances)
+        variance_break_index = utils.get_snr_index_break(snrs)
 
         if variance_break_index is not None:
             reason = "variance_break"

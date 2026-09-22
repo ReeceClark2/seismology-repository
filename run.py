@@ -69,7 +69,7 @@ def main():
     stream_index = 0
 
     start_time = UTCDateTime("2025-07-30T01:24:50")
-    end_time = UTCDateTime("2025-07-31T19:24:50")
+    end_time = UTCDateTime("2025-07-31T17:24:50")
 
     f_min = 0.0020
     f_max = 0.0100
@@ -93,7 +93,7 @@ def main():
         f_max=0.010,
         k_min=2.7e-6,
         k_max=2.6e-4,
-        max_workers=24
+        max_workers=12
     )
 
     grid_search_args = GridSearchArgs(
@@ -122,8 +122,8 @@ def main():
     )
     mcmc_kwargs = dict(
         num_warmup=100,
-        num_samples=300,
-        num_chains=4,
+        num_samples=400,
+        num_chains=8,
         chain_method="parallel"
     )
     run_kwargs = dict()
@@ -139,7 +139,6 @@ def main():
         subband_scaling_factor=0.9,
         depth=8,
         grid_search_args=grid_search_args,
-        nuts_args_init=nuts_args_init,
 
         signals_per_block=12,
         fill_order=1,

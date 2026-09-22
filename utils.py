@@ -191,6 +191,17 @@ def get_variance_break(
     return best_index
 
 
+def get_snr_index_break(snrs):
+    heuristic = []
+
+    for ind, snr in enumerate(snrs):
+        heuristic.append((ind + 1) * snr)
+
+    index = heuristic.index(max(heuristic))
+
+    return index
+
+
 def plot_time_series(path, t, d, title, model=None):
     if model is None:
         # Single plot when no model is provided
