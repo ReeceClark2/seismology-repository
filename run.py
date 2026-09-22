@@ -101,7 +101,7 @@ def main():
         k_points=100
     )
     nuts_kwargs = dict(
-        target_accept_prob=0.90,
+        target_accept_prob=0.75,
     )
     mcmc_kwargs = dict(
         num_warmup=150,
@@ -118,7 +118,7 @@ def main():
     )
 
     nuts_kwargs = dict(
-        target_accept_prob=0.75,
+        target_accept_prob=0.85,
     )
     mcmc_kwargs = dict(
         num_warmup=100,
@@ -131,16 +131,16 @@ def main():
         nuts_kwargs=nuts_kwargs,
         mcmc_kwargs=mcmc_kwargs,
         run_kwargs=run_kwargs,
-        seed=8
+        seed=18
     )
 
     model.execute(
         subband_count=40, 
         subband_scaling_factor=0.9,
-        depth=8,
+        depth=15,
         grid_search_args=grid_search_args,
 
-        signals_per_block=12,
+        signals_per_block=16,
         fill_order=1,
         nuts_args_sample=nuts_args_sample
     )

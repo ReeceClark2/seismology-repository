@@ -1,4 +1,5 @@
 from typing import Any
+import random
 
 from scipy.optimize import minimize
 import numpy as np
@@ -179,14 +180,17 @@ def get_mean_sq_proj(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
 def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
-    scale = 1 / min(d)
-    d = d * scale
+    d_scale = jnp.std(d)
+    d = d / jnp.maximum(d_scale, jnp.finfo(d.dtype).eps)
 
     omegas = fs * 2.0 * jnp.pi
     
     r = omegas.shape[0]
     m = 2 * r
     N = d.shape[0]
+
+    if N <= m + r:
+        return -jnp.inf
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -197,7 +201,10 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+
+    g_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    g_floor = jnp.finfo(g.dtype).eps * g_scale
+    eigenvalues = jnp.maximum(eigenvalues, g_floor)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -221,9 +228,13 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
         return get_mean_sq_proj(t, d, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
 
     eigenvalues = jnp.linalg.eigvalsh(b)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+
+    b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    b_floor = jnp.finfo(b.dtype).eps * b_scale
+    eigenvalues = jnp.maximum(eigenvalues, b_floor)
 
     log_jacobian_factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
 
@@ -406,6 +417,9 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs, rng_ke
         "init_strategy": init_strategy,
     }
     nuts_config.update(nuts_kwargs)
+
+    if rng_key_value is None:
+        rng_key_value = random.randint(1, 1_000)
 
     kernel = NUTS(bats_model, **nuts_config)
     mcmc = MCMC(kernel, **mcmc_kwargs)
