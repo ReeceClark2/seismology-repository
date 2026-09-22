@@ -17,72 +17,56 @@ from numpyro.infer import MCMC, NUTS, init_to_value
 import utils
 
 
-def get_log_prob(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_log_prob(t, d, signals):
     fs, ks = utils.unpack_signals(signals)
 
-    omegas = fs * 2.0 * jnp.pi
-    
-    r = omegas.shape[0]
-    m = 2 * r
-    N = d.shape[0]
-
+    omegas = 2.0 * jnp.pi * fs
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
+    G = jnp.vstack((
+        jnp.cos(arg) * decay,
+        jnp.sin(arg) * decay,
+    ))
 
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    # G.T = U S Vh
+    U, singular_values, _ = jnp.linalg.svd(
+        G.T,
+        full_matrices=False,
+    )
 
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
-    h = H @ d
+    cutoff = 1e-10 * singular_values[0]
+    keep = singular_values > cutoff
 
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
+    # Project only onto numerically valid directions
+    h = U.T @ d
+    sum_sq_proj = jnp.sum(jnp.where(keep, h**2, 0.0))
 
+    sum_sq_data = jnp.sum(d**2)
     ratio = sum_sq_proj / jnp.maximum(sum_sq_data, 1e-30)
     ratio = jnp.clip(ratio, 0.0, 1.0 - 1e-12)
 
-    return 0.5 * (m - N) * jnp.log1p(-ratio)
-
-@jax.jit
-def get_model(t: jax.Array, d: jax.Array, signals) -> jax.Array:
-    fs, ks = utils.unpack_signals(signals)
-
-    omegas = fs * 2.0 * jnp.pi
-    
-    r = omegas.shape[0]
-    m = 2 * r
+    effective_m = jnp.sum(keep)
     N = d.shape[0]
 
+    return 0.5 * (effective_m - N) * jnp.log1p(-ratio)
+
+@jax.jit
+def get_model(t, d, signals):
+    fs, ks = utils.unpack_signals(signals)
+
+    omegas = 2.0 * jnp.pi * fs
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    gram = G @ G.T
+    G = jnp.vstack((
+        jnp.cos(arg) * decay,
+        jnp.sin(arg) * decay,
+    ))
 
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-19)
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    T = (eigenvectors / jnp.sqrt(eigenvalues)).T
-    
-    H = T @ G
-    h = H @ d
-    model = h @ H
-
-    # Transform orthogonal amplitudes (h) back to physical amplitudes (A)
-    B = h @ T
-
-    return model
+    # G.T has shape (N, 2r)
+    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
+    return G.T @ coefficients
 
 def get_noise_variance(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
