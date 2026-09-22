@@ -92,8 +92,12 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         )
 
         if signals is not None:
-            signals_0 = list(signals) + [signal_candidate]
-            signals = list(signals) + [signal_candidate]
+            signals_0 = [(jnp.asarray(signal[0]).item(), jnp.asarray(signal[1]).item()) for signal in signals]
+
+            signal_candidate = (jnp.asarray(signal_candidate[0]).item(), jnp.asarray(signal_candidate[1]).item(),)
+
+            signals_0 = signals_0 + [signal_candidate]
+            signals = signals_0.copy()
         else:
             signals_0 = signal_candidate
             signals = signal_candidate
@@ -798,7 +802,7 @@ if __name__ == "__main__":
     mcmc_kwargs = dict(
         num_warmup=20,
         num_samples=20,
-        num_chains=1,
+        num_chains=2,
         progress_bar=True
     )
     run_kwargs = dict()
@@ -818,5 +822,6 @@ if __name__ == "__main__":
 
         signals_per_block=5,
         fill_order=0,
-        nuts_args_sample=nuts_args
+        nuts_args_sample=nuts_args,
+        cores_per_worker=2,
     )
