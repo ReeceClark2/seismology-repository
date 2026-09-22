@@ -9,6 +9,7 @@ import traceback
 import math
 from copy import deepcopy
 from collections import defaultdict
+import os
 
 import numpy as np
 
@@ -21,6 +22,16 @@ import bats
 import utils
 import log_utils
 
+
+def initialize_worker(core_queue):
+    worker_cores = core_queue.get()
+    os.sched_setaffinity(0, worker_cores)
+
+    print(
+        f"PID {os.getpid()} using cores "
+        f"{sorted(os.sched_getaffinity(0))}",
+        flush=True,
+    )
 
 @dataclass
 class SignalSpace:
@@ -541,7 +552,8 @@ class Dracula():
             signals_bw: Any,
             signals_per_block: int,
             fill_order: int,
-            nuts_args: NUTSArgs
+            nuts_args: NUTSArgs,
+            cores_per_worker: int,
     ):
         print("Sampling...")
 
@@ -613,9 +625,29 @@ class Dracula():
 
         results_by_signal = defaultdict(list)
 
+        context = mp.get_context("spawn")
+        manager = context.Manager()
+        core_queue = manager.Queue()
+
+        available_cores = sorted(os.sched_getaffinity(0))
+        required_cores = self.max_workers * cores_per_worker
+
+        if len(available_cores) < required_cores:
+            raise RuntimeError(
+                f"Need {required_cores} cores, "
+                f"but only {len(available_cores)} are available."
+            )
+
+        for worker_index in range(self.max_workers):
+            start = worker_index * cores_per_worker
+            stop = start + cores_per_worker
+            core_queue.put(available_cores[start:stop])
+
         with ProcessPoolExecutor(
             max_workers=self.max_workers,
-            mp_context=mp.get_context("spawn"),
+            mp_context=context,
+            initializer=initialize_worker,
+            initargs=(core_queue,),
         ) as executor:
 
             future_to_task_index = {
@@ -699,6 +731,7 @@ class Dracula():
             signals_per_block: int = 1,
             fill_order: int = 1,
             nuts_args_sample:  Optional[NUTSArgs] = None,
+            cores_per_worker: int = 1,
     ):        
         if not grid_search_args:
             grid_search_args = self.default_grid_search_args
@@ -718,7 +751,8 @@ class Dracula():
             signals_bw=self.signals_bw_init,
             signals_per_block=signals_per_block,
             fill_order=fill_order,
-            nuts_args=nuts_args_sample
+            nuts_args=nuts_args_sample,
+            cores_per_worker=cores_per_worker
         )
         self.report(
             self.results
