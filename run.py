@@ -69,10 +69,10 @@ def main():
     stream_index = 0
 
     start_time = UTCDateTime("2025-07-30T01:24:50")
-    end_time = UTCDateTime("2025-07-31T17:24:50")
+    end_time = UTCDateTime("2025-07-31T20:24:50")
 
-    f_min = 0.0020
-    f_max = 0.0100
+    f_min = 0.0028
+    f_max = 0.0042
 
     t, d = observed_data(
         network=network,
@@ -89,11 +89,11 @@ def main():
     model = Dracula(
         t, 
         d,
-        f_min=0.002,
-        f_max=0.010,
+        f_min=0.003,
+        f_max=0.004,
         k_min=2.7e-6,
         k_max=2.6e-4,
-        max_workers=12
+        max_workers=2
     )
 
     grid_search_args = GridSearchArgs(
@@ -123,7 +123,7 @@ def main():
     mcmc_kwargs = dict(
         num_warmup=100,
         num_samples=400,
-        num_chains=8,
+        num_chains=16,
         chain_method="parallel"
     )
     run_kwargs = dict()
@@ -135,14 +135,16 @@ def main():
     )
 
     model.execute(
-        subband_count=40, 
-        subband_scaling_factor=0.9,
-        depth=15,
+        subband_count=10, 
+        subband_scaling_factor=1.0,
+        depth=8,
         grid_search_args=grid_search_args,
 
         signals_per_block=16,
-        fill_order=1,
-        nuts_args_sample=nuts_args_sample
+        fill_order=0,
+        nuts_args_sample=nuts_args_sample,
+        perform_lbfgsb=True,
+        cores_per_worker=16,
     )
 
 

@@ -5,6 +5,8 @@ from scipy.optimize import minimize
 import numpy as np
 
 import jax
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import jax.scipy.special as jsp
 from jax.flatten_util import ravel_pytree
@@ -245,8 +247,6 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
 def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
-    scale = 1 / min(d)
-    d = d * scale
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -263,7 +263,9 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    g_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    g_floor = jnp.finfo(g.dtype).eps * g_scale
+    eigenvalues = jnp.maximum(eigenvalues, g_floor)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -279,7 +281,9 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     b = (-m / 2) * jax.hessian(objective)(theta)
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(b)
-    eigenvalues = jnp.maximum(eigenvalues, 1e-12)
+    b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    b_floor = jnp.finfo(b.dtype).eps * b_scale
+    eigenvalues = jnp.maximum(eigenvalues, b_floor)
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)

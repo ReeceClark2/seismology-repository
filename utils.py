@@ -10,7 +10,7 @@ import rcrpy
 
 def filter(t, d, f_min, f_max):
     sample_rate = 1 / np.mean(np.diff(t))
-    sos = signal.butter(4, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
+    sos = signal.butter(2, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
 
     return signal.sosfiltfilt(sos, d)
 
