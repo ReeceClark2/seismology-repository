@@ -1,7 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from itertools import chain
-from dataclasses import dataclass, asdict, field, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -10,8 +10,18 @@ import math
 from copy import deepcopy
 from collections import defaultdict
 import os
+import psutil
 
 import numpy as np
+
+os.environ["XLA_FLAGS"] = (
+    "--xla_cpu_multi_thread_eigen=false "
+    "intra_op_parallelism_threads=1"
+)
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import jax.numpy as jnp
 from jax.typing import ArrayLike
@@ -24,17 +34,34 @@ import log_utils
 
 
 def initialize_worker(core_queue):
-    worker_cores = core_queue.get()
-    os.sched_setaffinity(0, worker_cores)
+    '''
+    Windows and Linux compatible functon for diagnosing core availibility.
+    '''
 
-    print(
-        f"PID {os.getpid()} using cores "
-        f"{sorted(os.sched_getaffinity(0))}",
-        flush=True,
-    )
+    worker_cores = core_queue.get()
+
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, worker_cores)
+
+        active_cores = sorted(os.sched_getaffinity(0))
+        message = f"PID {os.getpid()} using cores {active_cores}"
+    else:
+        available_cores = os.cpu_count() or 1
+        message = (
+            f"PID {os.getpid()} on Windows; "
+            f"affinity not explicitly pinned; "
+            f"{available_cores} logical CPUs available"
+        )
+
+    print(message, flush=True)
+
 
 @dataclass
 class SignalSpace:
+    '''
+    Defines the set of allowed frequencies and decay rates that bound 
+    the whole of signal-decay rate space.
+    '''
     f_min: float
     f_max: float
     k_min: float
@@ -42,11 +69,17 @@ class SignalSpace:
 
 @dataclass
 class GridSearchArgs:
+    '''
+    Defines the resolution sought for a grid search to find initial conditions.
+    '''
     f_points: int
     k_points: int
 
 @dataclass
 class NUTSArgs:
+    '''
+    Defines the NUTS dictionaries to pass all numpyro kwargs.
+    '''
     seed: Any
     nuts_kwargs: dict[str, Any] = field(default_factory=dict)
     mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -54,30 +87,40 @@ class NUTSArgs:
 
 @dataclass
 class InitialConditionsTask:
+    '''
+    Defines the allowed parameters of an initial conditions worker.
+    '''
     t: ArrayLike
     d: ArrayLike
     signal_space: SignalSpace
     depth: int
     grid_search_args: GridSearchArgs
     nuts_args: NUTSArgs
-    lbfgsb: bool
+    perform_lbfgsb: bool
     path: str
     
 
-def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, nuts_args, lbfgsb, path):
+def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, nuts_args, perform_lbfgsb, path):
+    '''
+    Runs an instance of the initial conditions worker to find all signals in a subband.
+    '''
     path.mkdir(parents=True, exist_ok=True)
 
     def update_signals(
             t,
             d,
-            signals_bw,
             signal_space,
             grid_search_args,
             nuts_args=None,
-            lbfgsb=False,
+            perform_lbfgsb=False,
             signals=None,
-            model = None,
+            signals_bw=None,
+            model=None,
         ):
+        '''
+        Find the next signal and return it and its beamwidth. At minimum, must perform a grid search, 
+        but can run grid search and NUTS sample to typical set and lbfgs to local maximum probability.
+        '''
         if model is not None:
             d = d - model
 
@@ -92,15 +135,17 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         )
 
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
+        signal_candidate_bw = jnp.asarray(get_signal_bw(signal_space)).reshape(1, 2)
 
         if signals is None:
             signals = signal_candidate
             signals_0 = signal_candidate
+            signals_bw = signal_candidate_bw
         else:
             signals = jnp.asarray(signals).reshape(-1, 2)
             signals_0 = jnp.concatenate((signals, signal_candidate), axis=0)
+            signals_bw = jnp.concatenate((signals_bw, signal_candidate_bw), axis=0)
             signals = signals_0
-
         if model is not None:
             d = d + model
 
@@ -108,6 +153,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             signals = bats.nuts(
                 t, 
                 d, 
+                signal_space,
                 signals, 
                 signals_bw, 
                 nuts_args.nuts_kwargs, 
@@ -116,22 +162,20 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.seed
             )
 
-        if lbfgsb is True:
+        if perform_lbfgsb is True:
             signals = bats.lbfgsb(
                 t, 
                 d, 
-                signals, 
-                signal_space.f_min, 
-                signal_space.f_max, 
-                signal_space.k_min, 
-                signal_space.k_max
+                signal_space,
+                signals
             )
 
         log_utils.plot_probability_surface(path / f"{len(signals)}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals)}")
-        log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signal_bw, f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+        log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signals_bw, signal_space=signal_space)
 
-        return signals
+        return signals, signals_bw
 
+    # subband_bw = signal_space.f_max - signal_space.f_min
 
     subband_t = t.copy()
     subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
@@ -143,26 +187,38 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     subband_t = subband_t[mask]
     subband_d = subband_d[mask]
 
+    t = t[mask]
+    d = d[mask]
+
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
-    signal_bw = ((signal_space.f_max - signal_space.f_min) / 4, (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 4)
+    def get_signal_bw(signal_space):
+        '''
+        Small helper function to return beamwidth of signal. TODO: Make dynamic to individual signal, TODO: Allow the halfwidth to be an argument
+        '''
+        f_halfwidth = (signal_space.f_max - signal_space.f_min) / 8
+        log_k_halfwidth = (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 8
+
+        return (f_halfwidth, log_k_halfwidth)
+
     glob_lls = []
     noise_variances = []
     snrs = []
-    
-    signals = update_signals(
+
+    signals, signals_bw = update_signals(
         subband_t,
         subband_d,
-        signal_bw,
         signal_space,
         grid_search_args,
         nuts_args,
-        lbfgsb=False,
+        perform_lbfgsb=perform_lbfgsb,
     )
 
     signals_by_depth = {}
     signals_by_depth[len(signals)] = deepcopy(signals)
+    signals_bw_by_depth = {}
+    signals_bw_by_depth[len(signals_bw)] = deepcopy(signals_bw)
 
     glob_lls.append(bats.get_glob_ll(t, d, signals))
     noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
@@ -174,15 +230,15 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
     reason = "depth"
     while True:
-        signals = update_signals(
+        signals, signals_bw = update_signals(
             subband_t,
             subband_d,
-            signal_bw,
             signal_space,
             grid_search_args,
             nuts_args,
-            lbfgsb=False,
+            perform_lbfgsb=perform_lbfgsb,
             signals=signals,
+            signals_bw=signals_bw,
             model=model,
         )
 
@@ -191,6 +247,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
 
         signals_by_depth[len(signals)] = deepcopy(signals)
+        signals_bw_by_depth[len(signals_bw)] = deepcopy(signals_bw)
         noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
         snrs.append(bats.get_snr(subband_t, subband_d, signals))
         glob_lls.append(bats.get_glob_ll(t, d, signals))
@@ -204,14 +261,15 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     stop = index + 1
 
     signals = deepcopy(signals_by_depth[stop])
+    signals_bw = deepcopy(signals_bw_by_depth[stop])
     noise_variances = noise_variances[:stop]
     snrs = snrs[:stop]
     glob_lls = glob_lls[:stop]
     signals = deepcopy(signals_by_depth[len(signals)])
+    signals_bw = deepcopy(signals_bw_by_depth[len(signals_bw)])
 
-    signals_bw = [tuple(signal_bw) for _ in signals]
-    noise_variance = bats.get_noise_variance(t, d, signals)
-    snr = bats.get_snr(t, d, signals)
+    noise_variance = bats.get_noise_variance(subband_t, subband_d, signals)
+    snr = bats.get_snr(subband_t, subband_d, signals)
     glob_ll = bats.get_glob_ll(t, d, signals)
 
     return {
@@ -225,9 +283,10 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         "reason": reason,
     }
 
-def run_initial_conditions_worker_wrapper(
-    config: InitialConditionsTask,
-):
+def run_initial_conditions_worker_wrapper(config: InitialConditionsTask):
+    '''
+    Wrapper for launching initial conditions worker and flattening task dictionary.
+    '''
     config_dict = {
         field.name: getattr(config, field.name)
         for field in fields(config)
@@ -255,6 +314,9 @@ def run_initial_conditions_worker_wrapper(
 
 @dataclass
 class SampleTask:
+    '''
+    Defines the allowed parameters for the sampling worker.
+    '''
     t: ArrayLike
     d: ArrayLike
     signal_space: SignalSpace
@@ -262,7 +324,7 @@ class SampleTask:
     signals_bw: Any
     signal_indices: list[int]
     nuts_args: NUTSArgs
-    lbfgsb: bool
+    perform_lbfgsb: bool
     path: str
 
 def run_sample_worker(
@@ -273,9 +335,13 @@ def run_sample_worker(
     signals_bw,
     signal_indices,
     nuts_args,
-    lbfgsb,
+    perform_lbfgsb,
     path,
 ):
+    '''
+    Runs an instance of the sample worker that improves initial condtions by 
+    allowing more signals to covary.
+    '''    
     path.mkdir(parents=True, exist_ok=True)
 
     d = utils.filter(t, d, signal_space.f_min, signal_space.f_max)
@@ -294,6 +360,7 @@ def run_sample_worker(
     signals = bats.nuts(
         t,
         d,
+        signal_space,
         signals,
         signals_bw,
         nuts_args.nuts_kwargs,
@@ -301,18 +368,15 @@ def run_sample_worker(
         nuts_args.run_kwargs,
         nuts_args.seed
     )
-    if lbfgsb is True:
+    if perform_lbfgsb is True:
         signals = bats.lbfgsb(
             t,
             d,
-            signals,
-            signal_space.f_min / 1.5,
-            signal_space.f_max * 1.33,
-            signal_space.k_min / 1.5,
-            signal_space.k_max * 1.33
+            signal_space,
+            signals
         )
 
-    log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signals_bw[0], f_min=signal_space.f_min, f_max=signal_space.f_max, k_min=signal_space.k_min, k_max=signal_space.k_max)
+    log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signals_bw, signal_space=signal_space)
 
     model = bats.get_model(t, d, signals)
     log_utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
@@ -323,6 +387,9 @@ def run_sample_worker(
 
 
 def run_sample_worker_wrapper(config: SampleTask):
+    '''
+    Wrapper function for the sample worker to flatten and pass SampleTask dictionary.
+    '''
     config_dict = {
         field.name: getattr(config, field.name)
         for field in fields(config)
@@ -360,6 +427,11 @@ class Dracula():
             max_workers: int=1,
             path: str=None
         ):
+        '''
+        Model initialization for the time series, signal space, maximum workers
+        allowed, and directory to store data.
+        '''
+
         self.t = jnp.asarray(t)
         self.d = jnp.asarray(d)
 
@@ -403,11 +475,12 @@ class Dracula():
 
     def initialize(
             self,
-            subband_count: int,
-            subband_scaling_factor: float,
-            depth: int,
             grid_search_args: GridSearchArgs,
             nuts_args: NUTSArgs,
+            subband_count: int = 5,
+            subband_scaling_factor: float = 1,
+            depth: int = 5,
+            cores_per_worker: int = 1,
     ):
         print("Finding initial conditions...")
 
@@ -453,15 +526,52 @@ class Dracula():
                 depth=depth,
                 grid_search_args=grid_search_args,
                 nuts_args=nuts_args,
-                lbfgsb=self.perform_lbfgsb,
+                perform_lbfgsb=self.perform_lbfgsb,
                 path=path / f"subband_{ind + 1}r{subband_count}"
             )
 
         task_results_by_index = {}
 
+        context = mp.get_context("spawn")
+        manager = context.Manager()
+        core_queue = manager.Queue()
+
+        if hasattr(os, "sched_getaffinity"):
+            available_core_ids = sorted(os.sched_getaffinity(0))
+            available_cores = len(available_core_ids)
+        else:
+            available_core_ids = list(range(os.cpu_count() or 1))
+            available_cores = len(available_core_ids)
+
+        cores_per_worker = max(
+            1,
+            available_cores // self.max_workers,
+        )
+
+        required_cores = self.max_workers * cores_per_worker
+
+        available_core_ids = psutil.Process().cpu_affinity()
+        available_cores = len(available_core_ids)
+
+        required_cores = self.max_workers * cores_per_worker
+
+        if available_cores < required_cores:
+            raise RuntimeError(
+                f"Need {required_cores} cores, "
+                f"but only {available_cores} are available."
+            )
+
+        for worker_index in range(self.max_workers):
+            start = worker_index * cores_per_worker
+            stop = start + cores_per_worker
+
+            core_queue.put(available_core_ids[start:stop])
+
         with ProcessPoolExecutor(
             max_workers=self.max_workers,
-            mp_context=mp.get_context("spawn"),
+            mp_context=context,
+            initializer=initialize_worker,
+            initargs=(core_queue,),
         ) as executor:
             future_to_index = {
                 executor.submit(
@@ -520,7 +630,7 @@ class Dracula():
             key=lambda pair: pair[0][0],  
         )
 
-        self.signals_init, self.signals_bw_init = map(
+        self.signals_init, self.signals_bw = map(
             list,
             zip(*signals_and_bw)
         )
@@ -539,7 +649,22 @@ class Dracula():
             for result in ordered_results
         }
 
-        log_utils.save_initialize_csv(path / "initialize_results.csv", signals_by_subband=self.signals_by_subband)
+        print(self.signals_init)
+        log_utils.save_initialize_csv(path / "all_subband_results.csv", signals_by_subband=self.signals_by_subband)
+
+        model = bats.get_model(self.t, self.d, self.signals_init)
+        amplitudes = bats.get_amplitudes(self.t, self.d, self.signals_init)
+        uncertainties = bats.get_uncertainties(self.t, self.d, self.signals_init)
+
+        noise_variance = bats.get_noise_variance(self.t, self.d, self.signals_init)
+        snr = bats.get_snr(self.t, self.d, self.signals_init)
+
+        log_utils.save_signals_csv(path / "initial_conditions_signals.csv", self.signals_init, amplitudes, uncertainties)
+        log_utils.save_report_txt(path / "initial_conditions_report.txt", len(self.signals_init), noise_variance, snr)
+
+        log_utils.plot_fourier_space(path / "initial_conditions_fourier_space", self.t, self.d, "Initial Conditions Fourier Space", f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, f_points=10_000, model=model)
+        log_utils.plot_time_series(path / "initial_conditions_time_series", self.t, self.d, "Initial Conditions Time Series", model)
+        log_utils.plot_signal_space(path / "initial_conditions_signal_space", self.signals_init, "Initial Conditions Signal Space", signal_space=self.signal_space, uncertainties=uncertainties) 
 
         if self.signals_init:
             print(f"\nFound {len(self.signals_init)} signals!")
@@ -548,15 +673,16 @@ class Dracula():
             return
         
         return
+
                         
     def sample(
             self,
             signals: Any,
             signals_bw: Any,
-            signals_per_block: int,
-            fill_order: int,
             nuts_args: NUTSArgs,
-            cores_per_worker: int,
+            signals_per_block: int = 10,
+            fill_order: int = 0,
+            cores_per_worker: int = 1,
     ):
         print("Sampling...")
 
@@ -621,7 +747,7 @@ class Dracula():
                     signals_bw=signals_bw_block,
                     signal_indices=signal_indices,
                     nuts_args=nuts_args,
-                    lbfgsb=self.perform_lbfgsb,
+                    perform_lbfgsb=self.perform_lbfgsb,
                     path=path / f"block_{ind + 1}r{blocks}"   
                 )
             )
@@ -632,19 +758,36 @@ class Dracula():
         manager = context.Manager()
         core_queue = manager.Queue()
 
-        available_cores = sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity"):
+            available_core_ids = sorted(os.sched_getaffinity(0))
+            available_cores = len(available_core_ids)
+        else:
+            available_core_ids = list(range(os.cpu_count() or 1))
+            available_cores = len(available_core_ids)
+
+        cores_per_worker = max(
+            1,
+            available_cores // self.max_workers,
+        )
+
         required_cores = self.max_workers * cores_per_worker
 
-        if len(available_cores) < required_cores:
+        available_core_ids = psutil.Process().cpu_affinity()
+        available_cores = len(available_core_ids)
+
+        required_cores = self.max_workers * cores_per_worker
+
+        if available_cores < required_cores:
             raise RuntimeError(
                 f"Need {required_cores} cores, "
-                f"but only {len(available_cores)} are available."
+                f"but only {available_cores} are available."
             )
 
         for worker_index in range(self.max_workers):
             start = worker_index * cores_per_worker
             stop = start + cores_per_worker
-            core_queue.put(available_cores[start:stop])
+
+            core_queue.put(available_core_ids[start:stop])
 
         with ProcessPoolExecutor(
             max_workers=self.max_workers,
@@ -652,7 +795,6 @@ class Dracula():
             initializer=initialize_worker,
             initargs=(core_queue,),
         ) as executor:
-
             future_to_task_index = {
                 executor.submit(
                     run_sample_worker_wrapper,
@@ -693,6 +835,7 @@ class Dracula():
         
         self.results = results_by_signal
 
+
     def report(self, results):
         "Creating report..."
 
@@ -700,16 +843,14 @@ class Dracula():
         path.mkdir(parents=True, exist_ok=True)
 
         signals = utils.unpack_signal_results(results)
-        uncertainties = bats.get_uncertainties(self.t, self.d, signals)
-        log_utils.save_report_csv(path / "report_all.csv", results, uncertainties)
 
         if self.perform_lbfgsb is True:
-            signals = bats.lbfgsb(self.t, self.d, signals, self.signal_space.f_min / 1.5, self.signal_space.f_max * 1.33, self.signal_space.k_min / 1.5, self.signal_space.k_max * 1.33)
+            signals = bats.lbfgsb(self.t, self.d, self.signal_space, signals)
 
-        averaged_results = {signal_index: [{"result": signal}] for signal_index, signal in enumerate(signals)}
+        amplitudes = bats.get_amplitudes(self.t, self.d, signals)
         uncertainties = bats.get_uncertainties(self.t, self.d, signals)
-
-        log_utils.save_report_csv(path / "report_averaged.csv", averaged_results, uncertainties)
+        log_utils.save_report_csv(path / "report_all.csv", results, uncertainties)
+        log_utils.save_signals_csv(path / "report_averaged.csv", signals, amplitudes, uncertainties)
 
         noise_variance = bats.get_noise_variance(self.t, self.d, signals)
         snr = bats.get_snr(self.t, self.d, signals)
@@ -718,9 +859,9 @@ class Dracula():
 
         model = bats.get_model(self.t, self.d, signals)
         log_utils.plot_time_series(path / "model_time_series.png", self.t, self.d, "Model Time Series", model)
-        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", self.t, self.d, "model_fourier_space", self.signal_space.f_min, self.signal_space.f_max, 100_000, model)
-        log_utils.plot_signal_space(path / "signal_space.png", signals, "Signal Space", self.signals_init, self.signals_bw_init[0], f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, k_min=self.signal_space.k_min, k_max=self.signal_space.k_max)
-    
+        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", self.t, self.d, "Model Fourier Space", self.signal_space.f_min, self.signal_space.f_max, 100_000, model)
+        log_utils.plot_signal_space(path / "signal_space.png", signals, "Model Signal Space", signal_space=self.signal_space, uncertainties=uncertainties)
+
 
     def execute(
             self,
@@ -730,11 +871,12 @@ class Dracula():
             grid_search_args:  Optional[GridSearchArgs] = None,
             nuts_args_init: Optional[NUTSArgs] = None,
             perform_lbfgsb: bool = False,
+            cores_per_initial_conditions_worker: int = 1,
 
             signals_per_block: int = 1,
             fill_order: int = 1,
             nuts_args_sample:  Optional[NUTSArgs] = None,
-            cores_per_worker: int = 1,
+            cores_per_sample_worker: int = 1,
     ):        
         if not grid_search_args:
             grid_search_args = self.default_grid_search_args
@@ -748,14 +890,15 @@ class Dracula():
             depth=depth,
             grid_search_args=grid_search_args,
             nuts_args=nuts_args_init,
+            cores_per_worker=cores_per_initial_conditions_worker,
         )
         self.sample(
             signals=self.signals_init,
-            signals_bw=self.signals_bw_init,
+            signals_bw=self.signals_bw,
             signals_per_block=signals_per_block,
             fill_order=fill_order,
             nuts_args=nuts_args_sample,
-            cores_per_worker=cores_per_worker
+            cores_per_worker=cores_per_sample_worker
         )
         self.report(
             self.results
@@ -778,8 +921,7 @@ if __name__ == "__main__":
     d = (np.sin(2 * np.pi * f1 * t) * np.exp(-k1 * t) + 
          np.sin(2 * np.pi * f2 * t) * np.exp(-k2 * t) +
          np.sin(2 * np.pi * f3 * t) * np.exp(-k3 * t) + 
-         e)
-
+         2 * e)
 
     model = Dracula(
         t, 
@@ -789,7 +931,6 @@ if __name__ == "__main__":
         k_min=1e-4,
         k_max=3e-2,
         max_workers=4,
-        path="test3"
     )
 
     grid_search_args = GridSearchArgs(
@@ -816,10 +957,12 @@ if __name__ == "__main__":
         subband_count=1, 
         subband_scaling_factor=0.5,
         grid_search_args=grid_search_args,
+        cores_per_initial_conditions_worker=2,
         depth=5,
 
         signals_per_block=5,
         fill_order=0,
         nuts_args_sample=nuts_args,
-        cores_per_worker=2,
+        cores_per_sample_worker=2,
+        perform_lbfgsb=True,
     )

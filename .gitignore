@@ -4,4 +4,7 @@ __pycache__/
 output/
 scripting/
 diagnostics_*/
+
 dracula_*/
+lbfgsb*/
+test3/

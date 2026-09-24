@@ -69,10 +69,10 @@ def main():
     stream_index = 0
 
     start_time = UTCDateTime("2025-07-30T01:24:50")
-    end_time = UTCDateTime("2025-07-31T20:24:50")
+    end_time = UTCDateTime("2025-08-05T20:24:50")
 
-    f_min = 0.0028
-    f_max = 0.0042
+    f_min = 0.003
+    f_max = 0.004
 
     t, d = observed_data(
         network=network,
@@ -89,27 +89,29 @@ def main():
     model = Dracula(
         t, 
         d,
-        f_min=0.003,
-        f_max=0.004,
-        k_min=2.7e-6,
-        k_max=2.6e-4,
-        max_workers=2
+        f_min=0.0027,
+        f_max=0.0043,
+        k_min=1e-5,
+        k_max=1e-4,
+        max_workers=8,
+        path="ampltiude_no_initial_sampling"
     )
 
     grid_search_args = GridSearchArgs(
-        f_points=100,
-        k_points=100
+        f_points=50,
+        k_points=50
     )
     nuts_kwargs = dict(
         target_accept_prob=0.75,
     )
     mcmc_kwargs = dict(
-        num_warmup=150,
-        num_samples=200,
-        num_chains=4,
+        num_warmup=20,
+        num_samples=60,
+        num_chains=1,
         chain_method="parallel"
     )
     run_kwargs = dict()
+
     nuts_args_init = NUTSArgs(
         nuts_kwargs=nuts_kwargs,
         mcmc_kwargs=mcmc_kwargs,
@@ -121,12 +123,13 @@ def main():
         target_accept_prob=0.85,
     )
     mcmc_kwargs = dict(
-        num_warmup=100,
-        num_samples=400,
-        num_chains=16,
+        num_warmup=50,
+        num_samples=50,
+        num_chains=1,
         chain_method="parallel"
     )
     run_kwargs = dict()
+
     nuts_args_sample = NUTSArgs(
         nuts_kwargs=nuts_kwargs,
         mcmc_kwargs=mcmc_kwargs,
@@ -135,16 +138,18 @@ def main():
     )
 
     model.execute(
-        subband_count=10, 
+        subband_count=8, 
         subband_scaling_factor=1.0,
-        depth=8,
+        depth=4,
         grid_search_args=grid_search_args,
+        cores_per_initial_conditions_worker=2,
 
-        signals_per_block=16,
+        signals_per_block=8,
         fill_order=0,
         nuts_args_sample=nuts_args_sample,
-        perform_lbfgsb=True,
-        cores_per_worker=16,
+        cores_per_sample_worker=1,
+
+        perform_lbfgsb=False,
     )
 
 

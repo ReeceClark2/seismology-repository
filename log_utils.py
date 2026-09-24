@@ -5,7 +5,7 @@ import numpy as np
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, FuncFormatter
-from matplotlib.patches import Polygon
+from matplotlib.patches import Rectangle, Ellipse
 
 import utils
 
@@ -90,47 +90,87 @@ def plot_probability_surface(path, probability_surface, title):
     fig.savefig(path, dpi=300)
     plt.close(fig)
 
-def add_log_ellipse(
+def add_log_rectangle(
     ax,
     f0,
     k0,
     f_bandwidth,
     log_k_bandwidth,
+    f_min=None,
+    f_max=None,
+    k_min=None,
+    k_max=None,
     **kwargs,
 ):
-    theta = np.linspace(0, 2 * np.pi, 200)
+    f0 = float(f0)
+    k0 = float(k0)
+    f_bandwidth = float(f_bandwidth)
+    log_k_bandwidth = float(log_k_bandwidth)
 
-    f_radius = f_bandwidth / 2
+    if k0 <= 0:
+        raise ValueError("k0 must be strictly positive.")
+
+    if k_min is not None and k_min <= 0:
+        raise ValueError("k_min must be strictly positive.")
+
+    if k_max is not None and k_max <= 0:
+        raise ValueError("k_max must be strictly positive.")
+
+    # Rectangle bounds in frequency space
+    f_left = f0 - f_bandwidth
+    f_right = f0 + f_bandwidth
+
+    if f_min is not None:
+        f_left = max(f_left, f_min)
+
+    if f_max is not None:
+        f_right = min(f_right, f_max)
+
+    # Rectangle bounds in log(k) space
     log_k0 = np.log(k0)
 
-    # Ellipse in (frequency, log(decay rate)) coordinates
-    f_values = f0 + f_bandwidth * np.cos(theta)
-    log_k_values = log_k0 + log_k_bandwidth * np.sin(theta)
+    log_k_bottom = log_k0 - log_k_bandwidth
+    log_k_top = log_k0 + log_k_bandwidth
 
-    # Transform back to ordinary decay-rate coordinates
-    k_values = np.exp(log_k_values)
+    if k_min is not None:
+        log_k_bottom = max(log_k_bottom, np.log(k_min))
 
-    vertices = np.column_stack((f_values, k_values))
+    if k_max is not None:
+        log_k_top = min(log_k_top, np.log(k_max))
 
-    ellipse = Polygon(
-        vertices,
-        closed=True,
+    # Transform back to ordinary k coordinates for plotting
+    k_bottom = np.exp(log_k_bottom)
+    k_top = np.exp(log_k_top)
+
+    if f_left >= f_right:
+        raise ValueError(
+            "The rectangle has no valid frequency width after clipping."
+        )
+
+    if k_bottom >= k_top:
+        raise ValueError(
+            "The rectangle has no valid decay-rate height after clipping."
+        )
+
+    rectangle = Rectangle(
+        xy=(f_left, k_bottom),
+        width=f_right - f_left,
+        height=k_top - k_bottom,
         **kwargs,
     )
 
-    ax.add_patch(ellipse)
-    return ellipse
+    ax.add_patch(rectangle)
+    return rectangle
+
 
 def plot_signal_space(
     path,
     signals,
     title,
+    uncertainties=None,
     signals_0=None,
     signals_bw=None,
-    f_min=None,
-    f_max=None,
-    k_min=None,
-    k_max=None,
+    signal_space=None,
 ):
     fig, ax = plt.subplots(figsize=(10, 5))
 
@@ -139,6 +179,80 @@ def plot_signal_space(
     fs = np.asarray(fs)
     ks = np.asarray(ks)
 
+    # Draw uncertainty regions from largest to smallest so that the
+    # more opaque inner ellipses remain visible.
+    if uncertainties is not None:
+        sigma_fs, sigma_ks = utils.unpack_signals(uncertainties)
+
+        sigma_fs = np.asarray(sigma_fs)
+        sigma_ks = np.asarray(sigma_ks)
+
+        lengths = [len(fs), len(ks), len(sigma_fs), len(sigma_ks)]
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                "Signals and uncertainties must have matching lengths. "
+                f"Got lengths: {lengths}"
+            )
+
+        if np.any(ks <= 0):
+            raise ValueError(
+                "Decay rates must be positive to calculate log-space uncertainties."
+            )
+
+        if np.any(sigma_fs < 0) or np.any(sigma_ks < 0):
+            raise ValueError("Standard deviations must be non-negative.")
+
+        # First-order delta-method conversion:
+        # Var(log(k)) ≈ Var(k) / k**2
+        sigma_log_ks = sigma_ks / ks
+
+        # Draw largest first so the inner regions remain more visible.
+        uncertainty_levels = (
+            (3, 0.10),
+            (2, 0.25),
+            (1, 0.40),
+        )
+
+        angles = np.linspace(0.0, 2.0 * np.pi, 200)
+
+        for f, k, sigma_f, sigma_log_k in zip(
+            fs,
+            ks,
+            sigma_fs,
+            sigma_log_ks,
+        ):
+            log_k = np.log(k)
+
+            for standard_deviations, alpha in uncertainty_levels:
+                ellipse_f = (
+                    f
+                    + standard_deviations
+                    * sigma_f
+                    * np.cos(angles)
+                )
+
+                ellipse_log_k = (
+                    log_k
+                    + standard_deviations
+                    * sigma_log_k
+                    * np.sin(angles)
+                )
+
+                # Convert log-decay coordinates back to the data coordinates
+                # expected by the logarithmic Matplotlib axis.
+                ellipse_k = np.exp(ellipse_log_k)
+
+                ax.fill(
+                    ellipse_f,
+                    ellipse_k,
+                    facecolor="red",
+                    edgecolor="red",
+                    linewidth=1,
+                    alpha=alpha,
+                    zorder=3,
+                )
+
+    # Keep signal markers above their uncertainty regions.
     ax.scatter(
         fs,
         ks,
@@ -153,10 +267,17 @@ def plot_signal_space(
 
         fs_0 = np.asarray(fs_0)
         ks_0 = np.asarray(ks_0)
-        fs_bw = np.repeat(fs_bw, len(fs_0))
-        ks_bw = np.repeat(ks_bw, len(ks_0))
+        fs_bw = np.asarray(fs_bw)
+        ks_bw = np.asarray(ks_bw)
 
-        lengths = [len(fs_0), len(ks_0), len(fs), len(ks), len(fs_bw), len(ks_bw)]
+        lengths = [
+            len(fs_0),
+            len(ks_0),
+            len(fs),
+            len(ks),
+            len(fs_bw),
+            len(ks_bw),
+        ]
 
         if len(set(lengths)) != 1:
             raise ValueError(
@@ -180,7 +301,17 @@ def plot_signal_space(
             fs_bw,
             ks_bw,
         ):
-            add_log_ellipse(
+            rectangle_kwargs = {}
+
+            if signal_space is not None:
+                rectangle_kwargs = {
+                    "f_min": signal_space.f_min,
+                    "f_max": signal_space.f_max,
+                    "k_min": signal_space.k_min,
+                    "k_max": signal_space.k_max,
+                }
+
+            add_log_rectangle(
                 ax,
                 f0=f0,
                 k0=k0,
@@ -191,6 +322,7 @@ def plot_signal_space(
                 alpha=0.15,
                 linewidth=1,
                 zorder=1,
+                **rectangle_kwargs,
             )
 
             ax.plot(
@@ -212,12 +344,49 @@ def plot_signal_space(
         FuncFormatter(format_e_tick)
     )
 
-    if f_min is not None and f_max is not None:
+    if signal_space is not None:
+        f_min = signal_space.f_min
+        f_max = signal_space.f_max
+        k_min = signal_space.k_min
+        k_max = signal_space.k_max
+
         halfwidth = f_max - f_min
-        ax.set_xlim(f_min - halfwidth * 0.05, f_max + halfwidth * 0.05)
+        ax.set_xlim(
+            f_min - halfwidth * 0.1,
+            f_max + halfwidth * 0.1,
+        )
+
+        log_k_min = np.log(k_min)
+        log_k_max = np.log(k_max)
+
+        log_k_halfwidth = log_k_max - log_k_min
+        log_padding = 0.1 * log_k_halfwidth
+
+        ax.set_ylim(
+            np.exp(log_k_min - log_padding),
+            np.exp(log_k_max + log_padding),
+        )
+
+        xmin, xmax = ax.get_xlim()
+        ax.hlines(
+            y=[k_min, k_max],
+            xmin=f_min,
+            xmax=f_max,
+            color="black",
+            linestyle="dashed",
+            linewidth=0.3,
+        )
+        ax.set_xlim(xmin, xmax)
 
         ymin, ymax = ax.get_ylim()
-        ax.vlines(x=[f_min, f_max], ymin=0, ymax=k_max * 150, color='black', linestyle='dashed', linewidth=0.3)
+        ax.vlines(
+            x=[f_min, f_max],
+            ymin=k_min,
+            ymax=k_max,
+            color="black",
+            linestyle="dashed",
+            linewidth=0.3,
+        )
         ax.set_ylim(ymin, ymax)
 
     ax.set_xlabel("Frequency (Hz)")
@@ -230,7 +399,16 @@ def plot_signal_space(
     plt.close(fig)
 
 
-def plot_fourier_space(path, t, d, title, f_min, f_max, f_points, model=None):
+def plot_fourier_space(
+    path,
+    t,
+    d,
+    title,
+    f_min,
+    f_max,
+    f_points,
+    model=None,
+):
     t = np.asarray(t)
     d = np.asarray(d)
 
@@ -240,6 +418,15 @@ def plot_fourier_space(path, t, d, title, f_min, f_max, f_points, model=None):
     if len(t) != len(d):
         raise ValueError("t and d must have matching lengths")
 
+    if len(t) < 2:
+        raise ValueError("At least two time samples are required")
+
+    if f_min < 0 or f_max <= f_min:
+        raise ValueError("Require 0 <= f_min < f_max.")
+
+    if f_points < 2:
+        raise ValueError("f_points must be at least 2.")
+
     if model is not None:
         model = np.asarray(model)
 
@@ -247,37 +434,71 @@ def plot_fourier_space(path, t, d, title, f_min, f_max, f_points, model=None):
             raise ValueError("model must be one-dimensional")
 
         if len(model) != len(t):
-            raise ValueError("model must have the same length as t and d")
+            raise ValueError(
+                "model must have the same length as t and d"
+            )
 
-    if len(t) < 2:
-        raise ValueError("At least two time samples are required")
+    dt_values = np.diff(t)
 
-    sample_interval = np.mean(np.diff(t))
+    if not np.allclose(dt_values, dt_values[0]):
+        raise ValueError(
+            "The FFT requires uniformly sampled time values."
+        )
 
-    window = np.hanning(len(t))
-    n_fft = max(len(t), 2 * (f_points - 1))
+    sample_interval = float(dt_values[0])
+    sample_rate = 1.0 / sample_interval
+    nyquist = 0.5 * sample_rate
+
+    if f_max > nyquist:
+        raise ValueError(
+            f"f_max={f_max} exceeds the Nyquist frequency "
+            f"{nyquist}."
+        )
+
+    # Exactly f_points frequencies in [f_min, f_max].
+    target_frequencies = np.linspace(
+        f_min,
+        f_max,
+        f_points,
+    )
+
+    # Native FFT frequency spacing should be fine enough for interpolation.
+    target_spacing = (
+        f_max - f_min
+    ) / (f_points - 1)
+
+    required_n_fft = int(
+        np.ceil(
+            1.0
+            / (sample_interval * target_spacing)
+        )
+    )
+
+    n_fft = max(len(t), required_n_fft)
 
     frequencies = np.fft.rfftfreq(
         n_fft,
         d=sample_interval,
     )
 
-    normalization = np.sum(window)
+    def interpolated_spectrum(x):
+        spectrum = np.abs(
+            np.fft.rfft(x, n=n_fft)
+        )
 
-    data_spectrum = np.abs(
-        np.fft.rfft(d * window, n=n_fft)
-    ) / normalization
+        return np.interp(
+            target_frequencies,
+            frequencies,
+            spectrum,
+        )
 
-    frequency_mask = (
-        (frequencies >= f_min)
-        & (frequencies <= f_max)
-    )
+    data_spectrum = interpolated_spectrum(d)
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
     ax.plot(
-        frequencies[frequency_mask],
-        data_spectrum[frequency_mask],
+        target_frequencies,
+        data_spectrum,
         color="black",
         label="Data",
         linewidth=0.6,
@@ -286,25 +507,20 @@ def plot_fourier_space(path, t, d, title, f_min, f_max, f_points, model=None):
     if model is not None:
         residual = d - model
 
-        model_spectrum = np.abs(
-            np.fft.rfft(model * window, n=n_fft)
-        ) / normalization
-
-        residual_spectrum = np.abs(
-            np.fft.rfft(residual * window, n=n_fft)
-        ) / normalization
+        model_spectrum = interpolated_spectrum(model)
+        residual_spectrum = interpolated_spectrum(residual)
 
         ax.plot(
-            frequencies[frequency_mask],
-            model_spectrum[frequency_mask],
+            target_frequencies,
+            model_spectrum,
             color="red",
             label="Model",
             linewidth=0.6,
         )
 
         ax.plot(
-            frequencies[frequency_mask],
-            residual_spectrum[frequency_mask],
+            target_frequencies,
+            residual_spectrum,
             color="blue",
             label="Residual",
             linewidth=0.6,
@@ -423,6 +639,51 @@ def save_block_csv(path, signals):
                     "Decay Rate": decay_rate
                 }
             )
+
+
+def save_signals_csv(path, signals, amplitudes, uncertainties):
+    signals = list(signals)
+    amplitudes = list(amplitudes)
+    uncertainties = list(uncertainties)
+
+    if len(signals) != len(uncertainties):
+        raise ValueError(
+            "The number of uncertainty pairs must match the number of signals."
+        )
+
+    rows = []
+
+    for signal, amplitude, uncertainty in zip(signals, amplitudes, uncertainties):
+        try:
+            frequency, decay_rate = signal
+            frequency_uncertainty, decay_rate_uncertainty = uncertainty
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Each signal must be a `(frequency, decay_rate)` pair, "
+                "and each uncertainty must be a "
+                "`(frequency_uncertainty, decay_rate_uncertainty)` pair."
+            ) from exc
+
+        rows.append({
+            "Amplitude": amplitude,
+            "Frequency": frequency,
+            "Frequency Uncertainty": frequency_uncertainty,
+            "Decay Rate": decay_rate,
+            "Decay Rate Uncertainty": decay_rate_uncertainty,
+        })
+
+    fieldnames = [
+        "Amplitude",
+        "Frequency",
+        "Frequency Uncertainty",
+        "Decay Rate",
+        "Decay Rate Uncertainty",
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def save_report_csv(path, results, uncertainties):

@@ -53,6 +53,7 @@ def get_log_prob(t, d, signals):
 
     return 0.5 * (effective_m - N) * jnp.log1p(-ratio)
 
+
 @jax.jit
 def get_model(t, d, signals):
     fs, ks = utils.unpack_signals(signals)
@@ -245,6 +246,32 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     return delta_term + sigma_term + gamma_term + log_jacobian_factor
 
 
+def get_amplitudes(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+    fs, ks = utils.unpack_signals(signals)
+
+    omegas = 2.0 * jnp.pi * fs
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    G = jnp.vstack((
+        jnp.cos(arg) * decay,
+        jnp.sin(arg) * decay,
+    ))
+
+    # G.T has shape (N, 2r)
+    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
+
+    n_components = fs.shape[0]
+    cosine_coefficients = coefficients[:n_components]
+    sine_coefficients = coefficients[n_components:]
+
+    amplitudes = jnp.sqrt(
+        cosine_coefficients**2 + sine_coefficients**2
+    )
+
+    return amplitudes
+
+
 def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
@@ -279,6 +306,7 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
         return get_mean_sq_proj(t, d, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(b)
     b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
@@ -345,6 +373,10 @@ def bats_model(
     f_scale: float | jax.Array,
     k_loc: jax.Array,
     k_scale: float | jax.Array,
+    f_min: float,
+    f_max: float,
+    k_min: float,
+    k_max: float,
 ) -> None:
     f_loc = jnp.atleast_1d(jnp.asarray(f_loc))
     k_loc = jnp.atleast_1d(jnp.asarray(k_loc))
@@ -359,35 +391,60 @@ def bats_model(
         k_loc.shape,
     )
 
-    # Frequency bounds
-    f_low = f_loc - f_scale
-    f_high = f_loc + f_scale
+    # Bounds in ordinary frequency space
+    f_min = jnp.asarray(f_min, dtype=f_loc.dtype)
+    f_max = jnp.asarray(f_max, dtype=f_loc.dtype)
 
+    # k must be positive before converting to log space
+    log_k_min = jnp.log(
+        jnp.asarray(k_min, dtype=k_loc.dtype)
+    )
+    log_k_max = jnp.log(
+        jnp.asarray(k_max, dtype=k_loc.dtype)
+    )
+
+    log_k_loc = jnp.log(k_loc)
+
+    # Local rectangular region in f space
+    f_low = jnp.maximum(
+        f_loc - f_scale,
+        f_min,
+    )
+    f_high = jnp.minimum(
+        f_loc + f_scale,
+        f_max,
+    )
+
+    # Local rectangular region in log(k) space
+    log_k_low = jnp.maximum(
+        log_k_loc - k_scale,
+        log_k_min,
+    )
+    log_k_high = jnp.minimum(
+        log_k_loc + k_scale,
+        log_k_max,
+    )
+
+    # Sample independently from the clipped rectangle
     fs = numpyro.sample(
         "fs",
         dist.Uniform(f_low, f_high).to_event(1),
     )
 
-    # Log-decay-rate bounds
-    k_floor = jnp.asarray(1e-12, dtype=k_loc.dtype)
-    log_k_loc = jnp.log(jnp.maximum(k_loc, k_floor))
-
-    log_k_low = log_k_loc - k_scale
-    log_k_high = log_k_loc + k_scale
-
-    # Sample the bounded variable directly in log space
     log_ks = numpyro.sample(
         "log_ks",
         dist.Uniform(log_k_low, log_k_high).to_event(1),
     )
 
-    # Transform back to ordinary decay-rate space
     ks = numpyro.deterministic(
         "ks",
         jnp.exp(log_ks),
     )
 
-    signals = jnp.stack((fs, ks), axis=-1)
+    signals = jnp.stack(
+        (fs, ks),
+        axis=-1,
+    )
 
     numpyro.factor(
         "surface",
@@ -395,13 +452,101 @@ def bats_model(
     )
 
 
-def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs, rng_key_value):
+def nuts(
+    t,
+    d,
+    signal_space,
+    signals,
+    signals_bw,
+    nuts_kwargs,
+    mcmc_kwargs,
+    run_kwargs,
+    rng_key_value,
+):
     f_init, k_init = utils.unpack_signals(signals)
+
+    f_min = signal_space.f_min
+    f_max = signal_space.f_max
+    k_min = signal_space.k_min
+    k_max = signal_space.k_max
+
+    f_init = jnp.atleast_1d(jnp.asarray(f_init))
+    k_init = jnp.atleast_1d(jnp.asarray(k_init))
+
     f_bw, k_bw = utils.unpack_signals(signals_bw)
 
-    init_strategy = init_to_value(values={"fs": f_init, "log_ks": jnp.log(k_init)})
+    f_bw = jnp.broadcast_to(
+        jnp.asarray(f_bw, dtype=f_init.dtype),
+        f_init.shape,
+    )
+    k_bw = jnp.broadcast_to(
+        jnp.asarray(k_bw, dtype=k_init.dtype),
+        k_init.shape,
+    )
 
-    nuts_config: dict[str, Any] = {
+    log_k_init = jnp.log(k_init)
+
+    f_low = jnp.maximum(f_init - f_bw, f_min)
+    f_high = jnp.minimum(f_init + f_bw, f_max)
+
+    log_k_min = jnp.log(k_min)
+    log_k_max = jnp.log(k_max)
+
+    log_k_low = jnp.maximum(log_k_init - k_bw, log_k_min)
+    log_k_high = jnp.minimum(log_k_init + k_bw, log_k_max)
+
+    if bool(jnp.any(f_low >= f_high)):
+        raise ValueError(
+            f"Empty frequency interval: "
+            f"low={f_low}, high={f_high}"
+        )
+
+    if bool(jnp.any(log_k_low >= log_k_high)):
+        raise ValueError(
+            f"Empty log-k interval: "
+            f"low={log_k_low}, high={log_k_high}"
+        )
+
+    # Keep initial values away from hard Uniform boundaries.
+    f_width = f_high - f_low
+    log_k_width = log_k_high - log_k_low
+
+    f_eps = 1e-6 * jnp.maximum(f_width, 1.0)
+    log_k_eps = 1e-6 * jnp.maximum(log_k_width, 1.0)
+
+    f_init_safe = jnp.clip(
+        f_init,
+        f_low + f_eps,
+        f_high - f_eps,
+    )
+
+    log_k_init_safe = jnp.clip(
+        log_k_init,
+        log_k_low + log_k_eps,
+        log_k_high - log_k_eps,
+    )
+
+    signals_init = jnp.stack(
+        (f_init_safe, jnp.exp(log_k_init_safe)),
+        axis=-1,
+    )
+
+    surface_value = get_log_prob(t, d, signals_init)
+
+    if not bool(jnp.isfinite(surface_value)):
+        raise ValueError(
+            f"Initial surface log probability is not finite: "
+            f"{surface_value}"
+        )
+
+    init_strategy = init_to_value(
+        values={
+            "fs": f_init_safe,
+            "log_ks": log_k_init_safe,
+        }
+    )
+
+    nuts_config = {
         "init_strategy": init_strategy,
     }
     nuts_config.update(nuts_kwargs)
@@ -409,23 +554,37 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs, rng_ke
     if rng_key_value is None:
         rng_key_value = random.randint(1, 1_000)
 
-    kernel = NUTS(bats_model, **nuts_config)
-    mcmc = MCMC(kernel, **mcmc_kwargs)
+    kernel = NUTS(
+        bats_model,
+        **nuts_config,
+    )
+
+    mcmc = MCMC(
+        kernel,
+        **mcmc_kwargs,
+    )
+
     mcmc.run(
         jax.random.PRNGKey(int(rng_key_value)),
-        t,
-        d,
-        f_init,
-        f_bw,
-        k_init,
-        k_bw,
+        t=t,
+        d=d,
+        f_loc=f_init,
+        f_scale=f_bw,
+        k_loc=k_init,
+        k_scale=k_bw,
+        f_min=f_min,
+        f_max=f_max,
+        k_min=k_min,
+        k_max=k_max,
+        extra_fields=("potential_energy",),
         **run_kwargs,
-        extra_fields=("potential_energy",)
     )
 
     samples = mcmc.get_samples(group_by_chain=True)
     extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+
     potential_energy = extra_fields["potential_energy"]
+
     best_flat_index = jnp.argmin(potential_energy.ravel())
 
     chain_index, draw_index = jnp.unravel_index(
@@ -436,48 +595,113 @@ def nuts(t, d, signals, signals_bw, nuts_kwargs, mcmc_kwargs, run_kwargs, rng_ke
     best_fs = samples["fs"][chain_index, draw_index]
     best_ks = samples["ks"][chain_index, draw_index]
 
-    best_signals = jnp.stack(
-        (jnp.asarray(best_fs), jnp.asarray(best_ks)),
+    return jnp.stack(
+        (best_fs, best_ks),
         axis=-1,
     )
 
-    return best_signals
 
-
-def lbfgsb(t, d, signals ,f_min, f_max, k_min, k_max, maxiter=2_000,):
+def lbfgsb(
+    t,
+    d,
+    signal_space,
+    signals,
+    maxiter=2_000,
+):
     signals = jnp.asarray(signals)
+
+    f_min = float(signal_space.f_min)
+    f_max = float(signal_space.f_max)
+    k_min = float(signal_space.k_min)
+    k_max = float(signal_space.k_max)
+
+    if not f_max > f_min:
+        raise ValueError(f"Expected f_max > f_min, got {f_min=} and {f_max=}")
+
+    if not k_max > k_min:
+        raise ValueError(f"Expected k_max > k_min, got {k_min=} and {k_max=}")
+
     original_shape = signals.shape
 
-    x0 = np.asarray(signals, dtype=np.float64).reshape(-1)
+    # Physical initial parameters:
+    # [f_0, k_0, f_1, k_1, ...]
+    x0_physical = np.asarray(signals, dtype=np.float64).reshape(-1)
 
-    f_bounds = (f_min, f_max)
-    k_bounds = (k_min, k_max)
-
-    bounds = [
-        bound
-        for _ in range(len(x0) // 2)
-        for bound in (f_bounds, k_bounds)
-    ]
-
-    value_and_gradient = jax.jit(
-        jax.value_and_grad(
-            lambda s: -get_log_prob(t, d, s)
+    if len(x0_physical) % 2 != 0:
+        raise ValueError(
+            "Expected an even number of parameters arranged as "
+            "[frequency, decay_rate, ...]"
         )
+
+    # Construct physical lower and upper bounds:
+    lower = np.tile(
+        np.asarray([f_min, k_min], dtype=np.float64),
+        len(x0_physical) // 2,
+    )
+    upper = np.tile(
+        np.asarray([f_max, k_max], dtype=np.float64),
+        len(x0_physical) // 2,
     )
 
-    def objective_and_gradient(x):
-        signals_current = jnp.asarray(x).reshape(original_shape)
+    widths = upper - lower
 
-        value, gradient = value_and_gradient(signals_current)
-
-        return (
-            float(value),
-            np.asarray(gradient, dtype=np.float64).reshape(-1),
+    if np.any(x0_physical < lower) or np.any(x0_physical > upper):
+        raise ValueError(
+            "Initial parameters are outside the specified bounds.\n"
+            f"x0={x0_physical}\n"
+            f"lower={lower}\n"
+            f"upper={upper}"
         )
+
+    # Normalize the initial point to [0, 1].
+    x0_normalized = (x0_physical - lower) / widths
+
+    # JAX versions of the affine transformation parameters.
+    lower_jax = jnp.asarray(lower)
+    widths_jax = jnp.asarray(widths)
+
+    def normalized_to_physical(x_normalized):
+        return lower_jax + x_normalized * widths_jax
+
+    def negative_log_prob_normalized(x_normalized):
+        x_physical = normalized_to_physical(x_normalized)
+        signals_current = x_physical.reshape(original_shape)
+        return -get_log_prob(t, d, signals_current)
+
+    value_and_gradient = jax.jit(
+        jax.value_and_grad(negative_log_prob_normalized)
+    )
+
+    def objective_and_gradient(x_normalized):
+        x_normalized = np.asarray(x_normalized, dtype=np.float64)
+
+        value, gradient = value_and_gradient(jnp.asarray(x_normalized))
+
+        value = float(value)
+        gradient = np.asarray(gradient, dtype=np.float64).reshape(-1)
+
+        if not np.isfinite(value):
+            x_physical = lower + x_normalized * widths
+            raise FloatingPointError(
+                f"Non-finite objective at normalized parameters "
+                f"{x_normalized}; physical parameters={x_physical}"
+            )
+
+        if not np.all(np.isfinite(gradient)):
+            x_physical = lower + x_normalized * widths
+            raise FloatingPointError(
+                f"Non-finite gradient at normalized parameters "
+                f"{x_normalized}; physical parameters={x_physical}"
+            )
+
+        return value, gradient
+
+    # All optimization variables now have identical bounds.
+    bounds = [(0.0, 1.0)] * len(x0_normalized)
 
     result = minimize(
         objective_and_gradient,
-        x0,
+        x0_normalized,
         method="L-BFGS-B",
         jac=True,
         bounds=bounds,
@@ -485,10 +709,24 @@ def lbfgsb(t, d, signals ,f_min, f_max, k_min, k_max, maxiter=2_000,):
             "maxiter": maxiter,
             "ftol": 1e-12,
             "gtol": 1e-8,
+            "maxls": 50,
         },
     )
+
+    if not np.all(np.isfinite(result.x)):
+        raise FloatingPointError(
+            "L-BFGS-B returned non-finite normalized parameters"
+        )
+
+    # Convert the optimized normalized parameters back to physical units.
+    result_physical = lower + result.x * widths
+
+    if not np.all(np.isfinite(result_physical)):
+        raise FloatingPointError(
+            "L-BFGS-B returned non-finite physical parameters"
+        )
 
     if not result.success:
         print(f"L-BFGS-B warning: {result.message}")
 
-    return jnp.asarray(result.x).reshape(original_shape)
+    return jnp.asarray(result_physical).reshape(original_shape)
