@@ -272,111 +272,56 @@ def get_amplitudes(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     return amplitudes
 
 
-def get_uncertainties(
-    t: jax.Array,
-    d: jax.Array,
-    signals,
-    relative_tolerance: float = 1e-8,
-):
+def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
-
+    
     r = omegas.shape[0]
     m = 2 * r
     N = d.shape[0]
 
-    if N <= m:
-        raise ValueError(
-            f"Need N > m for the curvature scale, got {N=} and {m=}."
-        )
-
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    G = jnp.vstack((
-        jnp.cos(arg) * decay,
-        jnp.sin(arg) * decay,
-    ))
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
 
-    gram = G @ G.T
-    gram = 0.5 * (gram + gram.T)
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+    g_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    g_floor = jnp.finfo(g.dtype).eps * g_scale
+    eigenvalues = jnp.maximum(eigenvalues, g_floor)
 
-    gram_eigenvalues, gram_eigenvectors = jnp.linalg.eigh(gram)
-
-    gram_scale = jnp.maximum(
-        jnp.max(jnp.abs(gram_eigenvalues)),
-        1.0,
-    )
-    gram_tolerance = (
-        relative_tolerance * gram_scale
-    )
-
-    if bool(jnp.any(gram_eigenvalues <= gram_tolerance)):
-        raise ValueError(
-            "The signal basis is rank deficient or poorly conditioned. "
-            f"Gram eigenvalues: {gram_eigenvalues}"
-        )
-
-    H = (
-        gram_eigenvectors
-        / jnp.sqrt(gram_eigenvalues)
-    ).T @ G
-
+    # Bretthorst Eq. 3.6: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
     theta, unravel = ravel_pytree(signals)
 
-    def mean_sq_projection(theta_flat):
-        return get_mean_sq_proj(
-            t,
-            d,
-            unravel(theta_flat),
-        )
+    def objective(theta):
+        return get_mean_sq_proj(t, d, unravel(theta))
 
-    # Because mean_sq_projection = sum(h**2) / m:
-    #
-    # B = -0.5 Hessian(sum(h**2))
-    #   = -(m / 2) Hessian(mean_sq_projection)
-    b = (
-        -m / 2
-    ) * jax.hessian(mean_sq_projection)(theta)
-
+    b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
+    b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    b_floor = jnp.finfo(b.dtype).eps * b_scale
+    eigenvalues = jnp.maximum(eigenvalues, b_floor)
 
-    b_scale = jnp.maximum(
-        jnp.max(jnp.abs(b_eigenvalues)),
-        1.0,
-    )
-    b_tolerance = relative_tolerance * b_scale
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
 
-    if bool(jnp.any(b_eigenvalues <= b_tolerance)):
-        raise ValueError(
-            "The projection-curvature matrix is not sufficiently "
-            "positive definite. The signals may not be at an interior "
-            "optimum or may be poorly identified. "
-            f"Eigenvalues: {b_eigenvalues}"
-        )
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    
+    signals_uncertainties_flat = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1,))
+    signals_uncertainties = unravel(signals_uncertainties_flat)
 
-    residual_sum_sq = (
-        jnp.sum(d**2) - jnp.sum(h**2)
-    )
-
-    # Curvature scale implied by get_log_prob.
-    curvature_variance = residual_sum_sq / (N - m)
-
-    variances_flat = curvature_variance * jnp.sum(
-        b_eigenvectors**2 / b_eigenvalues[None, :],
-        axis=1,
-    )
-
-    uncertainties_flat = jnp.sqrt(
-        jnp.maximum(variances_flat, 0.0)
-    )
-
-    return unravel(uncertainties_flat)
+    return signals_uncertainties
 
 
 def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):
@@ -678,7 +623,7 @@ def minimize(
 
     original_shape = signals.shape
 
-    # Physical initial parameters:
+    # Physical parameters:
     # [f_0, k_0, f_1, k_1, ...]
     x0_physical = np.asarray(signals, dtype=np.float64).reshape(-1)
 
@@ -688,7 +633,6 @@ def minimize(
             "[frequency, decay_rate, ...]"
         )
 
-    # Construct physical lower and upper bounds:
     lower = np.tile(
         np.asarray([f_min, k_min], dtype=np.float64),
         len(x0_physical) // 2,
@@ -708,80 +652,106 @@ def minimize(
             f"upper={upper}"
         )
 
-    # Normalize the initial point to [0, 1].
+    # Normalize physical parameters to [0, 1].
     x0_normalized = (x0_physical - lower) / widths
 
-    # JAX versions of the affine transformation parameters.
     lower_jax = jnp.asarray(lower)
     widths_jax = jnp.asarray(widths)
 
     def normalized_to_physical(x_normalized):
-        return lower_jax + x_normalized * widths_jax
+        return lower_jax + widths_jax * x_normalized
 
-    def negative_log_prob_normalized(x_normalized):
+    def objective_normalized(x_normalized):
         x_physical = normalized_to_physical(x_normalized)
         signals_current = x_physical.reshape(original_shape)
+
+        # This is the objective being minimized.
         return -get_log_prob(t, d, signals_current)
 
-    value_and_gradient = jax.jit(
-        jax.value_and_grad(negative_log_prob_normalized)
+    # Compute value, gradient, and exact Hessian with JAX.
+    objective_derivatives = jax.jit(
+        jax.value_and_grad(objective_normalized)
+    )
+    hessian_normalized = jax.jit(
+        jax.hessian(objective_normalized)
     )
 
     def objective_and_gradient(x_normalized):
         x_normalized = np.asarray(x_normalized, dtype=np.float64)
 
-        value, gradient = value_and_gradient(jnp.asarray(x_normalized))
+        value, gradient = objective_derivatives(
+            jnp.asarray(x_normalized)
+        )
 
         value = float(value)
         gradient = np.asarray(gradient, dtype=np.float64).reshape(-1)
 
         if not np.isfinite(value):
-            x_physical = lower + x_normalized * widths
             raise FloatingPointError(
                 f"Non-finite objective at normalized parameters "
-                f"{x_normalized}; physical parameters={x_physical}"
+                f"{x_normalized}"
             )
 
         if not np.all(np.isfinite(gradient)):
-            x_physical = lower + x_normalized * widths
             raise FloatingPointError(
                 f"Non-finite gradient at normalized parameters "
-                f"{x_normalized}; physical parameters={x_physical}"
+                f"{x_normalized}"
             )
 
         return value, gradient
 
-    # All optimization variables now have identical bounds.
-    bounds = [(0.0, 1.0)] * len(x0_normalized)
+    def hessian_callback(x_normalized):
+        x_normalized = np.asarray(x_normalized, dtype=np.float64)
 
-    result = minimize(
+        hessian = np.asarray(
+            hessian_normalized(jnp.asarray(x_normalized)),
+            dtype=np.float64,
+        )
+
+        if not np.all(np.isfinite(hessian)):
+            raise FloatingPointError(
+                f"Non-finite Hessian at normalized parameters "
+                f"{x_normalized}"
+            )
+
+        # Numerical roundoff can make an analytically symmetric Hessian
+        # slightly nonsymmetric.
+        return 0.5 * (hessian + hessian.T)
+
+    # Every normalized parameter has bounds [0, 1].
+    bounds = Bounds(
+        lb=np.zeros_like(x0_normalized),
+        ub=np.ones_like(x0_normalized),
+    )
+
+    result = scipy_minimize(
         objective_and_gradient,
         x0_normalized,
-        method="L-BFGS-B",
+        method="trust-constr",
         jac=True,
+        hess=hessian_callback,
         bounds=bounds,
         options={
             "maxiter": maxiter,
-            "ftol": 1e-12,
             "gtol": 1e-8,
-            "maxls": 50,
+            "xtol": 1e-12,
+            "verbose": 0,
         },
     )
 
     if not np.all(np.isfinite(result.x)):
         raise FloatingPointError(
-            "L-BFGS-B returned non-finite normalized parameters"
+            "trust-constr returned non-finite normalized parameters"
         )
 
-    # Convert the optimized normalized parameters back to physical units.
     result_physical = lower + result.x * widths
 
     if not np.all(np.isfinite(result_physical)):
         raise FloatingPointError(
-            "L-BFGS-B returned non-finite physical parameters"
+            "trust-constr returned non-finite physical parameters"
         )
 
     if not result.success:
-        print(f"L-BFGS-B warning: {result.message}")
+        print(f"trust-constr warning: {result.message}")
 
     return jnp.asarray(result_physical).reshape(original_shape)

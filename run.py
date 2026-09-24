@@ -93,8 +93,8 @@ def main():
         f_max=0.0043,
         k_min=1e-5,
         k_max=1e-4,
-        max_workers=8,
-        path="ampltiude_no_initial_sampling"
+        max_workers=32,
+        path="ampltiude_no_initial_sampling_3"
     )
 
     grid_search_args = GridSearchArgs(
@@ -123,8 +123,8 @@ def main():
         target_accept_prob=0.85,
     )
     mcmc_kwargs = dict(
-        num_warmup=50,
-        num_samples=50,
+        num_warmup=100,
+        num_samples=200,
         num_chains=1,
         chain_method="parallel"
     )
@@ -138,18 +138,18 @@ def main():
     )
 
     model.execute(
-        subband_count=8, 
+        subband_count=10, 
         subband_scaling_factor=1.0,
-        depth=4,
+        depth=8,
         grid_search_args=grid_search_args,
-        cores_per_initial_conditions_worker=2,
+        cores_per_initial_conditions_worker=1,
 
-        signals_per_block=8,
+        signals_per_block=16,
         fill_order=0,
         nuts_args_sample=nuts_args_sample,
         cores_per_sample_worker=1,
 
-        perform_minimize=False,
+        perform_minimize=True,
     )
 
 
