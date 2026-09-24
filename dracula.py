@@ -96,11 +96,11 @@ class InitialConditionsTask:
     depth: int
     grid_search_args: GridSearchArgs
     nuts_args: NUTSArgs
-    perform_lbfgsb: bool
+    perform_minimize: bool
     path: str
     
 
-def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, nuts_args, perform_lbfgsb, path):
+def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, nuts_args, perform_minimize, path):
     '''
     Runs an instance of the initial conditions worker to find all signals in a subband.
     '''
@@ -112,7 +112,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             signal_space,
             grid_search_args,
             nuts_args=None,
-            perform_lbfgsb=False,
+            perform_minimize=False,
             signals=None,
             signals_bw=None,
             model=None,
@@ -162,8 +162,8 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 nuts_args.seed
             )
 
-        if perform_lbfgsb is True:
-            signals = bats.lbfgsb(
+        if perform_minimize is True:
+            signals = bats.minimize(
                 t, 
                 d, 
                 signal_space,
@@ -212,7 +212,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         signal_space,
         grid_search_args,
         nuts_args,
-        perform_lbfgsb=perform_lbfgsb,
+        perform_minimize=perform_minimize,
     )
 
     signals_by_depth = {}
@@ -226,7 +226,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
     model = bats.get_model(subband_t, subband_d, signals)
     log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
-    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
+    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model)
 
     reason = "depth"
     while True:
@@ -236,7 +236,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             signal_space,
             grid_search_args,
             nuts_args,
-            perform_lbfgsb=perform_lbfgsb,
+            perform_minimize=perform_minimize,
             signals=signals,
             signals_bw=signals_bw,
             model=model,
@@ -244,7 +244,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
         model = bats.get_model(subband_t, subband_d, signals)
         log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
-        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
+        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model)
 
         signals_by_depth[len(signals)] = deepcopy(signals)
         signals_bw_by_depth[len(signals_bw)] = deepcopy(signals_bw)
@@ -324,7 +324,7 @@ class SampleTask:
     signals_bw: Any
     signal_indices: list[int]
     nuts_args: NUTSArgs
-    perform_lbfgsb: bool
+    perform_minimize: bool
     path: str
 
 def run_sample_worker(
@@ -335,7 +335,7 @@ def run_sample_worker(
     signals_bw,
     signal_indices,
     nuts_args,
-    perform_lbfgsb,
+    perform_minimize,
     path,
 ):
     '''
@@ -368,8 +368,8 @@ def run_sample_worker(
         nuts_args.run_kwargs,
         nuts_args.seed
     )
-    if perform_lbfgsb is True:
-        signals = bats.lbfgsb(
+    if perform_minimize is True:
+        signals = bats.minimize(
             t,
             d,
             signal_space,
@@ -380,7 +380,7 @@ def run_sample_worker(
 
     model = bats.get_model(t, d, signals)
     log_utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
-    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, model)
+    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model)
     log_utils.save_block_csv(path / "block_results.csv", signals)
 
     return list(zip(signal_indices, signals))
@@ -526,7 +526,7 @@ class Dracula():
                 depth=depth,
                 grid_search_args=grid_search_args,
                 nuts_args=nuts_args,
-                perform_lbfgsb=self.perform_lbfgsb,
+                perform_minimize=self.perform_minimize,
                 path=path / f"subband_{ind + 1}r{subband_count}"
             )
 
@@ -649,7 +649,6 @@ class Dracula():
             for result in ordered_results
         }
 
-        print(self.signals_init)
         log_utils.save_initialize_csv(path / "all_subband_results.csv", signals_by_subband=self.signals_by_subband)
 
         model = bats.get_model(self.t, self.d, self.signals_init)
@@ -662,7 +661,7 @@ class Dracula():
         log_utils.save_signals_csv(path / "initial_conditions_signals.csv", self.signals_init, amplitudes, uncertainties)
         log_utils.save_report_txt(path / "initial_conditions_report.txt", len(self.signals_init), noise_variance, snr)
 
-        log_utils.plot_fourier_space(path / "initial_conditions_fourier_space", self.t, self.d, "Initial Conditions Fourier Space", f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, f_points=10_000, model=model)
+        log_utils.plot_fourier_space(path / "initial_conditions_fourier_space", self.t, self.d, "Initial Conditions Fourier Space", f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, f_points=10_000, signals=self.signals_init, model=model)
         log_utils.plot_time_series(path / "initial_conditions_time_series", self.t, self.d, "Initial Conditions Time Series", model)
         log_utils.plot_signal_space(path / "initial_conditions_signal_space", self.signals_init, "Initial Conditions Signal Space", signal_space=self.signal_space, uncertainties=uncertainties) 
 
@@ -747,7 +746,7 @@ class Dracula():
                     signals_bw=signals_bw_block,
                     signal_indices=signal_indices,
                     nuts_args=nuts_args,
-                    perform_lbfgsb=self.perform_lbfgsb,
+                    perform_minimize=self.perform_minimize,
                     path=path / f"block_{ind + 1}r{blocks}"   
                 )
             )
@@ -844,8 +843,8 @@ class Dracula():
 
         signals = utils.unpack_signal_results(results)
 
-        if self.perform_lbfgsb is True:
-            signals = bats.lbfgsb(self.t, self.d, self.signal_space, signals)
+        if self.perform_minimize is True:
+            signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
         amplitudes = bats.get_amplitudes(self.t, self.d, signals)
         uncertainties = bats.get_uncertainties(self.t, self.d, signals)
@@ -858,9 +857,9 @@ class Dracula():
         log_utils.save_report_txt(path / "report.txt", len(signals), noise_variance, snr)
 
         model = bats.get_model(self.t, self.d, signals)
-        log_utils.plot_time_series(path / "model_time_series.png", self.t, self.d, "Model Time Series", model)
-        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", self.t, self.d, "Model Fourier Space", self.signal_space.f_min, self.signal_space.f_max, 100_000, model)
-        log_utils.plot_signal_space(path / "signal_space.png", signals, "Model Signal Space", signal_space=self.signal_space, uncertainties=uncertainties)
+        log_utils.plot_time_series(path / "model_time_series.png", self.t, self.d, "Sampled Time Series", model)
+        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", self.t, self.d, "Sampled Fourier Space", self.signal_space.f_min, self.signal_space.f_max, 100_000, signals, model)
+        log_utils.plot_signal_space(path / "signal_space.png", signals, "Sampled Signal Space", signal_space=self.signal_space, uncertainties=uncertainties)
 
 
     def execute(
@@ -870,7 +869,7 @@ class Dracula():
             depth: int = 10,
             grid_search_args:  Optional[GridSearchArgs] = None,
             nuts_args_init: Optional[NUTSArgs] = None,
-            perform_lbfgsb: bool = False,
+            perform_minimize: bool = False,
             cores_per_initial_conditions_worker: int = 1,
 
             signals_per_block: int = 1,
@@ -882,7 +881,7 @@ class Dracula():
             grid_search_args = self.default_grid_search_args
         if not nuts_args_sample:
             nuts_args_sample = self.default_nuts_args_sample
-        self.perform_lbfgsb = perform_lbfgsb
+        self.perform_minimize = perform_minimize
         
         self.initialize(
             subband_count=subband_count,
@@ -964,5 +963,5 @@ if __name__ == "__main__":
         fill_order=0,
         nuts_args_sample=nuts_args,
         cores_per_sample_worker=2,
-        perform_lbfgsb=True,
+        perform_minimize=True,
     )

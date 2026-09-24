@@ -272,56 +272,111 @@ def get_amplitudes(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     return amplitudes
 
 
-def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_uncertainties(
+    t: jax.Array,
+    d: jax.Array,
+    signals,
+    relative_tolerance: float = 1e-8,
+):
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
-    
+
     r = omegas.shape[0]
     m = 2 * r
     N = d.shape[0]
 
+    if N <= m:
+        raise ValueError(
+            f"Need N > m for the curvature scale, got {N=} and {m=}."
+        )
+
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
+    G = jnp.vstack((
+        jnp.cos(arg) * decay,
+        jnp.sin(arg) * decay,
+    ))
 
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-    g_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
-    g_floor = jnp.finfo(g.dtype).eps * g_scale
-    eigenvalues = jnp.maximum(eigenvalues, g_floor)
+    gram = G @ G.T
+    gram = 0.5 * (gram + gram.T)
 
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
+    gram_eigenvalues, gram_eigenvectors = jnp.linalg.eigh(gram)
+
+    gram_scale = jnp.maximum(
+        jnp.max(jnp.abs(gram_eigenvalues)),
+        1.0,
+    )
+    gram_tolerance = (
+        relative_tolerance * gram_scale
+    )
+
+    if bool(jnp.any(gram_eigenvalues <= gram_tolerance)):
+        raise ValueError(
+            "The signal basis is rank deficient or poorly conditioned. "
+            f"Gram eigenvalues: {gram_eigenvalues}"
+        )
+
+    H = (
+        gram_eigenvectors
+        / jnp.sqrt(gram_eigenvalues)
+    ).T @ G
+
     h = H @ d
 
     theta, unravel = ravel_pytree(signals)
 
-    def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
+    def mean_sq_projection(theta_flat):
+        return get_mean_sq_proj(
+            t,
+            d,
+            unravel(theta_flat),
+        )
 
-    b = (-m / 2) * jax.hessian(objective)(theta)
+    # Because mean_sq_projection = sum(h**2) / m:
+    #
+    # B = -0.5 Hessian(sum(h**2))
+    #   = -(m / 2) Hessian(mean_sq_projection)
+    b = (
+        -m / 2
+    ) * jax.hessian(mean_sq_projection)(theta)
+
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
-    b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
-    b_floor = jnp.finfo(b.dtype).eps * b_scale
-    eigenvalues = jnp.maximum(eigenvalues, b_floor)
+    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
 
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
+    b_scale = jnp.maximum(
+        jnp.max(jnp.abs(b_eigenvalues)),
+        1.0,
+    )
+    b_tolerance = relative_tolerance * b_scale
 
-    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
-    
-    signals_uncertainties_flat = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1,))
-    signals_uncertainties = unravel(signals_uncertainties_flat)
+    if bool(jnp.any(b_eigenvalues <= b_tolerance)):
+        raise ValueError(
+            "The projection-curvature matrix is not sufficiently "
+            "positive definite. The signals may not be at an interior "
+            "optimum or may be poorly identified. "
+            f"Eigenvalues: {b_eigenvalues}"
+        )
 
-    return signals_uncertainties
+    residual_sum_sq = (
+        jnp.sum(d**2) - jnp.sum(h**2)
+    )
+
+    # Curvature scale implied by get_log_prob.
+    curvature_variance = residual_sum_sq / (N - m)
+
+    variances_flat = curvature_variance * jnp.sum(
+        b_eigenvectors**2 / b_eigenvalues[None, :],
+        axis=1,
+    )
+
+    uncertainties_flat = jnp.sqrt(
+        jnp.maximum(variances_flat, 0.0)
+    )
+
+    return unravel(uncertainties_flat)
 
 
 def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):
@@ -601,7 +656,7 @@ def nuts(
     )
 
 
-def lbfgsb(
+def minimize(
     t,
     d,
     signal_space,

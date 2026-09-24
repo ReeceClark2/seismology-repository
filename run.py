@@ -149,7 +149,7 @@ def main():
         nuts_args_sample=nuts_args_sample,
         cores_per_sample_worker=1,
 
-        perform_lbfgsb=False,
+        perform_minimize=False,
     )
 
 

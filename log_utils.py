@@ -407,6 +407,7 @@ def plot_fourier_space(
     f_min,
     f_max,
     f_points,
+    signals=None,
     model=None,
 ):
     t = np.asarray(t)
@@ -530,6 +531,29 @@ def plot_fourier_space(
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Amplitude")
     ax.set_title(title)
+
+    if signals is not None:
+        fs, _ = utils.unpack_signals(signals)
+        fs = np.asarray(fs).ravel()
+
+        # Capture the limits established by the spectra before adding
+        # the vertical lines.
+        y_min, y_max = ax.get_ylim()
+
+        ax.vlines(
+            fs,
+            ymin=y_min,
+            ymax=y_max,
+            color="red",
+            linestyle="--",
+            linewidth=0.4,
+            label="Signals",
+        )
+
+        # Explicitly restore the original limits so the lines do not
+        # affect the y-axis scaling.
+        ax.set_ylim(y_min, y_max)
+
     ax.legend()
 
     fig.tight_layout()
