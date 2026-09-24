@@ -386,7 +386,7 @@ def reconcile(
 
         # Replace this with the appropriate constructor if your utility
         # function has a different name or argument order.
-        signals = utils.pack_signals(
+        signals = utils.unpack_signals(
             jnp.asarray(fs),
             jnp.asarray(ks),
         )
@@ -429,7 +429,7 @@ def reconcile(
     fs = fs[order]
     ks = ks[order]
 
-    signals = utils.pack_signals(
+    signals = utils.unpack_signals(
         jnp.asarray(fs),
         jnp.asarray(ks),
     )
