@@ -1,7 +1,8 @@
 from typing import Any
 import random
 
-from scipy.optimize import minimize
+from scipy.optimize import minimize as scipy_minimize
+from scipy.optimize import Bounds
 import numpy as np
 
 import jax
@@ -322,6 +323,121 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     signals_uncertainties = unravel(signals_uncertainties_flat)
 
     return signals_uncertainties
+
+
+def reconcile(
+    t,
+    d,
+    signal_space,
+    signals,
+    signals_bw,
+    nuts_args=None,
+    f_tol=1e-5,
+):
+    if f_tol < 0:
+        raise ValueError(f"f_tol must be nonnegative, got {f_tol}")
+
+    fs, ks = utils.unpack_signals(signals)
+
+    fs = np.asarray(fs, dtype=np.float64).reshape(-1)
+    ks = np.asarray(ks, dtype=np.float64).reshape(-1)
+
+    if fs.shape != ks.shape:
+        raise ValueError(
+            "Frequencies and decay rates must have the same shape; "
+            f"got {fs.shape=} and {ks.shape=}."
+        )
+
+    initial_count = len(fs)
+
+    while len(fs) > 1:
+        # Sort so adjacent differences identify the closest frequencies.
+        order = np.argsort(fs)
+        fs = fs[order]
+        ks = ks[order]
+
+        delta_fs = np.diff(fs)
+        close_pairs = np.flatnonzero(delta_fs < f_tol)
+
+        if close_pairs.size == 0:
+            break
+
+        # Merge the closest eligible pair.
+        pair_index = close_pairs[np.argmin(delta_fs[close_pairs])]
+        next_index = pair_index + 1
+
+        merged_f = 0.5 * (fs[pair_index] + fs[next_index])
+        merged_k = 0.5 * (ks[pair_index] + ks[next_index])
+
+        fs = np.concatenate(
+            (
+                fs[:pair_index],
+                np.asarray([merged_f]),
+                fs[next_index + 1 :],
+            )
+        )
+        ks = np.concatenate(
+            (
+                ks[:pair_index],
+                np.asarray([merged_k]),
+                ks[next_index + 1 :],
+            )
+        )
+
+        # Replace this with the appropriate constructor if your utility
+        # function has a different name or argument order.
+        signals = utils.pack_signals(
+            jnp.asarray(fs),
+            jnp.asarray(ks),
+        )
+
+        if nuts_args is not None:
+            result = nuts(
+                t,
+                d,
+                signal_space,
+                signals,
+                signals_bw,
+                nuts_kwargs=nuts_args.nuts_kwargs,
+                run_kwargs=nuts_args.run_kwargs,
+                rng_key_value=nuts_args.rng_key_value,
+            )
+
+            # Support a NUTS implementation returning either:
+            #   signals
+            # or
+            #   (signals, signals_bw)
+            if isinstance(result, tuple) and len(result) == 2:
+                signals, signals_bw = result
+            else:
+                signals = result
+
+            # NUTS may have changed the parameter values, so unpack them
+            # again before checking for another close pair.
+            fs, ks = utils.unpack_signals(signals)
+            fs = np.asarray(fs, dtype=np.float64).reshape(-1)
+            ks = np.asarray(ks, dtype=np.float64).reshape(-1)
+
+            if fs.shape != ks.shape:
+                raise ValueError(
+                    "NUTS returned frequencies and decay rates with "
+                    f"different shapes: {fs.shape=} and {ks.shape=}."
+                )
+
+    # Ensure the final output is frequency-sorted even if no merge occurred.
+    order = np.argsort(fs)
+    fs = fs[order]
+    ks = ks[order]
+
+    signals = utils.pack_signals(
+        jnp.asarray(fs),
+        jnp.asarray(ks),
+    )
+
+    removed_count = initial_count - len(fs)
+    print(f"Removed {removed_count} signal{'s' if removed_count != 1 else ''}!")
+
+    return signals
 
 
 def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):

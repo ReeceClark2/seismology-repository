@@ -846,6 +846,8 @@ class Dracula():
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
+        bats.reconcile(self.t, self.d, self.signal_space, signals, self.signals_bw)
+
         amplitudes = bats.get_amplitudes(self.t, self.d, signals)
         uncertainties = bats.get_uncertainties(self.t, self.d, signals)
         log_utils.save_report_csv(path / "report_all.csv", results, uncertainties)
