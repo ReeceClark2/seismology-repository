@@ -313,6 +313,7 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
     b_floor = jnp.finfo(b.dtype).eps * b_scale
     eigenvalues = jnp.maximum(eigenvalues, b_floor)
+    print(eigenvalues)
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
@@ -902,3 +903,244 @@ def minimize(
         print(f"trust-constr warning: {result.message}")
 
     return jnp.asarray(result_physical).reshape(original_shape)
+
+
+
+
+#--------------------- Testing -----------------------------------
+
+def get_b_eigendecomposition(t, d, signals):
+    """
+    Return the raw eigendecomposition of the curvature matrix b.
+
+    The parameter ordering is assumed to match signals.reshape(-1), e.g.
+
+        [f_0, k_0, f_1, k_1, ...]
+
+    """
+    signals = jnp.asarray(signals)
+
+    r = signals.shape[0]
+    m = signals.size
+
+    theta, unravel = ravel_pytree(signals)
+
+    def objective(theta):
+        return get_mean_sq_proj(t, d, unravel(theta))
+
+    # Same definition as in get_uncertainties.
+    b = (-m / 2.0) * jax.hessian(objective)(theta)
+
+    # Remove small asymmetries caused by numerical differentiation.
+    b = 0.5 * (b + b.T)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
+
+    return b, eigenvalues, eigenvectors
+
+
+def reconcile_noise_floor(
+    t,
+    d,
+    signal_space,
+    signals,
+    signals_bw,
+    nuts_args=None,
+    floor_factor=1.0,
+    min_signals=1,
+):
+    """
+    Remove signals associated with eigenmodes of b that hit the
+    numerical eigenvalue floor.
+
+    Parameters
+    ----------
+    t, d :
+        Time samples and data values.
+
+    signal_space :
+        Passed through to nuts().
+
+    signals :
+        Array with shape (n_signals, 2), containing frequency and
+        decay-rate parameters.
+
+    signals_bw :
+        Array whose first axis indexes signals.
+
+    nuts_args :
+        Optional NUTS configuration. If provided, NUTS is rerun after
+        every signal removal.
+
+    floor_factor :
+        Multiplier for the numerical eigenvalue floor. A value of 1.0
+        detects eigenvalues at or below eps * max_eigenvalue. A larger
+        value detects moderately small eigenvalues as well.
+
+    min_signals :
+        Do not remove signals below this number.
+
+    Returns
+    -------
+    signals, signals_bw
+        The reconciled signal parameters and bandwidths.
+    """
+    if floor_factor < 1:
+        raise ValueError(
+            f"floor_factor must be at least 1, got {floor_factor}"
+        )
+
+    if min_signals < 0:
+        raise ValueError(
+            f"min_signals must be nonnegative, got {min_signals}"
+        )
+
+    fs, ks = utils.unpack_signals(signals)
+
+    fs = np.asarray(fs, dtype=np.float64).reshape(-1)
+    ks = np.asarray(ks, dtype=np.float64).reshape(-1)
+    signals_bw = jnp.asarray(signals_bw)
+
+    if fs.shape != ks.shape:
+        raise ValueError(
+            "Frequencies and decay rates must have the same shape; "
+            f"got {fs.shape=} and {ks.shape=}."
+        )
+
+    if signals_bw.shape[0] != len(fs):
+        raise ValueError(
+            "signals_bw must have one entry per signal; "
+            f"got {signals_bw.shape[0]} bandwidth entries and "
+            f"{len(fs)} signals."
+        )
+
+    initial_count = len(fs)
+
+    while len(fs) > min_signals:
+        signals = jnp.stack(
+            (jnp.asarray(fs), jnp.asarray(ks)),
+            axis=-1,
+        )
+
+        b, raw_eigenvalues, eigenvectors = get_b_eigendecomposition(
+            t,
+            d,
+            signals,
+        )
+
+        # Numerical floor used by the uncertainty calculation.
+        b_scale = jnp.maximum(
+            jnp.max(jnp.abs(raw_eigenvalues)),
+            1.0,
+        )
+
+        eigenvalue_floor = (
+            floor_factor
+            * jnp.finfo(b.dtype).eps
+            * b_scale
+        )
+
+        # Modes at or below the numerical floor are considered
+        # unconstrained or degenerate.
+        bad_modes = raw_eigenvalues <= eigenvalue_floor
+
+        if not bool(jnp.any(bad_modes)):
+            break
+
+        bad_mode_indices = jnp.flatnonzero(bad_modes)
+
+        # Each column of eigenvectors is an eigenmode. Compute the
+        # contribution of each parameter to all bad modes.
+        parameter_scores = jnp.sum(
+            eigenvectors[:, bad_mode_indices] ** 2,
+            axis=1,
+        )
+
+        # The flattened parameter order is assumed to be:
+        #
+        #   [f_0, k_0, f_1, k_1, ...]
+        #
+        # Combine the frequency and decay-rate scores for each signal.
+        signal_scores = parameter_scores.reshape(len(fs), 2).sum(axis=1)
+
+        remove_index = int(jnp.argmax(signal_scores))
+
+        print(
+            "Removing signal "
+            f"{remove_index}: "
+            f"f={fs[remove_index]:.6g}, "
+            f"k={ks[remove_index]:.6g}; "
+            f"bad_modes={int(jnp.sum(bad_modes))}, "
+            f"score={float(signal_scores[remove_index]):.6g}"
+        )
+
+        # Remove the same signal index from all signal-related arrays.
+        keep = np.ones(len(fs), dtype=bool)
+        keep[remove_index] = False
+
+        fs = fs[keep]
+        ks = ks[keep]
+        signals_bw = signals_bw[keep]
+
+        signals = jnp.stack(
+            (jnp.asarray(fs), jnp.asarray(ks)),
+            axis=-1,
+        )
+
+        # Optionally rerun NUTS after removing a degenerate signal.
+        if nuts_args is not None:
+            result = nuts(
+                t,
+                d,
+                signal_space,
+                signals,
+                signals_bw,
+                nuts_kwargs=nuts_args.nuts_kwargs,
+                run_kwargs=nuts_args.run_kwargs,
+                rng_key_value=nuts_args.rng_key_value,
+            )
+
+            if isinstance(result, tuple) and len(result) == 2:
+                signals, signals_bw = result
+                signals_bw = jnp.asarray(signals_bw)
+            else:
+                signals = result
+
+            fs, ks = utils.unpack_signals(signals)
+
+            fs = np.asarray(fs, dtype=np.float64).reshape(-1)
+            ks = np.asarray(ks, dtype=np.float64).reshape(-1)
+
+            if fs.shape != ks.shape:
+                raise ValueError(
+                    "NUTS returned frequencies and decay rates with "
+                    f"different shapes: {fs.shape=} and {ks.shape=}."
+                )
+
+            if signals_bw.shape[0] != len(fs):
+                raise ValueError(
+                    "NUTS returned signals_bw with a different number "
+                    "of entries than signals; "
+                    f"got {signals_bw.shape[0]} and {len(fs)}."
+                )
+
+    # Final synchronized sorting.
+    order = np.argsort(fs)
+
+    fs = fs[order]
+    ks = ks[order]
+    signals_bw = signals_bw[order]
+
+    signals = jnp.stack(
+        (jnp.asarray(fs), jnp.asarray(ks)),
+        axis=-1,
+    )
+
+    removed_count = initial_count - len(fs)
+
+    print(
+        f"Removed {removed_count} signal"
+        f"{'s' if removed_count != 1 else ''}!"
+    )
+
+    return signals, signals_bw

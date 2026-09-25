@@ -842,12 +842,12 @@ class Dracula():
         path.mkdir(parents=True, exist_ok=True)
 
         signals = utils.unpack_signal_results(results)
-        uncertainties_full = bats.get_uncertainties(signals)
+        uncertainties_full = bats.get_uncertainties(self.t, self.d, signals)
 
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
-        signals, signals_bw = bats.reconcile(self.t, self.d, self.signal_space, signals, self.signals_bw)
+        signals, signals_bw = bats.reconcile_noise_floor(self.t, self.d, self.signal_space, signals, self.signals_bw)
 
         amplitudes = bats.get_amplitudes(self.t, self.d, signals)
         uncertainties = bats.get_uncertainties(self.t, self.d, signals)
@@ -966,5 +966,5 @@ if __name__ == "__main__":
         fill_order=0,
         nuts_args_sample=nuts_args,
         cores_per_sample_worker=2,
-        perform_minimize=True,
+        perform_minimize=False,
     )

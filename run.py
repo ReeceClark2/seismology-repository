@@ -122,8 +122,8 @@ def main():
         target_accept_prob=0.85,
     )
     mcmc_kwargs = dict(
-        num_warmup=50,
-        num_samples=50,
+        num_warmup=70,
+        num_samples=120,
         num_chains=1,
         chain_method="parallel"
     )
