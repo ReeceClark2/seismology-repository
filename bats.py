@@ -32,7 +32,6 @@ def get_log_prob(t, d, signals):
         jnp.sin(arg) * decay,
     ))
 
-    # G.T = U S Vh
     U, singular_values, _ = jnp.linalg.svd(
         G.T,
         full_matrices=False,
@@ -422,7 +421,7 @@ def reconcile(
                 signals_bw,
                 nuts_kwargs=nuts_args.nuts_kwargs,
                 run_kwargs=nuts_args.run_kwargs,
-                rng_key_value=nuts_args.rng_key_value,
+                rng_key_value=nuts_args.seed,
             )
 
             if isinstance(result, tuple) and len(result) == 2:
@@ -908,102 +907,107 @@ def minimize(
 
 #--------------------- Testing -----------------------------------
 
-def get_b_eigendecomposition(t, d, signals):
-    """
-    Return the raw eigendecomposition of the curvature matrix b.
-
-    The parameter ordering is assumed to match signals.reshape(-1), e.g.
-
-        [f_0, k_0, f_1, k_1, ...]
-
-    """
-    signals = jnp.asarray(signals)
-
-    r = signals.shape[0]
-    m = signals.size
-
-    theta, unravel = ravel_pytree(signals)
-
-    def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
-
-    # Same definition as in get_uncertainties.
-    b = (-m / 2.0) * jax.hessian(objective)(theta)
-
-    # Remove small asymmetries caused by numerical differentiation.
-    b = 0.5 * (b + b.T)
-
-    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
-
-    return b, eigenvalues, eigenvectors
-
-
-def reconcile_noise_floor(
+def reconcile(
     t,
     d,
     signal_space,
     signals,
     signals_bw,
     nuts_args=None,
-    floor_factor=1.0,
+    singular_value_tol=1e-4,
     min_signals=1,
+    normalize_rows=True,
 ):
     """
-    Remove signals associated with eigenmodes of b that hit the
-    numerical eigenvalue floor.
+    Iteratively remove signals that participate strongly in redundant
+    model-function directions.
+
+    Redundancy is determined from the singular values of the model
+    matrix G rather than from a parameter Hessian.
+
+    The model matrix has row ordering:
+
+        cos(signal 0), ..., cos(signal r - 1),
+        sin(signal 0), ..., sin(signal r - 1)
+
+    A singular direction is considered redundant when:
+
+        singular_value / largest_singular_value
+            <= singular_value_tol
+
+    Since the eigenvalues of the Gram matrix G @ G.T are the squares
+    of the singular values of G, the equivalent relative Gram
+    eigenvalue threshold is:
+
+        gram_relative_tol = singular_value_tol**2
 
     Parameters
     ----------
     t, d :
-        Time samples and data values.
+        Time samples and observed data.
 
     signal_space :
-        Passed through to nuts().
+        Passed to nuts() when refitting.
 
     signals :
-        Array with shape (n_signals, 2), containing frequency and
-        decay-rate parameters.
+        Signal parameters with shape (n_signals, 2), containing
+        frequency and decay rate.
 
     signals_bw :
-        Array whose first axis indexes signals.
+        Signal bandwidths. Its first axis must correspond to the first
+        axis of signals.
 
     nuts_args :
         Optional NUTS configuration. If provided, NUTS is rerun after
-        every signal removal.
+        each signal removal.
 
-    floor_factor :
-        Multiplier for the numerical eigenvalue floor. A value of 1.0
-        detects eigenvalues at or below eps * max_eigenvalue. A larger
-        value detects moderately small eigenvalues as well.
+    singular_value_tol :
+        Relative singular-value threshold used to identify redundant
+        model directions. For example, 1e-4 corresponds to a relative
+        Gram-eigenvalue threshold of 1e-8.
 
     min_signals :
-        Do not remove signals below this number.
+        Minimum number of signals that must remain.
+
+    normalize_rows :
+        If True, normalize each model-function row before performing
+        the redundancy test. This detects redundant function shapes
+        rather than merely low-energy functions.
 
     Returns
     -------
-    signals, signals_bw
-        The reconciled signal parameters and bandwidths.
+    signals, signals_bw :
+        Reconciled signals and correspondingly indexed bandwidths.
     """
-    if floor_factor < 1:
+    if not 0.0 < singular_value_tol < 1.0:
         raise ValueError(
-            f"floor_factor must be at least 1, got {floor_factor}"
+            "singular_value_tol must be strictly between 0 and 1; "
+            f"got {singular_value_tol}."
         )
 
-    if min_signals < 0:
+    if min_signals < 1:
         raise ValueError(
-            f"min_signals must be nonnegative, got {min_signals}"
+            f"min_signals must be at least 1, got {min_signals}."
         )
+
+    t = jnp.asarray(t).reshape(-1)
+    d = jnp.asarray(d).reshape(-1)
+    signals_bw = jnp.asarray(signals_bw)
 
     fs, ks = utils.unpack_signals(signals)
 
     fs = np.asarray(fs, dtype=np.float64).reshape(-1)
     ks = np.asarray(ks, dtype=np.float64).reshape(-1)
-    signals_bw = jnp.asarray(signals_bw)
 
     if fs.shape != ks.shape:
         raise ValueError(
             "Frequencies and decay rates must have the same shape; "
             f"got {fs.shape=} and {ks.shape=}."
+        )
+
+    if signals_bw.ndim == 0:
+        raise ValueError(
+            "signals_bw must have a signal-indexed first axis."
         )
 
     if signals_bw.shape[0] != len(fs):
@@ -1013,80 +1017,201 @@ def reconcile_noise_floor(
             f"{len(fs)} signals."
         )
 
+    if min_signals > len(fs):
+        raise ValueError(
+            "min_signals cannot exceed the initial number of signals; "
+            f"got {min_signals=} and {len(fs)} signals."
+        )
+
     initial_count = len(fs)
 
     while len(fs) > min_signals:
+        r = len(fs)
+
         signals = jnp.stack(
-            (jnp.asarray(fs), jnp.asarray(ks)),
+            (
+                jnp.asarray(fs),
+                jnp.asarray(ks),
+            ),
             axis=-1,
         )
 
-        b, raw_eigenvalues, eigenvectors = get_b_eigendecomposition(
-            t,
-            d,
-            signals,
+        # -------------------------------------------------------------
+        # Construct the model matrix.
+        #
+        # Row ordering:
+        #
+        #   [cos_0, ..., cos_(r-1), sin_0, ..., sin_(r-1)]
+        # -------------------------------------------------------------
+        omegas = 2.0 * jnp.pi * signals[:, 0]
+
+        arg = omegas[:, None] * t[None, :]
+        decay = jnp.exp(-signals[:, 1, None] * t[None, :])
+
+        cosine_functions = jnp.cos(arg) * decay
+        sine_functions = jnp.sin(arg) * decay
+
+        G = jnp.vstack(
+            (
+                cosine_functions,
+                sine_functions,
+            )
         )
 
-        # Numerical floor used by the uncertainty calculation.
-        b_scale = jnp.maximum(
-            jnp.max(jnp.abs(raw_eigenvalues)),
-            1.0,
+        row_norms = jnp.linalg.norm(G, axis=1)
+
+        if normalize_rows:
+            # Zero or nearly zero rows are left as zero instead of
+            # dividing by a tiny norm.
+            largest_row_norm = jnp.max(row_norms)
+
+            row_norm_floor = (
+                jnp.finfo(G.dtype).eps
+                * jnp.maximum(largest_row_norm, 1.0)
+            )
+
+            safe_row_norms = jnp.where(
+                row_norms > row_norm_floor,
+                row_norms,
+                1.0,
+            )
+
+            G_for_test = G / safe_row_norms[:, None]
+        else:
+            G_for_test = G
+
+        # -------------------------------------------------------------
+        # Compute the SVD directly.
+        #
+        # This is more numerically stable than diagonalizing G @ G.T,
+        # because forming the Gram matrix squares the condition number.
+        #
+        # full_matrices=True is important when 2*r > len(t). It gives
+        # the complete left null space of G.
+        # -------------------------------------------------------------
+        left_vectors, singular_values, _ = jnp.linalg.svd(
+            G_for_test,
+            full_matrices=True,
         )
 
-        eigenvalue_floor = (
-            floor_factor
-            * jnp.finfo(b.dtype).eps
-            * b_scale
+        left_vectors_np = np.asarray(left_vectors)
+        singular_values_np = np.asarray(singular_values)
+        row_norms_np = np.asarray(row_norms)
+
+        number_model_functions = G_for_test.shape[0]
+
+        # jnp.linalg.svd returns only min(G.shape) singular values.
+        # If G has more rows than columns, the remaining left-singular
+        # directions have singular value exactly zero.
+        full_singular_values = np.zeros(
+            number_model_functions,
+            dtype=singular_values_np.dtype,
         )
 
-        # Modes at or below the numerical floor are considered
-        # unconstrained or degenerate.
-        bad_modes = raw_eigenvalues <= eigenvalue_floor
+        full_singular_values[: singular_values_np.size] = (
+            singular_values_np
+        )
 
-        if not bool(jnp.any(bad_modes)):
+        largest_singular_value = float(
+            np.max(full_singular_values)
+        )
+
+        if not np.isfinite(largest_singular_value):
+            raise FloatingPointError(
+                "The model matrix produced non-finite singular values."
+            )
+
+        if largest_singular_value <= 0.0:
+            # Every model function is zero over the observation window.
+            bad_modes = np.ones(
+                number_model_functions,
+                dtype=bool,
+            )
+            singular_value_floor = 0.0
+        else:
+            singular_value_floor = (
+                singular_value_tol
+                * largest_singular_value
+            )
+
+            bad_modes = (
+                full_singular_values
+                <= singular_value_floor
+            )
+
+        if not np.any(bad_modes):
             break
 
-        bad_mode_indices = jnp.flatnonzero(bad_modes)
+        number_bad_modes = int(np.count_nonzero(bad_modes))
 
-        # Each column of eigenvectors is an eigenmode. Compute the
-        # contribution of each parameter to all bad modes.
-        parameter_scores = jnp.sum(
-            eigenvectors[:, bad_mode_indices] ** 2,
+        # -------------------------------------------------------------
+        # Map the redundant subspace back to individual signals.
+        #
+        # Each column of left_vectors is a direction in model-function
+        # space. Squaring and summing the entries over the bad modes
+        # measures how strongly each model-function row participates
+        # in the redundant subspace.
+        # -------------------------------------------------------------
+        bad_left_vectors = left_vectors_np[:, bad_modes]
+
+        model_function_scores = np.sum(
+            bad_left_vectors**2,
             axis=1,
         )
 
-        # The flattened parameter order is assumed to be:
-        #
-        #   [f_0, k_0, f_1, k_1, ...]
-        #
-        # Combine the frequency and decay-rate scores for each signal.
-        signal_scores = parameter_scores.reshape(len(fs), 2).sum(axis=1)
+        cosine_scores = model_function_scores[:r]
+        sine_scores = model_function_scores[r:]
 
-        remove_index = int(jnp.argmax(signal_scores))
+        signal_scores = cosine_scores + sine_scores
+
+        # Remove the signal that participates most strongly in the
+        # redundant subspace.
+        remove_index = int(np.argmax(signal_scores))
+
+        relative_smallest_singular_value = (
+            float(full_singular_values[0])
+            / largest_singular_value
+            if largest_singular_value > 0.0
+            else 0.0
+        )
 
         print(
-            "Removing signal "
+            "Removing redundant signal "
             f"{remove_index}: "
             f"f={fs[remove_index]:.6g}, "
             f"k={ks[remove_index]:.6g}; "
-            f"bad_modes={int(jnp.sum(bad_modes))}, "
-            f"score={float(signal_scores[remove_index]):.6g}"
+            f"bad_modes={number_bad_modes}, "
+            f"score={signal_scores[remove_index]:.6g}, "
+            f"cos_norm={row_norms_np[remove_index]:.6g}, "
+            f"sin_norm={row_norms_np[r + remove_index]:.6g}, "
+            f"smallest_relative_singular_value="
+            f"{relative_smallest_singular_value:.6g}, "
+            f"singular_value_floor={singular_value_floor:.6g}"
         )
 
-        # Remove the same signal index from all signal-related arrays.
-        keep = np.ones(len(fs), dtype=bool)
+        # -------------------------------------------------------------
+        # Remove the chosen signal and the matching bandwidth entry.
+        # -------------------------------------------------------------
+        keep = np.ones(r, dtype=bool)
         keep[remove_index] = False
 
         fs = fs[keep]
         ks = ks[keep]
-        signals_bw = signals_bw[keep]
+
+        keep_jax = jnp.asarray(keep)
+        signals_bw = signals_bw[keep_jax]
 
         signals = jnp.stack(
-            (jnp.asarray(fs), jnp.asarray(ks)),
+            (
+                jnp.asarray(fs),
+                jnp.asarray(ks),
+            ),
             axis=-1,
         )
 
-        # Optionally rerun NUTS after removing a degenerate signal.
+        # -------------------------------------------------------------
+        # Optionally refit after each removal.
+        # -------------------------------------------------------------
         if nuts_args is not None:
             result = nuts(
                 t,
@@ -1094,9 +1219,10 @@ def reconcile_noise_floor(
                 signal_space,
                 signals,
                 signals_bw,
+                mcmc_kwargs=nuts_args.mcmc_kwargs,
                 nuts_kwargs=nuts_args.nuts_kwargs,
                 run_kwargs=nuts_args.run_kwargs,
-                rng_key_value=nuts_args.rng_key_value,
+                rng_key_value=nuts_args.seed,
             )
 
             if isinstance(result, tuple) and len(result) == 2:
@@ -1107,8 +1233,15 @@ def reconcile_noise_floor(
 
             fs, ks = utils.unpack_signals(signals)
 
-            fs = np.asarray(fs, dtype=np.float64).reshape(-1)
-            ks = np.asarray(ks, dtype=np.float64).reshape(-1)
+            fs = np.asarray(
+                fs,
+                dtype=np.float64,
+            ).reshape(-1)
+
+            ks = np.asarray(
+                ks,
+                dtype=np.float64,
+            ).reshape(-1)
 
             if fs.shape != ks.shape:
                 raise ValueError(
@@ -1116,29 +1249,44 @@ def reconcile_noise_floor(
                     f"different shapes: {fs.shape=} and {ks.shape=}."
                 )
 
+            if signals_bw.ndim == 0:
+                raise ValueError(
+                    "NUTS returned signals_bw without a "
+                    "signal-indexed first axis."
+                )
+
             if signals_bw.shape[0] != len(fs):
                 raise ValueError(
                     "NUTS returned signals_bw with a different number "
                     "of entries than signals; "
-                    f"got {signals_bw.shape[0]} and {len(fs)}."
+                    f"got {signals_bw.shape[0]} bandwidth entries and "
+                    f"{len(fs)} signals."
                 )
 
-    # Final synchronized sorting.
+    # -----------------------------------------------------------------
+    # Return the remaining signals in frequency order. Apply exactly
+    # the same permutation to signals_bw.
+    # -----------------------------------------------------------------
     order = np.argsort(fs)
 
     fs = fs[order]
     ks = ks[order]
-    signals_bw = signals_bw[order]
+
+    order_jax = jnp.asarray(order)
+    signals_bw = signals_bw[order_jax]
 
     signals = jnp.stack(
-        (jnp.asarray(fs), jnp.asarray(ks)),
+        (
+            jnp.asarray(fs),
+            jnp.asarray(ks),
+        ),
         axis=-1,
     )
 
     removed_count = initial_count - len(fs)
 
     print(
-        f"Removed {removed_count} signal"
+        f"Removed {removed_count} redundant signal"
         f"{'s' if removed_count != 1 else ''}!"
     )
 

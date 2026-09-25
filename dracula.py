@@ -997,7 +997,7 @@ if __name__ == "__main__":
         subband_count=1, 
         subband_scaling_factor=0.5,
         grid_search_args=grid_search_args,
-        cores_per_initial_conditions_worker=2,
+        cores_per_initial_conditions_worker=1,
         depth=5,
 
         signals_per_block=5,
