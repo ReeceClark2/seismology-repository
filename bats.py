@@ -426,7 +426,7 @@ def grid_search(
         return_probability_surface=False, 
         batch_size=256
     ):
-    f_min, f_max, k_min, k_max = signal_space
+    f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
 
     f_space = jnp.linspace(f_min, f_max, f_points)
     k_space = jnp.geomspace(k_min, k_max, k_points)
@@ -567,7 +567,7 @@ def nuts(
     ):
     f_init, k_init = utils.unpack_signals(signals)
 
-    f_min, f_max, k_min, k_max = signal_space
+    f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
 
     f_init = jnp.atleast_1d(jnp.asarray(f_init))
     k_init = jnp.atleast_1d(jnp.asarray(k_init))
