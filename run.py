@@ -93,8 +93,7 @@ def main():
         f_max=0.0043,
         k_min=1e-5,
         k_max=1e-4,
-        max_workers=32,
-        path="ampltiude_no_initial_sampling_3"
+        max_workers=32
     )
 
     grid_search_args = GridSearchArgs(
@@ -123,8 +122,8 @@ def main():
         target_accept_prob=0.85,
     )
     mcmc_kwargs = dict(
-        num_warmup=100,
-        num_samples=200,
+        num_warmup=50,
+        num_samples=50,
         num_chains=1,
         chain_method="parallel"
     )
@@ -149,7 +148,7 @@ def main():
         nuts_args_sample=nuts_args_sample,
         cores_per_sample_worker=1,
 
-        perform_minimize=True,
+        perform_minimize=False,
     )
 
 

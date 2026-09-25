@@ -386,10 +386,7 @@ def reconcile(
 
         # Replace this with the appropriate constructor if your utility
         # function has a different name or argument order.
-        signals = utils.unpack_signals(
-            jnp.asarray(fs),
-            jnp.asarray(ks),
-        )
+        signals = jnp.stack((jnp.asarray(fs), jnp.asarray(ks)), axis=-1)
 
         if nuts_args is not None:
             result = nuts(
@@ -429,10 +426,7 @@ def reconcile(
     fs = fs[order]
     ks = ks[order]
 
-    signals = utils.unpack_signals(
-        jnp.asarray(fs),
-        jnp.asarray(ks),
-    )
+    signals = jnp.stack((jnp.asarray(fs), jnp.asarray(ks)), axis=-1)
 
     removed_count = initial_count - len(fs)
     print(f"Removed {removed_count} signal{'s' if removed_count != 1 else ''}!")
