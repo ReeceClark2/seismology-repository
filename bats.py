@@ -341,6 +341,7 @@ def reconcile(
 
     fs = np.asarray(fs, dtype=np.float64).reshape(-1)
     ks = np.asarray(ks, dtype=np.float64).reshape(-1)
+    signals_bw = jnp.asarray(signals_bw)
 
     if fs.shape != ks.shape:
         raise ValueError(
@@ -348,13 +349,21 @@ def reconcile(
             f"got {fs.shape=} and {ks.shape=}."
         )
 
+    if signals_bw.shape[0] != len(fs):
+        raise ValueError(
+            "signals_bw must have one entry per signal; "
+            f"got {signals_bw.shape[0]} bandwidth entries and {len(fs)} signals."
+        )
+
     initial_count = len(fs)
 
     while len(fs) > 1:
-        # Sort so adjacent differences identify the closest frequencies.
+        # Sort signals and signals_bw using the same indices.
         order = np.argsort(fs)
+
         fs = fs[order]
         ks = ks[order]
+        signals_bw = signals_bw[order]
 
         delta_fs = np.diff(fs)
         close_pairs = np.flatnonzero(delta_fs < f_tol)
@@ -369,6 +378,11 @@ def reconcile(
         merged_f = 0.5 * (fs[pair_index] + fs[next_index])
         merged_k = 0.5 * (ks[pair_index] + ks[next_index])
 
+        # Merge the corresponding bandwidth entries.
+        merged_bw = 0.5 * (
+            signals_bw[pair_index] + signals_bw[next_index]
+        )
+
         fs = np.concatenate(
             (
                 fs[:pair_index],
@@ -376,6 +390,7 @@ def reconcile(
                 fs[next_index + 1 :],
             )
         )
+
         ks = np.concatenate(
             (
                 ks[:pair_index],
@@ -384,9 +399,19 @@ def reconcile(
             )
         )
 
-        # Replace this with the appropriate constructor if your utility
-        # function has a different name or argument order.
-        signals = jnp.stack((jnp.asarray(fs), jnp.asarray(ks)), axis=-1)
+        signals_bw = jnp.concatenate(
+            (
+                signals_bw[:pair_index],
+                merged_bw[None, ...],
+                signals_bw[next_index + 1 :],
+            ),
+            axis=0,
+        )
+
+        signals = jnp.stack(
+            (jnp.asarray(fs), jnp.asarray(ks)),
+            axis=-1,
+        )
 
         if nuts_args is not None:
             result = nuts(
@@ -400,18 +425,15 @@ def reconcile(
                 rng_key_value=nuts_args.rng_key_value,
             )
 
-            # Support a NUTS implementation returning either:
-            #   signals
-            # or
-            #   (signals, signals_bw)
             if isinstance(result, tuple) and len(result) == 2:
                 signals, signals_bw = result
+                signals_bw = jnp.asarray(signals_bw)
             else:
                 signals = result
 
-            # NUTS may have changed the parameter values, so unpack them
-            # again before checking for another close pair.
+            # NUTS may have changed the parameter values.
             fs, ks = utils.unpack_signals(signals)
+
             fs = np.asarray(fs, dtype=np.float64).reshape(-1)
             ks = np.asarray(ks, dtype=np.float64).reshape(-1)
 
@@ -421,17 +443,32 @@ def reconcile(
                     f"different shapes: {fs.shape=} and {ks.shape=}."
                 )
 
-    # Ensure the final output is frequency-sorted even if no merge occurred.
+            if signals_bw.shape[0] != len(fs):
+                raise ValueError(
+                    "NUTS returned signals_bw with a different number of "
+                    "entries than signals; "
+                    f"got {signals_bw.shape[0]} and {len(fs)}."
+                )
+
+    # Final synchronized sort.
     order = np.argsort(fs)
+
     fs = fs[order]
     ks = ks[order]
+    signals_bw = signals_bw[order]
 
-    signals = jnp.stack((jnp.asarray(fs), jnp.asarray(ks)), axis=-1)
+    signals = jnp.stack(
+        (jnp.asarray(fs), jnp.asarray(ks)),
+        axis=-1,
+    )
 
     removed_count = initial_count - len(fs)
-    print(f"Removed {removed_count} signal{'s' if removed_count != 1 else ''}!")
+    print(
+        f"Removed {removed_count} signal"
+        f"{'s' if removed_count != 1 else ''}!"
+    )
 
-    return signals
+    return signals, signals_bw
 
 
 def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):
