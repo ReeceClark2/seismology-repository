@@ -34,27 +34,14 @@ import log_utils
 
 
 def initialize_worker(core_queue):
-    '''
-    Windows and Linux compatible functon for diagnosing core availibility.
-    '''
+    import numpyro
 
-    worker_cores = core_queue.get()
+    worker_cores = list(core_queue.get())
 
     if hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, worker_cores)
 
-        active_cores = sorted(os.sched_getaffinity(0))
-        message = f"PID {os.getpid()} using cores {active_cores}"
-    else:
-        available_cores = os.cpu_count() or 1
-        message = (
-            f"PID {os.getpid()} on Windows; "
-            f"affinity not explicitly pinned; "
-            f"{available_cores} logical CPUs available"
-        )
-
-    print(message, flush=True)
-
+    numpyro.set_host_device_count(len(worker_cores))
 
 @dataclass
 class SignalSpace:
@@ -264,6 +251,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     noise_variances = noise_variances[:stop]
     snrs = snrs[:stop]
     glob_lls = glob_lls[:stop]
+
     signals = deepcopy(signals_by_depth[len(signals)])
     signals_bw = deepcopy(signals_bw_by_depth[len(signals_bw)])
 
@@ -326,6 +314,7 @@ class SampleTask:
     perform_minimize: bool
     path: str
 
+
 def run_sample_worker(
     t,
     d,
@@ -340,13 +329,12 @@ def run_sample_worker(
     '''
     Runs an instance of the sample worker that improves initial condtions by 
     allowing more signals to covary.
-    '''    
+    '''
+    
     path.mkdir(parents=True, exist_ok=True)
 
     d = utils.filter(t, d, signal_space.f_min, signal_space.f_max)
-
     t_max = jnp.log(0.2) / (-signal_space.k_min)
-
     mask = t < t_max
 
     t = t[mask]
@@ -529,14 +517,14 @@ class Dracula():
             subband_count: int = 5,
             subband_scaling_factor: float = 1,
             depth: int = 5,
-            cores_per_worker: int = 1,
+            cores_per_worker: Any = None,
     ):
         print("Finding initial conditions...")
 
         path = self.path / "initialize"
         path.mkdir(parents=True, exist_ok=True)
         pbar = tqdm(total=subband_count)
-        
+
         if subband_count == 1:
             subbands = [(self.signal_space.f_min, self.signal_space.f_max)]
 
@@ -585,22 +573,21 @@ class Dracula():
         manager = context.Manager()
         core_queue = manager.Queue()
 
-        if hasattr(os, "sched_getaffinity"):
-            available_core_ids = sorted(os.sched_getaffinity(0))
-            available_cores = len(available_core_ids)
+        if cores_per_worker is None:
+            if hasattr(os, "sched_getaffinity"):
+                available_core_ids = sorted(os.sched_getaffinity(0))
+                available_cores = len(available_core_ids)
+            else:
+                available_core_ids = psutil.Process().cpu_affinity()
+                available_cores = len(available_core_ids)
+
+            cores_per_worker = max(
+                1,
+                available_cores // self.max_workers,
+            )
         else:
-            available_core_ids = list(range(os.cpu_count() or 1))
+            available_core_ids = psutil.Process().cpu_affinity()
             available_cores = len(available_core_ids)
-
-        cores_per_worker = max(
-            1,
-            available_cores // self.max_workers,
-        )
-
-        required_cores = self.max_workers * cores_per_worker
-
-        available_core_ids = psutil.Process().cpu_affinity()
-        available_cores = len(available_core_ids)
 
         required_cores = self.max_workers * cores_per_worker
 
@@ -784,7 +771,7 @@ class Dracula():
                     signal_indices=signal_indices,
                     nuts_args=nuts_args,
                     perform_minimize=self.perform_minimize,
-                    path=path / f"block_{ind + 1}r{blocks}"   
+                    path=path / f"block_{ind + 1}r{blocks}"
                 )
             )
 
@@ -794,22 +781,21 @@ class Dracula():
         manager = context.Manager()
         core_queue = manager.Queue()
 
-        if hasattr(os, "sched_getaffinity"):
-            available_core_ids = sorted(os.sched_getaffinity(0))
-            available_cores = len(available_core_ids)
+        if cores_per_worker is None:
+            if hasattr(os, "sched_getaffinity"):
+                available_core_ids = sorted(os.sched_getaffinity(0))
+                available_cores = len(available_core_ids)
+            else:
+                available_core_ids = psutil.Process().cpu_affinity()
+                available_cores = len(available_core_ids)
+
+            cores_per_worker = max(
+                1,
+                available_cores // self.max_workers,
+            )
         else:
-            available_core_ids = list(range(os.cpu_count() or 1))
+            available_core_ids = psutil.Process().cpu_affinity()
             available_cores = len(available_core_ids)
-
-        cores_per_worker = max(
-            1,
-            available_cores // self.max_workers,
-        )
-
-        required_cores = self.max_workers * cores_per_worker
-
-        available_core_ids = psutil.Process().cpu_affinity()
-        available_cores = len(available_core_ids)
 
         required_cores = self.max_workers * cores_per_worker
 

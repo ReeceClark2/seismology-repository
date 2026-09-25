@@ -93,7 +93,7 @@ def main():
         f_max=0.0043,
         k_min=1e-5,
         k_max=1e-4,
-        max_workers=32
+        max_workers=8
     )
 
     grid_search_args = GridSearchArgs(
@@ -106,7 +106,7 @@ def main():
     mcmc_kwargs = dict(
         num_warmup=20,
         num_samples=60,
-        num_chains=1,
+        num_chains=4,
         chain_method="parallel"
     )
     run_kwargs = dict()
@@ -124,7 +124,7 @@ def main():
     mcmc_kwargs = dict(
         num_warmup=70,
         num_samples=120,
-        num_chains=1,
+        num_chains=4,
         chain_method="parallel"
     )
     run_kwargs = dict()

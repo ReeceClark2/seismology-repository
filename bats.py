@@ -378,7 +378,7 @@ def reconcile(
         signals,
         signals_bw,
         nuts_args=None,
-        condition_threshold=1e6
+        k2_threshold=1e6
     ):
 
     signals = list(signals)
@@ -393,7 +393,7 @@ def reconcile(
 
         k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
 
-        if k2 > condition_threshold:
+        if k2 > k2_threshold:
             eigenvector_index = int(jnp.argmin(eigenvalues))
             eigenvector = eigenvectors[:, eigenvector_index]
 
