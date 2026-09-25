@@ -148,6 +148,8 @@ def main():
         nuts_args_sample=nuts_args_sample,
         cores_per_sample_worker=1,
 
+        nuts_args_reconcile=nuts_args_sample,
+
         perform_minimize=False,
     )
 

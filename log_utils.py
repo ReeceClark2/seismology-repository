@@ -258,6 +258,7 @@ def plot_signal_space(
         ks,
         color="red",
         label="Updated Signals",
+        s=5,
         zorder=4,
     )
 

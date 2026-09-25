@@ -415,6 +415,56 @@ def run_sample_worker_wrapper(config: SampleTask):
             f"Original worker traceback:\n{worker_traceback}"
         ) from None
 
+
+def create_deliverables(path, t, d, signals, signal_space):
+    model = bats.get_model(t, d, signals)
+    amplitudes = bats.get_amplitudes(t, d, signals)
+    uncertainties = bats.get_uncertainties(t, d, signals)
+
+    noise_variance = bats.get_noise_variance(t, d, signals)
+    snr = bats.get_snr(t, d, signals)
+
+    log_utils.plot_time_series(
+        path / f"{len(signals)}_time_series.png", 
+        t, 
+        d, 
+        f"Time Series ({len(signals)} signal model)", 
+        model
+    )
+    log_utils.plot_fourier_space(
+        path / f"{len(signals)}_fourier_space.png", 
+        t,
+        d,
+        f"Fourier Space ({len(signals)} signal model)", 
+        signal_space.f_min,
+        signal_space.f_max,
+        10_000,
+        signals,
+        model
+    )
+    log_utils.plot_signal_space(
+        path / f"{len(signals)}_signal_space.png", 
+        signals,
+        f"Signal Space ({len(signals)} signal model)", 
+        uncertainties=uncertainties,
+        signal_space=signal_space
+    )
+
+    log_utils.save_signals_csv(
+        path / "signals.csv",
+        signals,
+        amplitudes,
+        uncertainties
+    )
+    log_utils.save_report_txt(
+        path / "report.txt",
+        len(signals),
+        noise_variance,
+        snr
+    )
+
+
+
 class Dracula():
     def __init__(
             self, 
@@ -630,7 +680,7 @@ class Dracula():
             key=lambda pair: pair[0][0],  
         )
 
-        self.signals_init, self.signals_bw = map(
+        self.signals_init, self.signals_bw_init = map(
             list,
             zip(*signals_and_bw)
         )
@@ -651,19 +701,7 @@ class Dracula():
 
         log_utils.save_initialize_csv(path / "all_subband_results.csv", signals_by_subband=self.signals_by_subband)
 
-        model = bats.get_model(self.t, self.d, self.signals_init)
-        amplitudes = bats.get_amplitudes(self.t, self.d, self.signals_init)
-        uncertainties = bats.get_uncertainties(self.t, self.d, self.signals_init)
-
-        noise_variance = bats.get_noise_variance(self.t, self.d, self.signals_init)
-        snr = bats.get_snr(self.t, self.d, self.signals_init)
-
-        log_utils.save_signals_csv(path / "initial_conditions_signals.csv", self.signals_init, amplitudes, uncertainties)
-        log_utils.save_report_txt(path / "initial_conditions_report.txt", len(self.signals_init), noise_variance, snr)
-
-        log_utils.plot_fourier_space(path / "initial_conditions_fourier_space", self.t, self.d, "Initial Conditions Fourier Space", f_min=self.signal_space.f_min, f_max=self.signal_space.f_max, f_points=10_000, signals=self.signals_init, model=model)
-        log_utils.plot_time_series(path / "initial_conditions_time_series", self.t, self.d, "Initial Conditions Time Series", model)
-        log_utils.plot_signal_space(path / "initial_conditions_signal_space", self.signals_init, "Initial Conditions Signal Space", signal_space=self.signal_space, uncertainties=uncertainties) 
+        create_deliverables(path, self.t, self.d, self.signals_init, self.signal_space)
 
         if self.signals_init:
             print(f"\nFound {len(self.signals_init)} signals!")
@@ -833,36 +871,32 @@ class Dracula():
                     ) from None
         
         self.results = results_by_signal
+        self.signals_sample = utils.unpack_signal_results(self.results)
+        self.signals_bw_sample = self.signals_bw_init
+
+        uncertainties = bats.get_uncertainties(self.t, self.d, self.signals_sample)
+        log_utils.save_report_csv(path / "report.csv", self.results, uncertainties)
+
+        create_deliverables(path, self.t, self.d, self.signals_sample, self.signal_space)
 
 
-    def report(self, results):
-        "Creating report..."
+    def reconcile(
+            self, 
+            signals: Any,
+            signals_bw: Any,
+            nuts_args: Optional[NUTSArgs] = None,
+        ):
+        "Reconciling degenerate signals..."
 
-        path = self.path / "report"
+        path = self.path / "reconcile"
         path.mkdir(parents=True, exist_ok=True)
-
-        signals = utils.unpack_signal_results(results)
-        uncertainties_full = bats.get_uncertainties(self.t, self.d, signals)
 
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
-        signals, signals_bw = bats.reconcile_noise_floor(self.t, self.d, self.signal_space, signals, self.signals_bw)
+        signals, signals_bw = bats.reconcile_noise_floor(self.t, self.d, self.signal_space, signals, signals_bw, nuts_args=nuts_args)
 
-        amplitudes = bats.get_amplitudes(self.t, self.d, signals)
-        uncertainties = bats.get_uncertainties(self.t, self.d, signals)
-        log_utils.save_report_csv(path / "report_all.csv", results, uncertainties_full)
-        log_utils.save_signals_csv(path / "report_averaged.csv", signals, amplitudes, uncertainties)
-
-        noise_variance = bats.get_noise_variance(self.t, self.d, signals)
-        snr = bats.get_snr(self.t, self.d, signals)
-
-        log_utils.save_report_txt(path / "report.txt", len(signals), noise_variance, snr)
-
-        model = bats.get_model(self.t, self.d, signals)
-        log_utils.plot_time_series(path / "model_time_series.png", self.t, self.d, "Sampled Time Series", model)
-        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", self.t, self.d, "Sampled Fourier Space", self.signal_space.f_min, self.signal_space.f_max, 100_000, signals, model)
-        log_utils.plot_signal_space(path / "signal_space.png", signals, "Sampled Signal Space", signal_space=self.signal_space, uncertainties=uncertainties)
+        create_deliverables(path, self.t, self.d, signals, self.signal_space)
 
 
     def execute(
@@ -870,15 +904,17 @@ class Dracula():
             subband_count: int = 2,
             subband_scaling_factor: float = 1,
             depth: int = 10,
-            grid_search_args:  Optional[GridSearchArgs] = None,
+            grid_search_args: Optional[GridSearchArgs] = None,
             nuts_args_init: Optional[NUTSArgs] = None,
             perform_minimize: bool = False,
             cores_per_initial_conditions_worker: int = 1,
 
             signals_per_block: int = 1,
             fill_order: int = 1,
-            nuts_args_sample:  Optional[NUTSArgs] = None,
+            nuts_args_sample: Optional[NUTSArgs] = None,
             cores_per_sample_worker: int = 1,
+
+            nuts_args_reconcile: Optional[NUTSArgs] = None,
     ):        
         if not grid_search_args:
             grid_search_args = self.default_grid_search_args
@@ -896,14 +932,16 @@ class Dracula():
         )
         self.sample(
             signals=self.signals_init,
-            signals_bw=self.signals_bw,
+            signals_bw=self.signals_bw_init,
             signals_per_block=signals_per_block,
             fill_order=fill_order,
             nuts_args=nuts_args_sample,
             cores_per_worker=cores_per_sample_worker
         )
-        self.report(
-            self.results
+        self.reconcile(
+            signals=self.signals_sample,
+            signals_bw=self.signals_bw_sample,
+            nuts_args=nuts_args_reconcile,
         )
 
         print("Dracula complete!")

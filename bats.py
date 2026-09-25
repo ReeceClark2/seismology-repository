@@ -313,7 +313,6 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
     b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
     b_floor = jnp.finfo(b.dtype).eps * b_scale
     eigenvalues = jnp.maximum(eigenvalues, b_floor)
-    print(eigenvalues)
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
