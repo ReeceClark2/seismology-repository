@@ -20,7 +20,11 @@ from numpyro.infer import MCMC, NUTS, init_to_value
 import utils
 
 
-def get_log_prob(t, d, signals):
+def get_log_prob(
+        t: jax.Array, 
+        d: jax.Array,
+        signals
+    ):
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -40,7 +44,6 @@ def get_log_prob(t, d, signals):
     cutoff = 1e-10 * singular_values[0]
     keep = singular_values > cutoff
 
-    # Project only onto numerically valid directions
     h = U.T @ d
     sum_sq_proj = jnp.sum(jnp.where(keep, h**2, 0.0))
 
@@ -53,9 +56,35 @@ def get_log_prob(t, d, signals):
 
     return 0.5 * (effective_m - N) * jnp.log1p(-ratio)
 
+def get_gram(
+        t: jax.Array, 
+        d: jax.Array,
+        signals
+    ):
+    fs, ks = utils.unpack_signals(signals)
+
+    omegas = 2.0 * jnp.pi * fs
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    G = jnp.vstack((
+        jnp.cos(arg) * decay,
+        jnp.sin(arg) * decay,
+    ), axis=0)
+
+    g = G @ G.T
+    g = 0.5 * (g + g.T)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+
+    return g, eigenvalues, eigenvectors
 
 @jax.jit
-def get_model(t, d, signals):
+def get_model(
+        t: jax.Array, 
+        d: jax.Array,
+        signals
+    ):
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -67,11 +96,14 @@ def get_model(t, d, signals):
         jnp.sin(arg) * decay,
     ))
 
-    # G.T has shape (N, 2r)
     coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
     return G.T @ coefficients
 
-def get_noise_variance(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_noise_variance(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -102,7 +134,11 @@ def get_noise_variance(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
 
-def get_snr(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_snr(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -135,8 +171,11 @@ def get_snr(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
 
-
-def get_mean_sq_proj(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_mean_sq_proj(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -164,8 +203,11 @@ def get_mean_sq_proj(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return jnp.mean(h ** 2)
 
-
-def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_glob_ll(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
     d_scale = jnp.std(d)
     d = d / jnp.maximum(d_scale, jnp.finfo(d.dtype).eps)
@@ -245,8 +287,11 @@ def get_glob_ll(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return delta_term + sigma_term + gamma_term + log_jacobian_factor
 
-
-def get_amplitudes(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_amplitudes(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -271,8 +316,11 @@ def get_amplitudes(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return amplitudes
 
-
-def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
+def get_uncertainties(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ) -> jax.Array:
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -323,154 +371,63 @@ def get_uncertainties(t: jax.Array, d: jax.Array, signals) -> jax.Array:
 
     return signals_uncertainties
 
-
 def reconcile(
-    t,
-    d,
-    signal_space,
-    signals,
-    signals_bw,
-    nuts_args=None,
-    f_tol=1e-5,
-):
-    if f_tol < 0:
-        raise ValueError(f"f_tol must be nonnegative, got {f_tol}")
+        t,
+        d,
+        signal_space,
+        signals,
+        signals_bw,
+        nuts_args=None,
+        condition_threshold=1e6
+    ):
 
-    fs, ks = utils.unpack_signals(signals)
+    signals = list(signals)
+    signals_bw = list(signals_bw)
 
-    fs = np.asarray(fs, dtype=np.float64).reshape(-1)
-    ks = np.asarray(ks, dtype=np.float64).reshape(-1)
-    signals_bw = jnp.asarray(signals_bw)
+    while True:
+        _, eigenvalues, eigenvectors = get_gram(t, d, signals)
+        m = len(signals)
 
-    if fs.shape != ks.shape:
-        raise ValueError(
-            "Frequencies and decay rates must have the same shape; "
-            f"got {fs.shape=} and {ks.shape=}."
-        )
+        max_eigenvalue = jnp.max(eigenvalues)
+        min_eigenvalue = jnp.min(eigenvalues)
 
-    if signals_bw.shape[0] != len(fs):
-        raise ValueError(
-            "signals_bw must have one entry per signal; "
-            f"got {signals_bw.shape[0]} bandwidth entries and {len(fs)} signals."
-        )
+        k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
 
-    initial_count = len(fs)
+        if k2 > condition_threshold:
+            eigenvector_index = int(jnp.argmin(eigenvalues))
+            eigenvector = eigenvectors[:, eigenvector_index]
 
-    while len(fs) > 1:
-        # Sort signals and signals_bw using the same indices.
-        order = np.argsort(fs)
+            cosine_components = eigenvector[:m]
+            sine_components = eigenvector[m:]
 
-        fs = fs[order]
-        ks = ks[order]
-        signals_bw = signals_bw[order]
+            signal_strength = jnp.sqrt(cosine_components ** 2 + sine_components ** 2)
+            signal_index = int(jnp.argmin(signal_strength))
 
-        delta_fs = np.diff(fs)
-        close_pairs = np.flatnonzero(delta_fs < f_tol)
+            f, k = signals[signal_index]
+            print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
 
-        if close_pairs.size == 0:
+            signals.pop(signal_index)
+            signals_bw.pop(signal_index)
+
+            if nuts_args is not None:
+                signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
+
+        else:
             break
-
-        # Merge the closest eligible pair.
-        pair_index = close_pairs[np.argmin(delta_fs[close_pairs])]
-        next_index = pair_index + 1
-
-        merged_f = 0.5 * (fs[pair_index] + fs[next_index])
-        merged_k = 0.5 * (ks[pair_index] + ks[next_index])
-
-        # Merge the corresponding bandwidth entries.
-        merged_bw = 0.5 * (
-            signals_bw[pair_index] + signals_bw[next_index]
-        )
-
-        fs = np.concatenate(
-            (
-                fs[:pair_index],
-                np.asarray([merged_f]),
-                fs[next_index + 1 :],
-            )
-        )
-
-        ks = np.concatenate(
-            (
-                ks[:pair_index],
-                np.asarray([merged_k]),
-                ks[next_index + 1 :],
-            )
-        )
-
-        signals_bw = jnp.concatenate(
-            (
-                signals_bw[:pair_index],
-                merged_bw[None, ...],
-                signals_bw[next_index + 1 :],
-            ),
-            axis=0,
-        )
-
-        signals = jnp.stack(
-            (jnp.asarray(fs), jnp.asarray(ks)),
-            axis=-1,
-        )
-
-        if nuts_args is not None:
-            result = nuts(
-                t,
-                d,
-                signal_space,
-                signals,
-                signals_bw,
-                nuts_kwargs=nuts_args.nuts_kwargs,
-                run_kwargs=nuts_args.run_kwargs,
-                rng_key_value=nuts_args.seed,
-            )
-
-            if isinstance(result, tuple) and len(result) == 2:
-                signals, signals_bw = result
-                signals_bw = jnp.asarray(signals_bw)
-            else:
-                signals = result
-
-            # NUTS may have changed the parameter values.
-            fs, ks = utils.unpack_signals(signals)
-
-            fs = np.asarray(fs, dtype=np.float64).reshape(-1)
-            ks = np.asarray(ks, dtype=np.float64).reshape(-1)
-
-            if fs.shape != ks.shape:
-                raise ValueError(
-                    "NUTS returned frequencies and decay rates with "
-                    f"different shapes: {fs.shape=} and {ks.shape=}."
-                )
-
-            if signals_bw.shape[0] != len(fs):
-                raise ValueError(
-                    "NUTS returned signals_bw with a different number of "
-                    "entries than signals; "
-                    f"got {signals_bw.shape[0]} and {len(fs)}."
-                )
-
-    # Final synchronized sort.
-    order = np.argsort(fs)
-
-    fs = fs[order]
-    ks = ks[order]
-    signals_bw = signals_bw[order]
-
-    signals = jnp.stack(
-        (jnp.asarray(fs), jnp.asarray(ks)),
-        axis=-1,
-    )
-
-    removed_count = initial_count - len(fs)
-    print(
-        f"Removed {removed_count} signal"
-        f"{'s' if removed_count != 1 else ''}!"
-    )
-
+        
     return signals, signals_bw
 
+def grid_search(
+        t, 
+        d, 
+        signal_space,
+        f_points, 
+        k_points,  
+        return_probability_surface=False, 
+        batch_size=256
+    ):
+    f_min, f_max, k_min, k_max = signal_space
 
-def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_probability_surface=False, batch_size=256):
     f_space = jnp.linspace(f_min, f_max, f_points)
     k_space = jnp.geomspace(k_min, k_max, k_points)
 
@@ -511,19 +468,19 @@ def grid_search(t, d, f_points, f_min, f_max, k_points, k_min, k_max, return_pro
 
     return signal
 
-
 def bats_model(
-    t: jax.Array,
-    d: jax.Array,
-    f_loc: jax.Array,
-    f_scale: float | jax.Array,
-    k_loc: jax.Array,
-    k_scale: float | jax.Array,
-    f_min: float,
-    f_max: float,
-    k_min: float,
-    k_max: float,
-) -> None:
+        t: jax.Array,
+        d: jax.Array,
+        f_loc: jax.Array,
+        f_scale: float | jax.Array,
+        k_loc: jax.Array,
+        k_scale: float | jax.Array,
+        f_min: float,
+        f_max: float,
+        k_min: float,
+        k_max: float,
+    ) -> None:
+
     f_loc = jnp.atleast_1d(jnp.asarray(f_loc))
     k_loc = jnp.atleast_1d(jnp.asarray(k_loc))
 
@@ -597,24 +554,20 @@ def bats_model(
         get_log_prob(t, d, signals),
     )
 
-
 def nuts(
-    t,
-    d,
-    signal_space,
-    signals,
-    signals_bw,
-    nuts_kwargs,
-    mcmc_kwargs,
-    run_kwargs,
-    rng_key_value,
-):
+        t,
+        d,
+        signal_space,
+        signals,
+        signals_bw,
+        nuts_kwargs,
+        mcmc_kwargs,
+        run_kwargs,
+        rng_key_value,
+    ):
     f_init, k_init = utils.unpack_signals(signals)
 
-    f_min = signal_space.f_min
-    f_max = signal_space.f_max
-    k_min = signal_space.k_min
-    k_max = signal_space.k_max
+    f_min, f_max, k_min, k_max = signal_space
 
     f_init = jnp.atleast_1d(jnp.asarray(f_init))
     k_init = jnp.atleast_1d(jnp.asarray(k_init))
@@ -746,14 +699,14 @@ def nuts(
         axis=-1,
     )
 
-
 def minimize(
-    t,
-    d,
-    signal_space,
-    signals,
-    maxiter=2_000,
-):
+        t,
+        d,
+        signal_space,
+        signals,
+        maxiter=2_000,
+    ):
+
     signals = jnp.asarray(signals)
 
     f_min = float(signal_space.f_min)
@@ -901,393 +854,3 @@ def minimize(
         print(f"trust-constr warning: {result.message}")
 
     return jnp.asarray(result_physical).reshape(original_shape)
-
-
-
-
-#--------------------- Testing -----------------------------------
-
-def reconcile_2(
-    t,
-    d,
-    signal_space,
-    signals,
-    signals_bw,
-    nuts_args=None,
-    singular_value_tol=1e-4,
-    min_signals=1,
-    normalize_rows=True,
-):
-    """
-    Iteratively remove signals that participate strongly in redundant
-    model-function directions.
-
-    Redundancy is determined from the singular values of the model
-    matrix G rather than from a parameter Hessian.
-
-    The model matrix has row ordering:
-
-        cos(signal 0), ..., cos(signal r - 1),
-        sin(signal 0), ..., sin(signal r - 1)
-
-    A singular direction is considered redundant when:
-
-        singular_value / largest_singular_value
-            <= singular_value_tol
-
-    Since the eigenvalues of the Gram matrix G @ G.T are the squares
-    of the singular values of G, the equivalent relative Gram
-    eigenvalue threshold is:
-
-        gram_relative_tol = singular_value_tol**2
-
-    Parameters
-    ----------
-    t, d :
-        Time samples and observed data.
-
-    signal_space :
-        Passed to nuts() when refitting.
-
-    signals :
-        Signal parameters with shape (n_signals, 2), containing
-        frequency and decay rate.
-
-    signals_bw :
-        Signal bandwidths. Its first axis must correspond to the first
-        axis of signals.
-
-    nuts_args :
-        Optional NUTS configuration. If provided, NUTS is rerun after
-        each signal removal.
-
-    singular_value_tol :
-        Relative singular-value threshold used to identify redundant
-        model directions. For example, 1e-4 corresponds to a relative
-        Gram-eigenvalue threshold of 1e-8.
-
-    min_signals :
-        Minimum number of signals that must remain.
-
-    normalize_rows :
-        If True, normalize each model-function row before performing
-        the redundancy test. This detects redundant function shapes
-        rather than merely low-energy functions.
-
-    Returns
-    -------
-    signals, signals_bw :
-        Reconciled signals and correspondingly indexed bandwidths.
-    """
-    if not 0.0 < singular_value_tol < 1.0:
-        raise ValueError(
-            "singular_value_tol must be strictly between 0 and 1; "
-            f"got {singular_value_tol}."
-        )
-
-    if min_signals < 1:
-        raise ValueError(
-            f"min_signals must be at least 1, got {min_signals}."
-        )
-
-    t = jnp.asarray(t).reshape(-1)
-    d = jnp.asarray(d).reshape(-1)
-    signals_bw = jnp.asarray(signals_bw)
-
-    fs, ks = utils.unpack_signals(signals)
-
-    fs = np.asarray(fs, dtype=np.float64).reshape(-1)
-    ks = np.asarray(ks, dtype=np.float64).reshape(-1)
-
-    if fs.shape != ks.shape:
-        raise ValueError(
-            "Frequencies and decay rates must have the same shape; "
-            f"got {fs.shape=} and {ks.shape=}."
-        )
-
-    if signals_bw.ndim == 0:
-        raise ValueError(
-            "signals_bw must have a signal-indexed first axis."
-        )
-
-    if signals_bw.shape[0] != len(fs):
-        raise ValueError(
-            "signals_bw must have one entry per signal; "
-            f"got {signals_bw.shape[0]} bandwidth entries and "
-            f"{len(fs)} signals."
-        )
-
-    if min_signals > len(fs):
-        raise ValueError(
-            "min_signals cannot exceed the initial number of signals; "
-            f"got {min_signals=} and {len(fs)} signals."
-        )
-
-    initial_count = len(fs)
-
-    while len(fs) > min_signals:
-        r = len(fs)
-
-        signals = jnp.stack(
-            (
-                jnp.asarray(fs),
-                jnp.asarray(ks),
-            ),
-            axis=-1,
-        )
-
-        # -------------------------------------------------------------
-        # Construct the model matrix.
-        #
-        # Row ordering:
-        #
-        #   [cos_0, ..., cos_(r-1), sin_0, ..., sin_(r-1)]
-        # -------------------------------------------------------------
-        omegas = 2.0 * jnp.pi * signals[:, 0]
-
-        arg = omegas[:, None] * t[None, :]
-        decay = jnp.exp(-signals[:, 1, None] * t[None, :])
-
-        cosine_functions = jnp.cos(arg) * decay
-        sine_functions = jnp.sin(arg) * decay
-
-        G = jnp.vstack(
-            (
-                cosine_functions,
-                sine_functions,
-            )
-        )
-
-        row_norms = jnp.linalg.norm(G, axis=1)
-
-        if normalize_rows:
-            # Zero or nearly zero rows are left as zero instead of
-            # dividing by a tiny norm.
-            largest_row_norm = jnp.max(row_norms)
-
-            row_norm_floor = (
-                jnp.finfo(G.dtype).eps
-                * jnp.maximum(largest_row_norm, 1.0)
-            )
-
-            safe_row_norms = jnp.where(
-                row_norms > row_norm_floor,
-                row_norms,
-                1.0,
-            )
-
-            G_for_test = G / safe_row_norms[:, None]
-        else:
-            G_for_test = G
-
-        # -------------------------------------------------------------
-        # Compute the SVD directly.
-        #
-        # This is more numerically stable than diagonalizing G @ G.T,
-        # because forming the Gram matrix squares the condition number.
-        #
-        # full_matrices=True is important when 2*r > len(t). It gives
-        # the complete left null space of G.
-        # -------------------------------------------------------------
-        left_vectors, singular_values, _ = jnp.linalg.svd(
-            G_for_test,
-            full_matrices=True,
-        )
-
-        left_vectors_np = np.asarray(left_vectors)
-        singular_values_np = np.asarray(singular_values)
-        row_norms_np = np.asarray(row_norms)
-
-        number_model_functions = G_for_test.shape[0]
-
-        # jnp.linalg.svd returns only min(G.shape) singular values.
-        # If G has more rows than columns, the remaining left-singular
-        # directions have singular value exactly zero.
-        full_singular_values = np.zeros(
-            number_model_functions,
-            dtype=singular_values_np.dtype,
-        )
-
-        full_singular_values[: singular_values_np.size] = (
-            singular_values_np
-        )
-
-        largest_singular_value = float(
-            np.max(full_singular_values)
-        )
-
-        if not np.isfinite(largest_singular_value):
-            raise FloatingPointError(
-                "The model matrix produced non-finite singular values."
-            )
-
-        if largest_singular_value <= 0.0:
-            # Every model function is zero over the observation window.
-            bad_modes = np.ones(
-                number_model_functions,
-                dtype=bool,
-            )
-            singular_value_floor = 0.0
-        else:
-            singular_value_floor = (
-                singular_value_tol
-                * largest_singular_value
-            )
-
-            bad_modes = (
-                full_singular_values
-                <= singular_value_floor
-            )
-
-        if not np.any(bad_modes):
-            break
-
-        number_bad_modes = int(np.count_nonzero(bad_modes))
-
-        # -------------------------------------------------------------
-        # Map the redundant subspace back to individual signals.
-        #
-        # Each column of left_vectors is a direction in model-function
-        # space. Squaring and summing the entries over the bad modes
-        # measures how strongly each model-function row participates
-        # in the redundant subspace.
-        # -------------------------------------------------------------
-        bad_left_vectors = left_vectors_np[:, bad_modes]
-
-        model_function_scores = np.sum(
-            bad_left_vectors**2,
-            axis=1,
-        )
-
-        cosine_scores = model_function_scores[:r]
-        sine_scores = model_function_scores[r:]
-
-        signal_scores = cosine_scores + sine_scores
-
-        # Remove the signal that participates most strongly in the
-        # redundant subspace.
-        remove_index = int(np.argmax(signal_scores))
-
-        relative_smallest_singular_value = (
-            float(full_singular_values[0])
-            / largest_singular_value
-            if largest_singular_value > 0.0
-            else 0.0
-        )
-
-        print(
-            "Removing redundant signal "
-            f"{remove_index}: "
-            f"f={fs[remove_index]:.6g}, "
-            f"k={ks[remove_index]:.6g}; "
-            f"bad_modes={number_bad_modes}, "
-            f"score={signal_scores[remove_index]:.6g}, "
-            f"cos_norm={row_norms_np[remove_index]:.6g}, "
-            f"sin_norm={row_norms_np[r + remove_index]:.6g}, "
-            f"smallest_relative_singular_value="
-            f"{relative_smallest_singular_value:.6g}, "
-            f"singular_value_floor={singular_value_floor:.6g}"
-        )
-
-        # -------------------------------------------------------------
-        # Remove the chosen signal and the matching bandwidth entry.
-        # -------------------------------------------------------------
-        keep = np.ones(r, dtype=bool)
-        keep[remove_index] = False
-
-        fs = fs[keep]
-        ks = ks[keep]
-
-        keep_jax = jnp.asarray(keep)
-        signals_bw = signals_bw[keep_jax]
-
-        signals = jnp.stack(
-            (
-                jnp.asarray(fs),
-                jnp.asarray(ks),
-            ),
-            axis=-1,
-        )
-
-        # -------------------------------------------------------------
-        # Optionally refit after each removal.
-        # -------------------------------------------------------------
-        if nuts_args is not None:
-            result = nuts(
-                t,
-                d,
-                signal_space,
-                signals,
-                signals_bw,
-                mcmc_kwargs=nuts_args.mcmc_kwargs,
-                nuts_kwargs=nuts_args.nuts_kwargs,
-                run_kwargs=nuts_args.run_kwargs,
-                rng_key_value=nuts_args.seed,
-            )
-
-            if isinstance(result, tuple) and len(result) == 2:
-                signals, signals_bw = result
-                signals_bw = jnp.asarray(signals_bw)
-            else:
-                signals = result
-
-            fs, ks = utils.unpack_signals(signals)
-
-            fs = np.asarray(
-                fs,
-                dtype=np.float64,
-            ).reshape(-1)
-
-            ks = np.asarray(
-                ks,
-                dtype=np.float64,
-            ).reshape(-1)
-
-            if fs.shape != ks.shape:
-                raise ValueError(
-                    "NUTS returned frequencies and decay rates with "
-                    f"different shapes: {fs.shape=} and {ks.shape=}."
-                )
-
-            if signals_bw.ndim == 0:
-                raise ValueError(
-                    "NUTS returned signals_bw without a "
-                    "signal-indexed first axis."
-                )
-
-            if signals_bw.shape[0] != len(fs):
-                raise ValueError(
-                    "NUTS returned signals_bw with a different number "
-                    "of entries than signals; "
-                    f"got {signals_bw.shape[0]} bandwidth entries and "
-                    f"{len(fs)} signals."
-                )
-
-    # -----------------------------------------------------------------
-    # Return the remaining signals in frequency order. Apply exactly
-    # the same permutation to signals_bw.
-    # -----------------------------------------------------------------
-    order = np.argsort(fs)
-
-    fs = fs[order]
-    ks = ks[order]
-
-    order_jax = jnp.asarray(order)
-    signals_bw = signals_bw[order_jax]
-
-    signals = jnp.stack(
-        (
-            jnp.asarray(fs),
-            jnp.asarray(ks),
-        ),
-        axis=-1,
-    )
-
-    removed_count = initial_count - len(fs)
-
-    print(
-        f"Removed {removed_count} redundant signal"
-        f"{'s' if removed_count != 1 else ''}!"
-    )
-
-    return signals, signals_bw

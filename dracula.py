@@ -127,10 +127,9 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         signal_candidate, probability_surface = bats.grid_search(
             t, 
             d,
+            signal_space,
             grid_search_args.f_points, 
-            signal_space.f_min, signal_space.f_max, 
-            grid_search_args.k_points, signal_space.k_min, 
-            signal_space.k_max, 
+            grid_search_args.k_points,
             return_probability_surface=True
         )
 
@@ -894,7 +893,7 @@ class Dracula():
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
-        signals, signals_bw = bats.reconcile_2(self.t, self.d, self.signal_space, signals, signals_bw, nuts_args=nuts_args)
+        signals, signals_bw = bats.reconcile(self.t, self.d, self.signal_space, signals, signals_bw, nuts_args=nuts_args)
 
         create_deliverables(path, self.t, self.d, signals, self.signal_space)
 
