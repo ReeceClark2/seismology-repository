@@ -907,7 +907,7 @@ def minimize(
 
 #--------------------- Testing -----------------------------------
 
-def reconcile(
+def reconcile_2(
     t,
     d,
     signal_space,

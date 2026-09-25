@@ -894,7 +894,7 @@ class Dracula():
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
-        signals, signals_bw = bats.reconcile_noise_floor(self.t, self.d, self.signal_space, signals, signals_bw, nuts_args=nuts_args)
+        signals, signals_bw = bats.reconcile_2(self.t, self.d, self.signal_space, signals, signals_bw, nuts_args=nuts_args)
 
         create_deliverables(path, self.t, self.d, signals, self.signal_space)
 

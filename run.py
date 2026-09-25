@@ -136,6 +136,25 @@ def main():
         seed=18
     )
 
+    nuts_kwargs = dict(
+        target_accept_prob=0.8,
+        max_tree_depth=(5,5)
+    )
+    mcmc_kwargs = dict(
+        num_warmup=50,
+        num_samples=50,
+        num_chains=1,
+        chain_method="parallel"
+    )
+    run_kwargs = dict()
+
+    nuts_args_reconcile = NUTSArgs(
+        nuts_kwargs=nuts_kwargs,
+        mcmc_kwargs=mcmc_kwargs,
+        run_kwargs=run_kwargs,
+        seed=18
+    )
+
     model.execute(
         subband_count=10, 
         subband_scaling_factor=1.0,
@@ -148,7 +167,7 @@ def main():
         nuts_args_sample=nuts_args_sample,
         cores_per_sample_worker=1,
 
-        nuts_args_reconcile=nuts_args_sample,
+        nuts_args_reconcile=nuts_args_reconcile,
 
         perform_minimize=False,
     )
