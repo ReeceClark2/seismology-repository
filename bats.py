@@ -70,7 +70,7 @@ def get_gram(
     G = jnp.vstack((
         jnp.cos(arg) * decay,
         jnp.sin(arg) * decay,
-    ), axis=0)
+    ))
 
     g = G @ G.T
     g = 0.5 * (g + g.T)
@@ -378,7 +378,7 @@ def reconcile(
         signals,
         signals_bw,
         nuts_args=None,
-        k2_threshold=1e6
+        k2_threshold=1e4
     ):
 
     signals = list(signals)
@@ -394,7 +394,7 @@ def reconcile(
         k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
 
         if k2 > k2_threshold:
-            eigenvector_index = int(jnp.argmin(eigenvalues))
+            eigenvector_index = int(jnp.argmax(eigenvalues))
             eigenvector = eigenvectors[:, eigenvector_index]
 
             cosine_components = eigenvector[:m]
@@ -406,8 +406,8 @@ def reconcile(
             f, k = signals[signal_index]
             print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
 
-            signals.pop(signal_index)
-            signals_bw.pop(signal_index)
+            signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
+            signals_bw = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
 
             if nuts_args is not None:
                 signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)

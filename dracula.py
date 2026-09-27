@@ -13,6 +13,8 @@ import os
 import psutil
 
 import numpy as np
+import numpyro
+numpyro.set_host_device_count(32)
 
 os.environ["XLA_FLAGS"] = (
     "--xla_cpu_multi_thread_eigen=false "

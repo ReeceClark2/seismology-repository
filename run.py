@@ -106,7 +106,7 @@ def main():
     mcmc_kwargs = dict(
         num_warmup=20,
         num_samples=60,
-        num_chains=4,
+        num_chains=1,
         chain_method="parallel"
     )
     run_kwargs = dict()
@@ -165,7 +165,7 @@ def main():
         signals_per_block=16,
         fill_order=0,
         nuts_args_sample=nuts_args_sample,
-        cores_per_sample_worker=1,
+        cores_per_sample_worker=4,
 
         nuts_args_reconcile=nuts_args_reconcile,
 
