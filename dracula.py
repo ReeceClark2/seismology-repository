@@ -405,6 +405,66 @@ def run_sample_worker_wrapper(config: SampleTask):
         ) from None
 
 
+@dataclass
+class ReconcileTask:
+    '''
+    Defines the allowed parameters for the sampling worker.
+    '''
+    t: ArrayLike
+    d: ArrayLike
+    signal_space: SignalSpace
+    signals: Any
+    signals_bw: Any
+    nuts_args: NUTSArgs
+    perform_minimize: bool
+    path: str
+
+
+def run_reconcile_worker(
+        t,
+        d,
+        signal_space,
+        signals,
+        signals_bw,
+        nuts_args,
+        perform_minimize,
+        path
+    ):
+    signals, signals_bw = bats.reconcile(t, d, signal_space, signals, signals_bw, nuts_args)
+
+    return signals, signals_bw
+
+
+def run_reconcile_worker_wrapper(config: ReconcileTask):
+    '''
+    Wrapper function for the sample worker to flatten and pass SampleTask dictionary.
+    '''
+    config_dict = {
+        field.name: getattr(config, field.name)
+        for field in fields(config)
+    }
+
+    try:
+        return run_reconcile_worker(**config_dict)
+
+    except BaseException as exc:
+        worker_traceback = traceback.format_exc()
+
+        print(
+            "\n========== WORKER TRACEBACK ==========\n"
+            f"Exception type: {type(exc).__name__}\n"
+            f"Exception: {exc}\n"
+            f"{worker_traceback}"
+            "======================================\n",
+            flush=True,
+        )
+
+        raise RuntimeError(
+            f"Worker failed with {type(exc).__name__}: {exc}\n\n"
+            f"Original worker traceback:\n{worker_traceback}"
+        ) from None
+
+
 def create_deliverables(path, t, d, signals, signal_space):
     model = bats.get_model(t, d, signals)
     amplitudes = bats.get_amplitudes(t, d, signals)
@@ -872,8 +932,11 @@ class Dracula():
             signals: Any,
             signals_bw: Any,
             nuts_args: Optional[NUTSArgs] = None,
+            cores_per_worker: int = 1
         ):
         "Reconciling degenerate signals..."
+
+        pbar = tqdm(total=1)
 
         path = self.path / "reconcile"
         path.mkdir(parents=True, exist_ok=True)
@@ -881,7 +944,72 @@ class Dracula():
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
-        signals, signals_bw = bats.reconcile(self.t, self.d, self.signal_space, signals, signals_bw, nuts_args=nuts_args)
+        context = mp.get_context("spawn")
+        manager = context.Manager()
+        core_queue = manager.Queue()
+
+        task = [
+            self.t,
+            self.d,
+            self.signal_space,
+            signals,
+            signals_bw,
+            nuts_args,
+            self.perform_minimize,
+            path
+        ]
+
+        if cores_per_worker is None:
+            if hasattr(os, "sched_getaffinity"):
+                available_core_ids = sorted(os.sched_getaffinity(0))
+                available_cores = len(available_core_ids)
+            else:
+                available_core_ids = psutil.Process().cpu_affinity()
+                available_cores = len(available_core_ids)
+
+            cores_per_worker = max(
+                1,
+                available_cores // self.max_workers,
+            )
+        else:
+            available_core_ids = psutil.Process().cpu_affinity()
+            available_cores = len(available_core_ids)
+
+        required_cores = self.max_workers * cores_per_worker
+
+        if available_cores < required_cores:
+            raise RuntimeError(
+                f"Need {required_cores} cores, "
+                f"but only {available_cores} are available."
+            )
+
+        for worker_index in range(self.max_workers):
+            start = worker_index * cores_per_worker
+            stop = start + cores_per_worker
+
+            core_queue.put(available_core_ids[start:stop])
+
+        with ProcessPoolExecutor(
+            max_workers=self.max_workers,
+            mp_context=context,
+            initializer=initialize_worker,
+            initargs=(core_queue,),
+        ) as executor:
+            future = executor.submit(
+                run_reconcile_worker_wrapper,
+                task,
+            )
+
+            try:
+                signals, signals_bw = future.result()
+
+            except BaseException as exc:
+                traceback_text = traceback.format_exc()
+
+                raise RuntimeError(
+                    f"Worker failed with {type(exc).__name__}: {exc}\n\n"
+                    f"Worker traceback:\n{traceback_text}"
+                ) from None
 
         create_deliverables(path, self.t, self.d, signals, self.signal_space)
 
@@ -991,5 +1119,8 @@ if __name__ == "__main__":
         fill_order=0,
         nuts_args_sample=nuts_args,
         cores_per_sample_worker=2,
+
+        cores_per_reconcile_worker=3,
+        
         perform_minimize=False,
     )

@@ -388,33 +388,34 @@ def reconcile(
         _, eigenvalues, eigenvectors = get_gram(t, d, signals)
         m = len(signals)
 
-        max_eigenvalue = jnp.max(eigenvalues)
-        min_eigenvalue = jnp.min(eigenvalues)
+        glob_ll_0 = get_glob_ll(t, d, signals)
 
-        k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
+        eigenvector_index = int(jnp.argmax(eigenvalues))
+        eigenvector = eigenvectors[:, eigenvector_index]
 
-        if k2 > k2_threshold:
-            eigenvector_index = int(jnp.argmax(eigenvalues))
-            eigenvector = eigenvectors[:, eigenvector_index]
+        cosine_components = eigenvector[:m]
+        sine_components = eigenvector[m:]
 
-            cosine_components = eigenvector[:m]
-            sine_components = eigenvector[m:]
+        signal_strength = jnp.sqrt(cosine_components ** 2 + sine_components ** 2)
+        signal_index = int(jnp.argmin(signal_strength))
 
-            signal_strength = jnp.sqrt(cosine_components ** 2 + sine_components ** 2)
-            signal_index = int(jnp.argmin(signal_strength))
+        f, k = signals[signal_index]
+        print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
 
-            f, k = signals[signal_index]
-            print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
+        signals_1 = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
+        signals_bw_1 = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
 
-            signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
-            signals_bw = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
+        if nuts_args is not None:
+            signals_1 = nuts(t, d, signal_space, signals_1, signals_bw_1, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
 
-            if nuts_args is not None:
-                signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
+        glob_ll_1 = get_glob_ll(t, d, signals_1)
 
+        if glob_ll_0 < glob_ll_1:
+            signals = signals_1
+            signals_bw = signals_bw_1
         else:
             break
-        
+    
     return signals, signals_bw
 
 def grid_search(
