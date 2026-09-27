@@ -384,11 +384,13 @@ def reconcile(
     signals = list(signals)
     signals_bw = list(signals_bw)
 
-    while True:
+    signals_history = []
+    signals_bw_history = []
+    glob_lls = []
+
+    while len(signals) > 2:
         _, eigenvalues, eigenvectors = get_gram(t, d, signals)
         m = len(signals)
-
-        glob_ll_0 = get_glob_ll(t, d, signals)
 
         eigenvector_index = int(jnp.argmax(eigenvalues))
         eigenvector = eigenvectors[:, eigenvector_index]
@@ -400,23 +402,26 @@ def reconcile(
         signal_index = int(jnp.argmin(signal_strength))
 
         f, k = signals[signal_index]
-        print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
+        print(f"Removed signal with frequency {round(f, 8)} Hz and decay rate {round(k, 8)}.")
 
-        signals_1 = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
-        signals_bw_1 = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
+        signals_history.append(signals)
+        signals_bw_history.append(signals_bw)
+
+        signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
+        signals_bw = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
 
         if nuts_args is not None:
-            signals_1 = nuts(t, d, signal_space, signals_1, signals_bw_1, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
+            signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
 
-        glob_ll_1 = get_glob_ll(t, d, signals_1)
+        signals_history.append(signals)
+        signals_bw_history.append(signals_bw)
+        glob_lls.append(get_glob_ll(t, d, signals))
 
-        if glob_ll_0 < glob_ll_1:
-            signals = signals_1
-            signals_bw = signals_bw_1
-        else:
-            break
+    index = glob_lls.index(max(glob_lls))
+
+    print(f"Reduced to {index + 1} signals!")
     
-    return signals, signals_bw
+    return signals_history[index], signals_bw_history[index]
 
 def grid_search(
         t, 

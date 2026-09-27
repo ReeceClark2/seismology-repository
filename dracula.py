@@ -948,7 +948,7 @@ class Dracula():
         manager = context.Manager()
         core_queue = manager.Queue()
 
-        task = [
+        task = ReconcileTask(
             self.t,
             self.d,
             self.signal_space,
@@ -957,7 +957,7 @@ class Dracula():
             nuts_args,
             self.perform_minimize,
             path
-        ]
+        )
 
         if cores_per_worker is None:
             if hasattr(os, "sched_getaffinity"):
@@ -1029,6 +1029,7 @@ class Dracula():
             nuts_args_sample: Optional[NUTSArgs] = None,
             cores_per_sample_worker: int = 1,
 
+            cores_per_reconcile_worker: int = 1,
             nuts_args_reconcile: Optional[NUTSArgs] = None,
     ):        
         if not grid_search_args:
@@ -1057,6 +1058,7 @@ class Dracula():
             signals=self.signals_sample,
             signals_bw=self.signals_bw_sample,
             nuts_args=nuts_args_reconcile,
+            cores_per_worker=cores_per_reconcile_worker
         )
 
         print("Dracula complete!")
@@ -1121,6 +1123,6 @@ if __name__ == "__main__":
         cores_per_sample_worker=2,
 
         cores_per_reconcile_worker=3,
-        
+
         perform_minimize=False,
     )
