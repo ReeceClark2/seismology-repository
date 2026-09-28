@@ -523,7 +523,6 @@ class Dracula():
             f_max: float,
             k_min: float,
             k_max: float,
-            max_workers: int=1,
             path: str=None
         ):
         '''
@@ -540,8 +539,6 @@ class Dracula():
             k_min=k_min,
             k_max=k_max
         )
-
-        self.max_workers = max_workers
 
         if path is None:
             path = Path.cwd() / "dracula"
@@ -646,7 +643,8 @@ class Dracula():
         if available_cores == 0:
             raise RuntimeError("No CPU cores are available.")
 
-        requested_workers = max(1, self.max_workers)
+        max_workers = available_cores // cores_per_worker
+        requested_workers = max(1, max_workers)
 
         if cores_per_worker is None:
             cores_per_worker = max(
@@ -883,7 +881,8 @@ class Dracula():
         if available_cores == 0:
             raise RuntimeError("No CPU cores are available.")
 
-        requested_workers = max(1, self.max_workers)
+        max_workers = available_cores // cores_per_worker
+        requested_workers = max(1, max_workers)
 
         if cores_per_worker is None:
             cores_per_worker = max(
@@ -1002,10 +1001,6 @@ class Dracula():
         if self.perform_minimize is True:
             signals = bats.minimize(self.t, self.d, self.signal_space, signals)
 
-        context = mp.get_context("spawn")
-        manager = context.Manager()
-        core_queue = manager.Queue()
-
         task = ReconcileTask(
             self.t,
             self.d,
@@ -1017,57 +1012,91 @@ class Dracula():
             path
         )
 
-        if cores_per_worker is None:
-            if hasattr(os, "sched_getaffinity"):
-                available_core_ids = sorted(os.sched_getaffinity(0))
-                available_cores = len(available_core_ids)
-            else:
-                available_core_ids = psutil.Process().cpu_affinity()
-                available_cores = len(available_core_ids)
+        context = mp.get_context("spawn")
 
+        # Determine the cores available to this process.
+        if hasattr(os, "sched_getaffinity"):
+            available_core_ids = sorted(os.sched_getaffinity(0))
+        else:
+            available_core_ids = sorted(
+                psutil.Process().cpu_affinity()
+            )
+
+        available_cores = len(available_core_ids)
+
+        if available_cores == 0:
+            raise RuntimeError("No CPU cores are available.")
+
+        max_workers = available_cores // cores_per_worker
+        requested_workers = max(1, max_workers)
+
+        if cores_per_worker is None:
             cores_per_worker = max(
                 1,
-                available_cores // self.max_workers,
+                available_cores // requested_workers,
             )
-        else:
-            available_core_ids = psutil.Process().cpu_affinity()
-            available_cores = len(available_core_ids)
 
-        required_cores = self.max_workers * cores_per_worker
+        elif cores_per_worker < 1:
+            raise ValueError(
+                "cores_per_worker must be at least 1."
+            )
 
-        if available_cores < required_cores:
+        max_affinity_workers = (
+            available_cores // cores_per_worker
+        )
+
+        if max_affinity_workers < 1:
             raise RuntimeError(
-                f"Need {required_cores} cores, "
-                f"but only {available_cores} are available."
+                f"Each worker requires {cores_per_worker} cores, "
+                f"but only {available_cores} cores are available."
             )
 
-        for worker_index in range(self.max_workers):
-            start = worker_index * cores_per_worker
-            stop = start + cores_per_worker
+        actual_workers = min(
+            requested_workers,
+            max_affinity_workers,
+        )
 
-            core_queue.put(available_core_ids[start:stop])
+        required_cores = actual_workers * cores_per_worker
 
-        with ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=context,
-            initializer=initialize_worker,
-            initargs=(core_queue,),
-        ) as executor:
-            future = executor.submit(
-                run_reconcile_worker_wrapper,
-                task,
-            )
+        print(
+            f"Launching {actual_workers} workers "
+            f"with {cores_per_worker} cores per worker "
+            f"using {required_cores} of {available_cores} available cores."
+        )
 
-            try:
-                signals, signals_bw = future.result()
+        with context.Manager() as manager:
 
-            except BaseException as exc:
-                traceback_text = traceback.format_exc()
+            core_queue = manager.Queue()
 
-                raise RuntimeError(
-                    f"Worker failed with {type(exc).__name__}: {exc}\n\n"
-                    f"Worker traceback:\n{traceback_text}"
-                ) from None
+            for worker_index in range(actual_workers):
+                start = worker_index * cores_per_worker
+                stop = start + cores_per_worker
+
+                worker_core_ids = available_core_ids[start:stop]
+
+                core_queue.put(worker_core_ids)
+
+            with ProcessPoolExecutor(
+                max_workers=actual_workers,
+                mp_context=context,
+                initializer=initialize_worker,
+                initargs=(core_queue,),
+            ) as executor:
+                future = executor.submit(
+                    run_reconcile_worker_wrapper,
+                    task,
+                )
+
+                try:
+                    signals, signals_bw = future.result()
+
+                except BaseException as exc:
+                    traceback_text = traceback.format_exc()
+
+                    raise RuntimeError(
+                        f"Worker failed with {type(exc).__name__}: {exc}\n\n"
+                        f"Worker traceback:\n{traceback_text}"
+                    ) from None
 
         create_deliverables(path, self.t, self.d, signals, self.signal_space)
 
@@ -1144,8 +1173,7 @@ if __name__ == "__main__":
         f_min=3,
         f_max=5,
         k_min=1e-4,
-        k_max=3e-2,
-        max_workers=4,
+        k_max=3e-2
     )
 
     grid_search_args = GridSearchArgs(

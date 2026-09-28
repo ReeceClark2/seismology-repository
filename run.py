@@ -93,12 +93,12 @@ def main():
         f_max=0.0043,
         k_min=1e-5,
         k_max=1e-4,
-        max_workers=8
+        path="end-to-end-2"
     )
 
     grid_search_args = GridSearchArgs(
-        f_points=50,
-        k_points=50
+        f_points=100,
+        k_points=100
     )
     nuts_kwargs = dict(
         target_accept_prob=0.75,
@@ -122,8 +122,8 @@ def main():
         target_accept_prob=0.85,
     )
     mcmc_kwargs = dict(
-        num_warmup=70,
-        num_samples=120,
+        num_warmup=100,
+        num_samples=300,
         num_chains=4,
         chain_method="parallel"
     )
@@ -133,7 +133,7 @@ def main():
         nuts_kwargs=nuts_kwargs,
         mcmc_kwargs=mcmc_kwargs,
         run_kwargs=run_kwargs,
-        seed=18
+        seed=54
     )
 
     nuts_kwargs = dict(
@@ -141,9 +141,9 @@ def main():
         max_tree_depth=(5,5)
     )
     mcmc_kwargs = dict(
-        num_warmup=50,
-        num_samples=50,
-        num_chains=1,
+        num_warmup=60,
+        num_samples=100,
+        num_chains=32,
         chain_method="parallel"
     )
     run_kwargs = dict()
@@ -152,13 +152,13 @@ def main():
         nuts_kwargs=nuts_kwargs,
         mcmc_kwargs=mcmc_kwargs,
         run_kwargs=run_kwargs,
-        seed=18
+        seed=3
     )
 
     model.execute(
-        subband_count=10, 
+        subband_count=3, 
         subband_scaling_factor=1.0,
-        depth=8,
+        depth=25,
         grid_search_args=grid_search_args,
         cores_per_initial_conditions_worker=1,
 
@@ -168,6 +168,7 @@ def main():
         cores_per_sample_worker=4,
 
         nuts_args_reconcile=nuts_args_reconcile,
+        cores_per_reconcile_worker=32,
 
         perform_minimize=False,
     )
