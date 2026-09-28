@@ -378,50 +378,44 @@ def reconcile(
         signals,
         signals_bw,
         nuts_args=None,
-        k2_threshold=1e4
+        k2_threshold=1e3
     ):
 
     signals = list(signals)
     signals_bw = list(signals_bw)
 
-    signals_history = []
-    signals_bw_history = []
-    glob_lls = []
-
-    while len(signals) > 2:
+    while True:
         _, eigenvalues, eigenvectors = get_gram(t, d, signals)
         m = len(signals)
 
-        eigenvector_index = int(jnp.argmax(eigenvalues))
-        eigenvector = eigenvectors[:, eigenvector_index]
+        max_eigenvalue = jnp.max(eigenvalues)
+        min_eigenvalue = jnp.min(eigenvalues)
 
-        cosine_components = eigenvector[:m]
-        sine_components = eigenvector[m:]
+        k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
 
-        signal_strength = jnp.sqrt(cosine_components ** 2 + sine_components ** 2)
-        signal_index = int(jnp.argmin(signal_strength))
+        if k2 > k2_threshold:
+            eigenvector_index = int(jnp.minimum(eigenvalues))
+            eigenvector = eigenvectors[:, eigenvector_index]
 
-        f, k = signals[signal_index]
-        print(f"Removed signal with frequency {round(f, 8)} Hz and decay rate {round(k, 8)}.")
+            cosine_components = eigenvector[:m]
+            sine_components = eigenvector[m:]
 
-        signals_history.append(signals)
-        signals_bw_history.append(signals_bw)
+            signal_strength = jnp.sqrt(cosine_components ** 2 + sine_components ** 2)
+            signal_index = int(jnp.argmax(signal_strength))
 
-        signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
-        signals_bw = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
+            f, k = signals[signal_index]
+            print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
 
-        if nuts_args is not None:
-            signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
+            signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
+            signals_bw = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
 
-        signals_history.append(signals)
-        signals_bw_history.append(signals_bw)
-        glob_lls.append(get_glob_ll(t, d, signals))
+            if nuts_args is not None:
+                signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
 
-    index = glob_lls.index(max(glob_lls))
-
-    print(f"Reduced to {index + 1} signals!")
-    
-    return signals_history[index], signals_bw_history[index]
+        else:
+            break
+        
+    return signals, signals_bw
 
 def grid_search(
         t, 
