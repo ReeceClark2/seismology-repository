@@ -123,7 +123,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         )
 
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
-        signal_candidate_bw = jnp.asarray(get_signal_bw(signal_space)).reshape(1, 2)
+        signal_candidate_bw = jnp.asarray(get_signal_bw(signal_candidate, signal_space)).reshape(1, 2)
 
         if signals is None:
             signals = signal_candidate
@@ -181,14 +181,16 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
-    def get_signal_bw(signal_space):
+    def get_signal_bw(signal, signal_space):
         '''
         Small helper function to return beamwidth of signal. TODO: Make dynamic to individual signal, TODO: Allow the halfwidth to be an argument
         '''
         f_halfwidth = (signal_space.f_max - signal_space.f_min) / 8
         log_k_halfwidth = (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 8
 
-        return (f_halfwidth, log_k_halfwidth)
+        f, k = utils.unpack_signals(signal)
+
+        return (f - f_halfwidth, f + f_halfwidth, jnp.log(k) - log_k_halfwidth, jnp.log(k) + log_k_halfwidth)
 
     glob_lls = []
     noise_variances = []

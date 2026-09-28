@@ -264,26 +264,32 @@ def plot_signal_space(
 
     if signals_0 is not None and signals_bw is not None:
         fs_0, ks_0 = utils.unpack_signals(signals_0)
-        fs_bw, ks_bw = utils.unpack_signals(signals_bw)
 
         fs_0 = np.asarray(fs_0)
         ks_0 = np.asarray(ks_0)
-        fs_bw = np.asarray(fs_bw)
-        ks_bw = np.asarray(ks_bw)
+        fs = np.asarray(fs)
+        ks = np.asarray(ks)
+
+        bounds = np.asarray(signals_bw)
+
+        if bounds.ndim != 2 or bounds.shape != (len(fs), 4):
+            raise ValueError(
+                "signals_bw must have shape (n_signals, 4), with entries "
+                "(f_min, f_max, k_min, k_max)"
+            )
 
         lengths = [
             len(fs_0),
             len(ks_0),
             len(fs),
             len(ks),
-            len(fs_bw),
-            len(ks_bw),
+            len(bounds),
         ]
 
         if len(set(lengths)) != 1:
             raise ValueError(
-                "Signals, reference signals, and bandwidth arrays must "
-                f"have matching lengths. Got lengths: {lengths}"
+                "Signals and reference signals must have matching lengths. "
+                f"Got lengths: {lengths}"
             )
 
         ax.scatter(
@@ -294,14 +300,15 @@ def plot_signal_space(
             zorder=5,
         )
 
-        for f0, k0, f, k, f_bandwidth, k_bandwidth in zip(
+        for f0, k0, f, k, signal_bounds in zip(
             fs_0,
             ks_0,
             fs,
             ks,
-            fs_bw,
-            ks_bw,
+            bounds,
         ):
+            f_min, f_max, k_min, k_max = signal_bounds
+
             rectangle_kwargs = {}
 
             if signal_space is not None:
@@ -316,8 +323,10 @@ def plot_signal_space(
                 ax,
                 f0=f0,
                 k0=k0,
-                f_bandwidth=f_bandwidth,
-                log_k_bandwidth=k_bandwidth,
+                f_min=f_min,
+                f_max=f_max,
+                k_min=k_min,
+                k_max=k_max,
                 facecolor="green",
                 edgecolor="green",
                 alpha=0.15,

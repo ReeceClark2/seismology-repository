@@ -356,17 +356,31 @@ def get_uncertainties(
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
-    b_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
-    b_floor = jnp.finfo(b.dtype).eps * b_scale
-    eigenvalues = jnp.maximum(eigenvalues, b_floor)
+    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
 
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
+    b_scale = jnp.maximum(jnp.max(jnp.abs(b_eigenvalues)), 1.0)
 
-    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
-    
-    signals_uncertainties_flat = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1,))
+    # Ridge regularization
+    alpha = 1e-10
+    ridge = alpha * b_scale
+    effective_eigenvalues = b_eigenvalues + ridge
+
+    sum_sq_data = jnp.sum(d**2)
+    sum_sq_proj = jnp.sum(h**2)
+
+    noise_variance = (
+        sum_sq_data - sum_sq_proj
+    ) / (N - m - 2)
+
+    variance_per_parameter = noise_variance * jnp.sum(
+        b_eigenvectors**2 / effective_eigenvalues[None, :],
+        axis=1,
+    )
+
+    signals_uncertainties_flat = jnp.sqrt(
+        jnp.maximum(variance_per_parameter, 0.0)
+    )
+
     signals_uncertainties = unravel(signals_uncertainties_flat)
 
     return signals_uncertainties
@@ -469,74 +483,53 @@ def grid_search(
     return signal
 
 def bats_model(
-        t: jax.Array,
-        d: jax.Array,
-        f_loc: jax.Array,
-        f_scale: float | jax.Array,
-        k_loc: jax.Array,
-        k_scale: float | jax.Array,
-        f_min: float,
-        f_max: float,
-        k_min: float,
-        k_max: float,
-    ) -> None:
-
-    f_loc = jnp.atleast_1d(jnp.asarray(f_loc))
-    k_loc = jnp.atleast_1d(jnp.asarray(k_loc))
-
-    f_scale = jnp.broadcast_to(
-        jnp.asarray(f_scale, dtype=f_loc.dtype),
-        f_loc.shape,
+    t: jax.Array,
+    d: jax.Array,
+    f_min: jax.Array,
+    f_max: jax.Array,
+    k_min: jax.Array,
+    k_max: jax.Array,
+) -> None:
+    f_min = jnp.atleast_1d(jnp.asarray(f_min))
+    f_max = jnp.broadcast_to(
+        jnp.asarray(f_max, dtype=f_min.dtype),
+        f_min.shape,
     )
 
-    k_scale = jnp.broadcast_to(
-        jnp.asarray(k_scale, dtype=k_loc.dtype),
-        k_loc.shape,
+    k_min = jnp.atleast_1d(jnp.asarray(k_min))
+    k_max = jnp.broadcast_to(
+        jnp.asarray(k_max, dtype=k_min.dtype),
+        k_min.shape,
     )
 
-    # Bounds in ordinary frequency space
-    f_min = jnp.asarray(f_min, dtype=f_loc.dtype)
-    f_max = jnp.asarray(f_max, dtype=f_loc.dtype)
+    if bool(jnp.any(f_min >= f_max)):
+        raise ValueError(
+            f"Empty frequency intervals: "
+            f"low={f_min}, high={f_max}"
+        )
 
-    # k must be positive before converting to log space
-    log_k_min = jnp.log(
-        jnp.asarray(k_min, dtype=k_loc.dtype)
-    )
-    log_k_max = jnp.log(
-        jnp.asarray(k_max, dtype=k_loc.dtype)
-    )
+    if bool(jnp.any(k_min <= 0.0)):
+        raise ValueError(
+            f"Decay-rate lower bounds must be positive: {k_min}"
+        )
 
-    log_k_loc = jnp.log(k_loc)
+    if bool(jnp.any(k_min >= k_max)):
+        raise ValueError(
+            f"Empty decay-rate intervals: "
+            f"low={k_min}, high={k_max}"
+        )
 
-    # Local rectangular region in f space
-    f_low = jnp.maximum(
-        f_loc - f_scale,
-        f_min,
-    )
-    f_high = jnp.minimum(
-        f_loc + f_scale,
-        f_max,
-    )
+    log_k_min = jnp.log(k_min)
+    log_k_max = jnp.log(k_max)
 
-    # Local rectangular region in log(k) space
-    log_k_low = jnp.maximum(
-        log_k_loc - k_scale,
-        log_k_min,
-    )
-    log_k_high = jnp.minimum(
-        log_k_loc + k_scale,
-        log_k_max,
-    )
-
-    # Sample independently from the clipped rectangle
     fs = numpyro.sample(
         "fs",
-        dist.Uniform(f_low, f_high).to_event(1),
+        dist.Uniform(f_min, f_max).to_event(1),
     )
 
     log_ks = numpyro.sample(
         "log_ks",
-        dist.Uniform(log_k_low, log_k_high).to_event(1),
+        dist.Uniform(log_k_min, log_k_max).to_event(1),
     )
 
     ks = numpyro.deterministic(
@@ -555,74 +548,69 @@ def bats_model(
     )
 
 def nuts(
-        t,
-        d,
-        signal_space,
-        signals,
-        signals_bw,
-        nuts_kwargs,
-        mcmc_kwargs,
-        run_kwargs,
-        rng_key_value,
-    ):
+    t,
+    d,
+    signal_space,
+    signals,
+    signals_bw,
+    nuts_kwargs,
+    mcmc_kwargs,
+    run_kwargs,
+    rng_key_value,
+):
     f_init, k_init = utils.unpack_signals(signals)
-
-    f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
 
     f_init = jnp.atleast_1d(jnp.asarray(f_init))
     k_init = jnp.atleast_1d(jnp.asarray(k_init))
 
-    f_bw, k_bw = utils.unpack_signals(signals_bw)
+    bounds = jnp.asarray(signals_bw)
 
-    f_bw = jnp.broadcast_to(
-        jnp.asarray(f_bw, dtype=f_init.dtype),
-        f_init.shape,
-    )
-    k_bw = jnp.broadcast_to(
-        jnp.asarray(k_bw, dtype=k_init.dtype),
-        k_init.shape,
-    )
+    if bounds.ndim != 2 or bounds.shape != (f_init.size, 4):
+        raise ValueError(
+            "signals_bw must have shape (n_signals, 4), with entries "
+            "(f_min, f_max, k_min, k_max)"
+        )
+
+    fs_min = bounds[:, 0].astype(f_init.dtype)
+    fs_max = bounds[:, 1].astype(f_init.dtype)
+    ks_min = bounds[:, 2].astype(k_init.dtype)
+    ks_max = bounds[:, 3].astype(k_init.dtype)
+
+    if bool(jnp.any(fs_min >= fs_max)):
+        raise ValueError(
+            f"Empty frequency intervals: low={fs_min}, high={fs_max}"
+        )
+
+    if bool(jnp.any(ks_min <= 0.0)):
+        raise ValueError(
+            f"Decay-rate lower bounds must be positive: {ks_min}"
+        )
+
+    if bool(jnp.any(ks_min >= ks_max)):
+        raise ValueError(
+            f"Empty decay-rate intervals: low={ks_min}, high={ks_max}"
+        )
 
     log_k_init = jnp.log(k_init)
+    log_ks_min = jnp.log(ks_min)
+    log_ks_max = jnp.log(ks_max)
 
-    f_low = jnp.maximum(f_init - f_bw, f_min)
-    f_high = jnp.minimum(f_init + f_bw, f_max)
-
-    log_k_min = jnp.log(k_min)
-    log_k_max = jnp.log(k_max)
-
-    log_k_low = jnp.maximum(log_k_init - k_bw, log_k_min)
-    log_k_high = jnp.minimum(log_k_init + k_bw, log_k_max)
-
-    if bool(jnp.any(f_low >= f_high)):
-        raise ValueError(
-            f"Empty frequency interval: "
-            f"low={f_low}, high={f_high}"
-        )
-
-    if bool(jnp.any(log_k_low >= log_k_high)):
-        raise ValueError(
-            f"Empty log-k interval: "
-            f"low={log_k_low}, high={log_k_high}"
-        )
-
-    # Keep initial values away from hard Uniform boundaries.
-    f_width = f_high - f_low
-    log_k_width = log_k_high - log_k_low
+    f_width = fs_max - fs_min
+    log_k_width = log_ks_max - log_ks_min
 
     f_eps = 1e-6 * jnp.maximum(f_width, 1.0)
     log_k_eps = 1e-6 * jnp.maximum(log_k_width, 1.0)
 
     f_init_safe = jnp.clip(
         f_init,
-        f_low + f_eps,
-        f_high - f_eps,
+        fs_min + f_eps,
+        fs_max - f_eps,
     )
 
     log_k_init_safe = jnp.clip(
         log_k_init,
-        log_k_low + log_k_eps,
-        log_k_high - log_k_eps,
+        log_ks_min + log_k_eps,
+        log_ks_max - log_k_eps,
     )
 
     signals_init = jnp.stack(
@@ -668,13 +656,11 @@ def nuts(
         t=t,
         d=d,
         f_loc=f_init,
-        f_scale=f_bw,
         k_loc=k_init,
-        k_scale=k_bw,
-        f_min=f_min,
-        f_max=f_max,
-        k_min=k_min,
-        k_max=k_max,
+        fs_min=fs_min,
+        fs_max=fs_max,
+        ks_min=ks_min,
+        ks_max=ks_max,
         extra_fields=("potential_energy",),
         **run_kwargs,
     )
@@ -685,7 +671,6 @@ def nuts(
     potential_energy = extra_fields["potential_energy"]
 
     best_flat_index = jnp.argmin(potential_energy.ravel())
-
     chain_index, draw_index = jnp.unravel_index(
         best_flat_index,
         potential_energy.shape,
@@ -698,6 +683,7 @@ def nuts(
         (best_fs, best_ks),
         axis=-1,
     )
+
 
 def minimize(
         t,
