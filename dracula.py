@@ -632,77 +632,106 @@ class Dracula():
         task_results_by_index = {}
 
         context = mp.get_context("spawn")
-        manager = context.Manager()
-        core_queue = manager.Queue()
+
+        # Determine the cores available to this process.
+        if hasattr(os, "sched_getaffinity"):
+            available_core_ids = sorted(os.sched_getaffinity(0))
+        else:
+            available_core_ids = sorted(
+                psutil.Process().cpu_affinity()
+            )
+
+        available_cores = len(available_core_ids)
+
+        if available_cores == 0:
+            raise RuntimeError("No CPU cores are available.")
+
+        requested_workers = max(1, self.max_workers)
 
         if cores_per_worker is None:
-            if hasattr(os, "sched_getaffinity"):
-                available_core_ids = sorted(os.sched_getaffinity(0))
-                available_cores = len(available_core_ids)
-            else:
-                available_core_ids = psutil.Process().cpu_affinity()
-                available_cores = len(available_core_ids)
-
             cores_per_worker = max(
                 1,
-                available_cores // self.max_workers,
+                available_cores // requested_workers,
             )
-        else:
-            available_core_ids = psutil.Process().cpu_affinity()
-            available_cores = len(available_core_ids)
 
-        required_cores = self.max_workers * cores_per_worker
+        elif cores_per_worker < 1:
+            raise ValueError(
+                "cores_per_worker must be at least 1."
+            )
 
-        if available_cores < required_cores:
+        max_affinity_workers = (
+            available_cores // cores_per_worker
+        )
+
+        if max_affinity_workers < 1:
             raise RuntimeError(
-                f"Need {required_cores} cores, "
-                f"but only {available_cores} are available."
+                f"Each worker requires {cores_per_worker} cores, "
+                f"but only {available_cores} cores are available."
             )
 
-        for worker_index in range(self.max_workers):
-            start = worker_index * cores_per_worker
-            stop = start + cores_per_worker
+        actual_workers = min(
+            requested_workers,
+            max_affinity_workers,
+        )
 
-            core_queue.put(available_core_ids[start:stop])
+        required_cores = actual_workers * cores_per_worker
 
-        with ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=context,
-            initializer=initialize_worker,
-            initargs=(core_queue,),
-        ) as executor:
-            future_to_index = {
-                executor.submit(
-                    run_initial_conditions_worker_wrapper,
-                    task,
-                ): i
-                for i, task in enumerate(tasks)
-            }
+        print(
+            f"Launching {actual_workers} workers "
+            f"with {cores_per_worker} cores per worker "
+            f"using {required_cores} of {available_cores} available cores."
+        )
 
-            for future in as_completed(future_to_index):
-                pbar.update(1)
-                task_index = future_to_index[future]
+        with context.Manager() as manager:
 
-                try:
-                    result = future.result()
+            core_queue = manager.Queue()
 
-                    if result is not None:
-                        result["subband_index"] = task_index
-                        task_results_by_index[task_index] = result
+            for worker_index in range(actual_workers):
+                start = worker_index * cores_per_worker
+                stop = start + cores_per_worker
 
-                except BaseException as exc:
-                    traceback_text = traceback.format_exc()
+                worker_core_ids = available_core_ids[start:stop]
 
-                    print(
-                        f"\nWorker failed with {type(exc).__name__}: {exc}\n"
-                        f"{traceback_text}",
-                        flush=True,
-                    )
+                core_queue.put(worker_core_ids)
 
-                    raise RuntimeError(
-                        f"{type(exc).__name__}: {exc}\n\n"
-                        f"Worker traceback:\n{traceback_text}"
-                    ) from None
+            with ProcessPoolExecutor(
+                max_workers=actual_workers,
+                mp_context=context,
+                initializer=initialize_worker,
+                initargs=(core_queue,),
+            ) as executor:
+                future_to_index = {
+                    executor.submit(
+                        run_initial_conditions_worker_wrapper,
+                        task,
+                    ): i
+                    for i, task in enumerate(tasks)
+                }
+
+                for future in as_completed(future_to_index):
+                    pbar.update(1)
+                    task_index = future_to_index[future]
+
+                    try:
+                        result = future.result()
+
+                        if result is not None:
+                            result["subband_index"] = task_index
+                            task_results_by_index[task_index] = result
+
+                    except BaseException as exc:
+                        traceback_text = traceback.format_exc()
+
+                        print(
+                            f"\nWorker failed with {type(exc).__name__}: {exc}\n"
+                            f"{traceback_text}",
+                            flush=True,
+                        )
+
+                        raise RuntimeError(
+                            f"{type(exc).__name__}: {exc}\n\n"
+                            f"Worker traceback:\n{traceback_text}"
+                        ) from None
 
         ordered_results = [
             task_results_by_index[i]
@@ -840,82 +869,111 @@ class Dracula():
         results_by_signal = defaultdict(list)
 
         context = mp.get_context("spawn")
-        manager = context.Manager()
-        core_queue = manager.Queue()
+
+        # Determine the cores available to this process.
+        if hasattr(os, "sched_getaffinity"):
+            available_core_ids = sorted(os.sched_getaffinity(0))
+        else:
+            available_core_ids = sorted(
+                psutil.Process().cpu_affinity()
+            )
+
+        available_cores = len(available_core_ids)
+
+        if available_cores == 0:
+            raise RuntimeError("No CPU cores are available.")
+
+        requested_workers = max(1, self.max_workers)
 
         if cores_per_worker is None:
-            if hasattr(os, "sched_getaffinity"):
-                available_core_ids = sorted(os.sched_getaffinity(0))
-                available_cores = len(available_core_ids)
-            else:
-                available_core_ids = psutil.Process().cpu_affinity()
-                available_cores = len(available_core_ids)
-
             cores_per_worker = max(
                 1,
-                available_cores // self.max_workers,
+                available_cores // requested_workers,
             )
-        else:
-            available_core_ids = psutil.Process().cpu_affinity()
-            available_cores = len(available_core_ids)
 
-        required_cores = self.max_workers * cores_per_worker
+        elif cores_per_worker < 1:
+            raise ValueError(
+                "cores_per_worker must be at least 1."
+            )
 
-        if available_cores < required_cores:
+        max_affinity_workers = (
+            available_cores // cores_per_worker
+        )
+
+        if max_affinity_workers < 1:
             raise RuntimeError(
-                f"Need {required_cores} cores, "
-                f"but only {available_cores} are available."
+                f"Each worker requires {cores_per_worker} cores, "
+                f"but only {available_cores} cores are available."
             )
 
-        for worker_index in range(self.max_workers):
-            start = worker_index * cores_per_worker
-            stop = start + cores_per_worker
+        actual_workers = min(
+            requested_workers,
+            max_affinity_workers,
+        )
 
-            core_queue.put(available_core_ids[start:stop])
+        required_cores = actual_workers * cores_per_worker
 
-        with ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=context,
-            initializer=initialize_worker,
-            initargs=(core_queue,),
-        ) as executor:
-            future_to_task_index = {
-                executor.submit(
-                    run_sample_worker_wrapper,
-                    task,
-                ): task_index
-                for task_index, task in enumerate(tasks)
-            }
+        print(
+            f"Launching {actual_workers} workers "
+            f"with {cores_per_worker} cores per worker "
+            f"using {required_cores} of {available_cores} available cores."
+        )
 
-            for future in as_completed(future_to_task_index):
-                pbar.update(1)
+        with context.Manager() as manager:
 
-                task_index = future_to_task_index[future]
+            core_queue = manager.Queue()
 
-                try:
-                    indexed_results = future.result()
+            for worker_index in range(actual_workers):
+                start = worker_index * cores_per_worker
+                stop = start + cores_per_worker
 
-                    for signal_index, result in indexed_results:
-                        results_by_signal[signal_index].append({
-                            "task_index": task_index,
-                            "result": result,
-                        })
+                worker_core_ids = available_core_ids[start:stop]
 
-                except BaseException as exc:
-                    traceback_text = traceback.format_exc()
+                core_queue.put(worker_core_ids)
 
-                    print(
-                        f"\nWorker failed for task {task_index}: "
-                        f"{type(exc).__name__}: {exc}\n"
-                        f"{traceback_text}",
-                        flush=True,
-                    )
+            with ProcessPoolExecutor(
+                max_workers=actual_workers,
+                mp_context=context,
+                initializer=initialize_worker,
+                initargs=(core_queue,),
+            ) as executor:
+                future_to_task_index = {
+                    executor.submit(
+                        run_sample_worker_wrapper,
+                        task,
+                    ): task_index
+                    for task_index, task in enumerate(tasks)
+                }
 
-                    raise RuntimeError(
-                        f"Task {task_index} failed with "
-                        f"{type(exc).__name__}: {exc}\n\n"
-                        f"Worker traceback:\n{traceback_text}"
-                    ) from None
+                for future in as_completed(future_to_task_index):
+                    pbar.update(1)
+
+                    task_index = future_to_task_index[future]
+
+                    try:
+                        indexed_results = future.result()
+
+                        for signal_index, result in indexed_results:
+                            results_by_signal[signal_index].append({
+                                "task_index": task_index,
+                                "result": result,
+                            })
+
+                    except BaseException as exc:
+                        traceback_text = traceback.format_exc()
+
+                        print(
+                            f"\nWorker failed for task {task_index}: "
+                            f"{type(exc).__name__}: {exc}\n"
+                            f"{traceback_text}",
+                            flush=True,
+                        )
+
+                        raise RuntimeError(
+                            f"Task {task_index} failed with "
+                            f"{type(exc).__name__}: {exc}\n\n"
+                            f"Worker traceback:\n{traceback_text}"
+                        ) from None
         
         self.results = results_by_signal
         self.signals_sample = utils.unpack_signal_results(self.results)
