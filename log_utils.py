@@ -94,8 +94,6 @@ def add_log_rectangle(
     ax,
     f0,
     k0,
-    f_bandwidth,
-    log_k_bandwidth,
     f_min=None,
     f_max=None,
     k_min=None,
@@ -104,8 +102,6 @@ def add_log_rectangle(
 ):
     f0 = float(f0)
     k0 = float(k0)
-    f_bandwidth = float(f_bandwidth)
-    log_k_bandwidth = float(log_k_bandwidth)
 
     if k0 <= 0:
         raise ValueError("k0 must be strictly positive.")
@@ -116,21 +112,11 @@ def add_log_rectangle(
     if k_max is not None and k_max <= 0:
         raise ValueError("k_max must be strictly positive.")
 
-    # Rectangle bounds in frequency space
-    f_left = f0 - f_bandwidth
-    f_right = f0 + f_bandwidth
-
     if f_min is not None:
         f_left = max(f_left, f_min)
 
     if f_max is not None:
         f_right = min(f_right, f_max)
-
-    # Rectangle bounds in log(k) space
-    log_k0 = np.log(k0)
-
-    log_k_bottom = log_k0 - log_k_bandwidth
-    log_k_top = log_k0 + log_k_bandwidth
 
     if k_min is not None:
         log_k_bottom = max(log_k_bottom, np.log(k_min))
