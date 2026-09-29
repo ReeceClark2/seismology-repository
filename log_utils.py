@@ -256,8 +256,6 @@ def plot_signal_space(
 
             add_log_rectangle(
                 ax,
-                f0=f0,
-                k0=k0,
                 f_min=f_min,
                 f_max=f_max,
                 k_min=k_min,

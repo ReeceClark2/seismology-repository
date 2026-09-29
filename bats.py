@@ -392,7 +392,7 @@ def reconcile(
         signals,
         signals_bw,
         nuts_args=None,
-        k2_threshold=1e3
+        k2_threshold=1e2
     ):
 
     signals = list(signals)
@@ -502,23 +502,6 @@ def bats_model(
         k_min.shape,
     )
 
-    if bool(jnp.any(f_min >= f_max)):
-        raise ValueError(
-            f"Empty frequency intervals: "
-            f"low={f_min}, high={f_max}"
-        )
-
-    if bool(jnp.any(k_min <= 0.0)):
-        raise ValueError(
-            f"Decay-rate lower bounds must be positive: {k_min}"
-        )
-
-    if bool(jnp.any(k_min >= k_max)):
-        raise ValueError(
-            f"Empty decay-rate intervals: "
-            f"low={k_min}, high={k_max}"
-        )
-
     log_k_min = jnp.log(k_min)
     log_k_max = jnp.log(k_max)
 
@@ -581,19 +564,14 @@ def nuts(
             f"Empty frequency intervals: low={fs_min}, high={fs_max}"
         )
 
-    if bool(jnp.any(ks_min <= 0.0)):
-        raise ValueError(
-            f"Decay-rate lower bounds must be positive: {ks_min}"
-        )
-
     if bool(jnp.any(ks_min >= ks_max)):
         raise ValueError(
             f"Empty decay-rate intervals: low={ks_min}, high={ks_max}"
         )
 
     log_k_init = jnp.log(k_init)
-    log_ks_min = jnp.log(ks_min)
-    log_ks_max = jnp.log(ks_max)
+    log_ks_min = ks_min
+    log_ks_max = ks_max
 
     f_width = fs_max - fs_min
     log_k_width = log_ks_max - log_ks_min
@@ -655,12 +633,10 @@ def nuts(
         jax.random.PRNGKey(int(rng_key_value)),
         t=t,
         d=d,
-        f_loc=f_init,
-        k_loc=k_init,
-        fs_min=fs_min,
-        fs_max=fs_max,
-        ks_min=ks_min,
-        ks_max=ks_max,
+        f_min=fs_min,
+        f_max=fs_max,
+        k_min=ks_min,
+        k_max=ks_max,
         extra_fields=("potential_energy",),
         **run_kwargs,
     )

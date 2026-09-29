@@ -92,8 +92,7 @@ def main():
         f_min=0.0027,
         f_max=0.0043,
         k_min=1e-5,
-        k_max=1e-4,
-        path="end-to-end-2"
+        k_max=1e-4
     )
 
     grid_search_args = GridSearchArgs(
