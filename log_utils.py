@@ -92,62 +92,21 @@ def plot_probability_surface(path, probability_surface, title):
 
 def add_log_rectangle(
     ax,
-    f0,
-    k0,
-    f_min=None,
-    f_max=None,
-    k_min=None,
-    k_max=None,
+    f_min,
+    f_max,
+    k_min,
+    k_max,
     **kwargs,
 ):
-    f0 = float(f0)
-    k0 = float(k0)
-
-    if k0 <= 0:
-        raise ValueError("k0 must be strictly positive.")
-
-    if k_min is not None and k_min <= 0:
-        raise ValueError("k_min must be strictly positive.")
-
-    if k_max is not None and k_max <= 0:
-        raise ValueError("k_max must be strictly positive.")
-
-    if f_min is not None:
-        f_left = max(f_left, f_min)
-
-    if f_max is not None:
-        f_right = min(f_right, f_max)
-
-    if k_min is not None:
-        log_k_bottom = max(log_k_bottom, np.log(k_min))
-
-    if k_max is not None:
-        log_k_top = min(log_k_top, np.log(k_max))
-
-    # Transform back to ordinary k coordinates for plotting
-    k_bottom = np.exp(log_k_bottom)
-    k_top = np.exp(log_k_top)
-
-    if f_left >= f_right:
-        raise ValueError(
-            "The rectangle has no valid frequency width after clipping."
-        )
-
-    if k_bottom >= k_top:
-        raise ValueError(
-            "The rectangle has no valid decay-rate height after clipping."
-        )
-
     rectangle = Rectangle(
-        xy=(f_left, k_bottom),
-        width=f_right - f_left,
-        height=k_top - k_bottom,
+        (f_min, k_min),
+        f_max - f_min,
+        k_max - k_min,
         **kwargs,
     )
 
     ax.add_patch(rectangle)
     return rectangle
-
 
 def plot_signal_space(
     path,
@@ -295,16 +254,6 @@ def plot_signal_space(
         ):
             f_min, f_max, k_min, k_max = signal_bounds
 
-            rectangle_kwargs = {}
-
-            if signal_space is not None:
-                rectangle_kwargs = {
-                    "f_min": signal_space.f_min,
-                    "f_max": signal_space.f_max,
-                    "k_min": signal_space.k_min,
-                    "k_max": signal_space.k_max,
-                }
-
             add_log_rectangle(
                 ax,
                 f0=f0,
@@ -317,8 +266,7 @@ def plot_signal_space(
                 edgecolor="green",
                 alpha=0.15,
                 linewidth=1,
-                zorder=1,
-                **rectangle_kwargs,
+                zorder=1
             )
 
             ax.plot(

@@ -123,7 +123,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         )
 
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
-        signal_candidate_bw = jnp.asarray(get_signal_bw(signal_candidate, signal_space)).reshape(1, 2)
+        signal_candidate_bw = jnp.asarray(get_signal_bw(signal_candidate, signal_space)).reshape(1, 4)
 
         if signals is None:
             signals = signal_candidate
