@@ -63,11 +63,7 @@ def observed_data(
 
 def main():
     network = "IU"
-    stations = [
-        "KIP", "ANMO", "COLA", "COR", "HRV",
-        "KONO", "PFO", "POHA", "RSSD", "TUC",
-        "BILL", "FFC", "MAJO", "TATO", "TROM"
-    ]
+    station = "KIP"
     location = "00"
     channel = "LHZ"
     stream_index = 0
@@ -78,29 +74,17 @@ def main():
     f_min = 0.003
     f_max = 0.004
 
-    t = None
-    d_product = None
-
-    for station in stations:
-        t_station, d_station = observed_data(
-            network=network,
-            station=station,
-            channel=channel,
-            location=location,
-            stream_index=stream_index,
-            start_time=start_time,
-            end_time=end_time,
-            min_f=f_min,
-            max_f=f_max,
-        )
-
-        if t is None:
-            t = t_station
-            d_product = np.asarray(d_station)
-        else:
-            d_product *= np.asarray(d_station)
-
-    d = d_product
+    t, d = observed_data(
+        network=network,
+        station=station,
+        channel=channel,
+        location=location,
+        stream_index=stream_index,
+        start_time=start_time,
+        end_time=end_time,
+        min_f=f_min,
+        max_f=f_max,
+    )
 
     model = Dracula(
         t, 
