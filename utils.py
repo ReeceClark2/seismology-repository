@@ -53,6 +53,89 @@ def unpack_signals(signals):
 
     return fs, ks
 
+
+def get_signal_bounds(
+    signals,
+    signal_space,
+    f_fraction=1 / 8,
+    log_k_fraction=1 / 8,
+):
+    fs, ks = unpack_signals(signals)
+
+    fs = jnp.asarray(fs)
+    ks = jnp.asarray(ks)
+
+    if signal_space.f_max <= signal_space.f_min:
+        raise ValueError("signal_space.f_max must exceed f_min")
+
+    if signal_space.k_min <= 0:
+        raise ValueError("signal_space.k_min must be positive")
+
+    if signal_space.k_max <= signal_space.k_min:
+        raise ValueError("signal_space.k_max must exceed k_min")
+
+    if bool(jnp.any(fs < signal_space.f_min)) or bool(
+        jnp.any(fs > signal_space.f_max)
+    ):
+        raise ValueError(
+            "Signal frequencies must lie inside signal_space."
+        )
+
+    if bool(jnp.any(ks < signal_space.k_min)) or bool(
+        jnp.any(ks > signal_space.k_max)
+    ):
+        raise ValueError(
+            "Signal decay rates must lie inside signal_space."
+        )
+
+    frequency_halfwidth = (
+        f_fraction
+        * (signal_space.f_max - signal_space.f_min)
+    )
+
+    log_k_space_min = jnp.log(signal_space.k_min)
+    log_k_space_max = jnp.log(signal_space.k_max)
+
+    log_k_halfwidth = (
+        log_k_fraction
+        * (log_k_space_max - log_k_space_min)
+    )
+
+    frequency_min = jnp.maximum(
+        fs - frequency_halfwidth,
+        signal_space.f_min,
+    )
+    frequency_max = jnp.minimum(
+        fs + frequency_halfwidth,
+        signal_space.f_max,
+    )
+
+    log_ks = jnp.log(ks)
+
+    log_k_min = jnp.maximum(
+        log_ks - log_k_halfwidth,
+        log_k_space_min,
+    )
+    log_k_max = jnp.minimum(
+        log_ks + log_k_halfwidth,
+        log_k_space_max,
+    )
+
+    # Store physical decay-rate bounds.
+    decay_rate_min = jnp.exp(log_k_min)
+    decay_rate_max = jnp.exp(log_k_max)
+
+    return jnp.stack(
+        (
+            frequency_min,
+            frequency_max,
+            decay_rate_min,
+            decay_rate_max,
+        ),
+        axis=-1,
+    )
+
+
 def is_signal_detected(probability_surface, log_prob=None, n=5):
     _, _, log_prob_space = probability_surface
     log_prob_space = log_prob_space.ravel()

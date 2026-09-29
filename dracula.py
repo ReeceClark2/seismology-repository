@@ -103,7 +103,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             nuts_args=None,
             perform_minimize=False,
             signals=None,
-            signals_bw=None,
+            signals_bounds=None,
             model=None,
         ):
         '''
@@ -123,16 +123,16 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         )
 
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
-        signal_candidate_bw = jnp.asarray(get_signal_bw(signal_candidate, signal_space)).reshape(1, 4)
+        signal_candidate_bounds = utils.get_signal_bounds(signal_candidate, signal_space)
 
         if signals is None:
             signals = signal_candidate
             signals_0 = signal_candidate
-            signals_bw = signal_candidate_bw
+            signals_bounds = signal_candidate_bounds
         else:
             signals = jnp.asarray(signals).reshape(-1, 2)
             signals_0 = jnp.concatenate((signals, signal_candidate), axis=0)
-            signals_bw = jnp.concatenate((signals_bw, signal_candidate_bw), axis=0)
+            signals_bounds = jnp.concatenate((signals_bounds, signal_candidate_bounds), axis=0)
             signals = signals_0
         if model is not None:
             d = d + model
@@ -143,7 +143,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
                 d, 
                 signal_space,
                 signals, 
-                signals_bw, 
+                signals_bounds, 
                 nuts_args.nuts_kwargs, 
                 nuts_args.mcmc_kwargs, 
                 nuts_args.run_kwargs, 
@@ -159,11 +159,11 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             )
 
         log_utils.plot_probability_surface(path / f"{len(signals)}_probability_surface.png", probability_surface, f"Probability Surface of Signal {len(signals)}")
-        log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signals_bw, signal_space=signal_space)
+        log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bounds=signals_bounds, signal_space=signal_space)
 
-        return signals, signals_bw
+        return signals, signals_bounds
 
-    # subband_bw = signal_space.f_max - signal_space.f_min
+    # subband_bounds = signal_space.f_max - signal_space.f_min
 
     subband_t = t.copy()
     subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
@@ -181,22 +181,11 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
-    def get_signal_bw(signal, signal_space):
-        '''
-        Small helper function to return beamwidth of signal. TODO: Make dynamic to individual signal, TODO: Allow the halfwidth to be an argument
-        '''
-        f_halfwidth = (signal_space.f_max - signal_space.f_min) / 8
-        log_k_halfwidth = (jnp.log(signal_space.k_max) - jnp.log(signal_space.k_min)) / 8
-
-        f, k = utils.unpack_signals(signal)
-
-        return (f - f_halfwidth, f + f_halfwidth, jnp.log(k) - log_k_halfwidth, jnp.log(k) + log_k_halfwidth)
-
     glob_lls = []
     noise_variances = []
     snrs = []
 
-    signals, signals_bw = update_signals(
+    signals, signals_bounds = update_signals(
         subband_t,
         subband_d,
         signal_space,
@@ -207,8 +196,8 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
     signals_by_depth = {}
     signals_by_depth[len(signals)] = deepcopy(signals)
-    signals_bw_by_depth = {}
-    signals_bw_by_depth[len(signals_bw)] = deepcopy(signals_bw)
+    signals_bounds_by_depth = {}
+    signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
 
     glob_lls.append(bats.get_glob_ll(t, d, signals))
     noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
@@ -220,7 +209,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
 
     reason = "depth"
     while True:
-        signals, signals_bw = update_signals(
+        signals, signals_bounds = update_signals(
             subband_t,
             subband_d,
             signal_space,
@@ -228,7 +217,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
             nuts_args,
             perform_minimize=perform_minimize,
             signals=signals,
-            signals_bw=signals_bw,
+            signals_bounds=signals_bounds,
             model=model,
         )
 
@@ -237,7 +226,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model)
 
         signals_by_depth[len(signals)] = deepcopy(signals)
-        signals_bw_by_depth[len(signals_bw)] = deepcopy(signals_bw)
+        signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
         noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
         snrs.append(bats.get_snr(subband_t, subband_d, signals))
         glob_lls.append(bats.get_glob_ll(t, d, signals))
@@ -251,13 +240,13 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
     stop = index + 1
 
     signals = deepcopy(signals_by_depth[stop])
-    signals_bw = deepcopy(signals_bw_by_depth[stop])
+    signals_bounds = deepcopy(signals_bounds_by_depth[stop])
     noise_variances = noise_variances[:stop]
     snrs = snrs[:stop]
     glob_lls = glob_lls[:stop]
 
     signals = deepcopy(signals_by_depth[len(signals)])
-    signals_bw = deepcopy(signals_bw_by_depth[len(signals_bw)])
+    signals_bounds = deepcopy(signals_bounds_by_depth[len(signals_bounds)])
 
     noise_variance = bats.get_noise_variance(subband_t, subband_d, signals)
     snr = bats.get_snr(subband_t, subband_d, signals)
@@ -267,7 +256,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         "f_min": signal_space.f_min,
         "f_max": signal_space.f_max,
         "signals": signals,
-        "signals_bw": signals_bw,
+        "signals_bounds": signals_bounds,
         "noise_variance": noise_variance,
         "snr": snr,
         "glob_ll": glob_ll,
@@ -312,7 +301,7 @@ class SampleTask:
     d: ArrayLike
     signal_space: SignalSpace
     signals: Any
-    signals_bw: Any
+    signals_bounds: Any
     signal_indices: list[int]
     nuts_args: NUTSArgs
     perform_minimize: bool
@@ -324,7 +313,7 @@ def run_sample_worker(
     d,
     signal_space,
     signals,
-    signals_bw,
+    signals_bounds,
     signal_indices,
     nuts_args,
     perform_minimize,
@@ -353,7 +342,7 @@ def run_sample_worker(
         d,
         signal_space,
         signals,
-        signals_bw,
+        signals_bounds,
         nuts_args.nuts_kwargs,
         nuts_args.mcmc_kwargs,
         nuts_args.run_kwargs,
@@ -367,7 +356,7 @@ def run_sample_worker(
             signals
         )
 
-    log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bw=signals_bw, signal_space=signal_space)
+    log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bounds=signals_bounds, signal_space=signal_space)
 
     model = bats.get_model(t, d, signals)
     log_utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
@@ -416,7 +405,7 @@ class ReconcileTask:
     d: ArrayLike
     signal_space: SignalSpace
     signals: Any
-    signals_bw: Any
+    signals_bounds: Any
     nuts_args: NUTSArgs
     perform_minimize: bool
     path: str
@@ -427,14 +416,14 @@ def run_reconcile_worker(
         d,
         signal_space,
         signals,
-        signals_bw,
+        signals_bounds,
         nuts_args,
         perform_minimize,
         path
     ):
-    signals, signals_bw = bats.reconcile(t, d, signal_space, signals, signals_bw, nuts_args)
+    signals, signals_bounds = bats.reconcile(t, d, signal_space, signals, signals_bounds, nuts_args)
 
-    return signals, signals_bw
+    return signals, signals_bounds
 
 
 def run_reconcile_worker_wrapper(config: ReconcileTask):
@@ -467,7 +456,7 @@ def run_reconcile_worker_wrapper(config: ReconcileTask):
         ) from None
 
 
-def create_deliverables(path, t, d, signals, signal_space):
+def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
     model = bats.get_model(t, d, signals)
     amplitudes = bats.get_amplitudes(t, d, signals)
     uncertainties = bats.get_uncertainties(t, d, signals)
@@ -498,6 +487,7 @@ def create_deliverables(path, t, d, signals, signal_space):
         signals,
         f"Signal Space ({len(signals)} signal model)", 
         uncertainties=uncertainties,
+        signals_bounds=signals_bounds,
         signal_space=signal_space
     )
 
@@ -745,21 +735,21 @@ class Dracula():
             )
         )
 
-        signals_bw_init = list(
+        signals_bounds_init = list(
             chain.from_iterable(
-                result["signals_bw"]
+                result["signals_bounds"]
                 for result in ordered_results
             )
         )
 
-        signals_and_bw = sorted(
-            zip(signals_init, signals_bw_init),
+        signals_and_bounds = sorted(
+            zip(signals_init, signals_bounds_init),
             key=lambda pair: pair[0][0],  
         )
 
-        self.signals_init, self.signals_bw_init = map(
+        self.signals_init, self.signals_bounds_init = map(
             list,
-            zip(*signals_and_bw)
+            zip(*signals_and_bounds)
         )
 
         self.signals_by_subband = {
@@ -767,7 +757,7 @@ class Dracula():
                 "f_min": result["f_min"],
                 "f_max": result["f_max"],
                 "signals": result["signals"],
-                "signals_bw": result["signals_bw"],
+                "signals_bounds": result["signals_bounds"],
                 "noise_variance": result["noise_variance"],
                 "snr": result["snr"],
                 "glob_ll": result["glob_ll"],
@@ -778,7 +768,13 @@ class Dracula():
 
         log_utils.save_initialize_csv(path / "all_subband_results.csv", signals_by_subband=self.signals_by_subband)
 
-        create_deliverables(path, self.t, self.d, self.signals_init, self.signal_space)
+        create_deliverables(
+            path,
+            self.t,
+            self.d,
+            self.signals_init,
+            self.signal_space
+        )
 
         if self.signals_init:
             print(f"\nFound {len(self.signals_init)} signals!")
@@ -792,7 +788,7 @@ class Dracula():
     def sample(
             self,
             signals: Any,
-            signals_bw: Any,
+            signals_bounds: Any,
             nuts_args: NUTSArgs,
             signals_per_block: int = 10,
             fill_order: int = 0,
@@ -824,32 +820,44 @@ class Dracula():
 
             signal_indices = list(range(start, stop))
             signal_block = signals[start:stop]
-            signals_bw_block = signals_bw[start:stop]
+            signals_bounds_block = signals_bounds[start:stop]
 
-            if ind == 0:
-                f_min = self.signal_space.f_min
-            else:
-                # Boundary computed from the previous block's last signal
-                # and this block's first signal
-                previous_stop = min(start, n_signals)
-                f_min = (
-                    signals[previous_stop - 1][0] +
-                    signals[previous_stop][0]
-                ) / 2
+            block_bounds = np.asarray(signals_bounds_block, dtype=float)
 
-            if ind == blocks - 1 or stop >= n_signals:
-                f_max = self.signal_space.f_max
-            else:
-                f_max = (
-                    signals[stop - 1][0] +
-                    signals[stop][0]
-                ) / 2
+            if block_bounds.ndim != 2 or block_bounds.shape != (
+                len(signal_block),
+                4,
+            ):
+                raise ValueError(
+                    "signals_bounds_block must have shape "
+                    "(n_block_signals, 4), with entries "
+                    "(f_min, f_max, k_min, k_max). "
+                    f"Got {block_bounds.shape}."
+                )
+
+            # Use the union of all persistent frequency bounds in this block,
+            # clipped to the overall signal space.
+            f_min = max(
+                self.signal_space.f_min,
+                float(np.min(block_bounds[:, 0])),
+            )
+
+            f_max = min(
+                self.signal_space.f_max,
+                float(np.max(block_bounds[:, 1])),
+            )
+
+            if f_min >= f_max:
+                raise ValueError(
+                    f"Block {ind} has an empty frequency interval: "
+                    f"f_min={f_min}, f_max={f_max}."
+                )
 
             signal_space = SignalSpace(
                 f_min=f_min,
                 f_max=f_max,
                 k_min=self.signal_space.k_min,
-                k_max=self.signal_space.k_max
+                k_max=self.signal_space.k_max,
             )
 
             tasks.append(
@@ -858,11 +866,11 @@ class Dracula():
                     d=self.d,
                     signal_space=signal_space,
                     signals=signal_block,
-                    signals_bw=signals_bw_block,
+                    signals_bounds=signals_bounds_block,
                     signal_indices=signal_indices,
                     nuts_args=nuts_args,
                     perform_minimize=self.perform_minimize,
-                    path=path / f"block_{ind + 1}r{blocks}"
+                    path=path / f"block_{ind + 1}r{blocks}",
                 )
             )
 
@@ -978,18 +986,25 @@ class Dracula():
         
         self.results = results_by_signal
         self.signals_sample = utils.unpack_signal_results(self.results)
-        self.signals_bw_sample = self.signals_bw_init
+        self.signals_bounds_sample = self.signals_bounds_init
 
         uncertainties = bats.get_uncertainties(self.t, self.d, self.signals_sample)
         log_utils.save_report_csv(path / "report.csv", self.results, uncertainties)
 
-        create_deliverables(path, self.t, self.d, self.signals_sample, self.signal_space)
+        create_deliverables(
+            path,
+            self.t,
+            self.d,
+            self.signals_sample,
+            self.signal_space,
+            signals_bounds=self.signals_bounds_sample,
+        )
 
 
     def reconcile(
             self, 
             signals: Any,
-            signals_bw: Any,
+            signals_bounds: Any,
             nuts_args: Optional[NUTSArgs] = None,
             cores_per_worker: int = 1
         ):
@@ -1008,7 +1023,7 @@ class Dracula():
             self.d,
             self.signal_space,
             signals,
-            signals_bw,
+            signals_bounds,
             nuts_args,
             self.perform_minimize,
             path
@@ -1090,7 +1105,7 @@ class Dracula():
                 )
 
                 try:
-                    signals, signals_bw = future.result()
+                    signals, signals_bounds = future.result()
 
                 except BaseException as exc:
                     traceback_text = traceback.format_exc()
@@ -1100,7 +1115,13 @@ class Dracula():
                         f"Worker traceback:\n{traceback_text}"
                     ) from None
 
-        create_deliverables(path, self.t, self.d, signals, self.signal_space)
+        create_deliverables(
+            path,
+            self.t,
+            self.d,
+            signals,
+            self.signal_space
+        )
 
 
     def execute(
@@ -1137,7 +1158,7 @@ class Dracula():
         )
         self.sample(
             signals=self.signals_init,
-            signals_bw=self.signals_bw_init,
+            signals_bounds=self.signals_bounds_init,
             signals_per_block=signals_per_block,
             fill_order=fill_order,
             nuts_args=nuts_args_sample,
@@ -1145,7 +1166,7 @@ class Dracula():
         )
         self.reconcile(
             signals=self.signals_sample,
-            signals_bw=self.signals_bw_sample,
+            signals_bounds=self.signals_bounds_sample,
             nuts_args=nuts_args_reconcile,
             cores_per_worker=cores_per_reconcile_worker
         )

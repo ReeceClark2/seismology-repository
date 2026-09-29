@@ -390,13 +390,13 @@ def reconcile(
         d,
         signal_space,
         signals,
-        signals_bw,
+        signals_bounds,
         nuts_args=None,
         k2_threshold=1e2
     ):
 
     signals = list(signals)
-    signals_bw = list(signals_bw)
+    signals_bounds = list(signals_bounds)
 
     while True:
         _, eigenvalues, eigenvectors = get_gram(t, d, signals)
@@ -408,7 +408,7 @@ def reconcile(
         k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
 
         if k2 > k2_threshold:
-            eigenvector_index = int(jnp.minimum(eigenvalues))
+            eigenvector_index = int(jnp.argmin(eigenvalues))
             eigenvector = eigenvectors[:, eigenvector_index]
 
             cosine_components = eigenvector[:m]
@@ -421,15 +421,15 @@ def reconcile(
             print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
 
             signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
-            signals_bw = jnp.delete(jnp.asarray(signals_bw), signal_index, axis=0)
+            signals_bounds = jnp.delete(jnp.asarray(signals_bounds), signal_index, axis=0)
 
             if nuts_args is not None:
-                signals = nuts(t, d, signal_space, signals, signals_bw, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
+                signals = nuts(t, d, signal_space, signals, signals_bounds, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
 
         else:
             break
         
-    return signals, signals_bw
+    return signals, signals_bounds
 
 def grid_search(
         t, 
@@ -535,7 +535,7 @@ def nuts(
     d,
     signal_space,
     signals,
-    signals_bw,
+    signals_bounds,
     nuts_kwargs,
     mcmc_kwargs,
     run_kwargs,
@@ -546,11 +546,11 @@ def nuts(
     f_init = jnp.atleast_1d(jnp.asarray(f_init))
     k_init = jnp.atleast_1d(jnp.asarray(k_init))
 
-    bounds = jnp.asarray(signals_bw)
+    bounds = jnp.asarray(signals_bounds)
 
     if bounds.ndim != 2 or bounds.shape != (f_init.size, 4):
         raise ValueError(
-            "signals_bw must have shape (n_signals, 4), with entries "
+            "signals_bounds must have shape (n_signals, 4), with entries "
             "(f_min, f_max, k_min, k_max)"
         )
 
@@ -564,14 +564,21 @@ def nuts(
             f"Empty frequency intervals: low={fs_min}, high={fs_max}"
         )
 
+    if bool(jnp.any(ks_min <= 0)):
+        raise ValueError(
+            f"Decay-rate lower bounds must be positive: {ks_min}"
+        )
+
     if bool(jnp.any(ks_min >= ks_max)):
         raise ValueError(
             f"Empty decay-rate intervals: low={ks_min}, high={ks_max}"
         )
 
+    # The persistent representation is physical k. Convert to log(k)
+    # only for the NUTS sampling distribution.
     log_k_init = jnp.log(k_init)
-    log_ks_min = ks_min
-    log_ks_max = ks_max
+    log_ks_min = jnp.log(ks_min)
+    log_ks_max = jnp.log(ks_max)
 
     f_width = fs_max - fs_min
     log_k_width = log_ks_max - log_ks_min

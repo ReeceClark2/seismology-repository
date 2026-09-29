@@ -114,7 +114,7 @@ def plot_signal_space(
     title,
     uncertainties=None,
     signals_0=None,
-    signals_bw=None,
+    signals_bounds=None,
     signal_space=None,
 ):
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -207,53 +207,38 @@ def plot_signal_space(
         zorder=4,
     )
 
-    if signals_0 is not None and signals_bw is not None:
-        fs_0, ks_0 = utils.unpack_signals(signals_0)
+    bounds = None
 
-        fs_0 = np.asarray(fs_0)
-        ks_0 = np.asarray(ks_0)
-        fs = np.asarray(fs)
-        ks = np.asarray(ks)
-
-        bounds = np.asarray(signals_bw)
+    if signals_bounds is not None:
+        bounds = np.asarray(signals_bounds, dtype=float)
 
         if bounds.ndim != 2 or bounds.shape != (len(fs), 4):
             raise ValueError(
-                "signals_bw must have shape (n_signals, 4), with entries "
+                "signals_bounds must have shape (n_signals, 4), with entries "
                 "(f_min, f_max, k_min, k_max)"
             )
 
-        lengths = [
-            len(fs_0),
-            len(ks_0),
-            len(fs),
-            len(ks),
-            len(bounds),
-        ]
-
-        if len(set(lengths)) != 1:
+        if np.any(~np.isfinite(bounds)):
             raise ValueError(
-                "Signals and reference signals must have matching lengths. "
-                f"Got lengths: {lengths}"
+                "signals_bounds must contain only finite values."
             )
 
-        ax.scatter(
-            fs_0,
-            ks_0,
-            color="green",
-            label="Initial Signals",
-            zorder=5,
-        )
+        if np.any(bounds[:, 0] >= bounds[:, 1]):
+            raise ValueError(
+                "Every frequency lower bound must be less than its upper bound."
+            )
 
-        for f0, k0, f, k, signal_bounds in zip(
-            fs_0,
-            ks_0,
-            fs,
-            ks,
-            bounds,
-        ):
-            f_min, f_max, k_min, k_max = signal_bounds
+        if np.any(bounds[:, 2] <= 0):
+            raise ValueError(
+                "Decay-rate bounds must be positive on a logarithmic axis."
+            )
 
+        if np.any(bounds[:, 2] >= bounds[:, 3]):
+            raise ValueError(
+                "Every decay-rate lower bound must be less than its upper bound."
+            )
+
+        for f_min, f_max, k_min, k_max in bounds:
             add_log_rectangle(
                 ax,
                 f_min=f_min,
@@ -264,9 +249,30 @@ def plot_signal_space(
                 edgecolor="green",
                 alpha=0.15,
                 linewidth=1,
-                zorder=1
+                zorder=1,
             )
 
+    if signals_0 is not None:
+        fs_0, ks_0 = utils.unpack_signals(signals_0)
+
+        fs_0 = np.asarray(fs_0)
+        ks_0 = np.asarray(ks_0)
+
+        if len(fs_0) != len(fs):
+            raise ValueError(
+                "signals_0 and signals must have matching lengths "
+                "when plotting movement between signals."
+            )
+
+        ax.scatter(
+            fs_0,
+            ks_0,
+            color="green",
+            label="Initial Signals",
+            zorder=5,
+        )
+
+        for f0, k0, f, k in zip(fs_0, ks_0, fs, ks):
             ax.plot(
                 [f0, f],
                 [k0, k],
