@@ -395,40 +395,73 @@ def reconcile(
         k2_threshold=1e2
     ):
 
-    signals = list(signals)
-    signals_bounds = list(signals_bounds)
+    signals = jnp.asarray(signals)
+    signals_bounds = jnp.asarray(signals_bounds)
 
-    while True:
-        _, eigenvalues, eigenvectors = get_gram(t, d, signals)
-        m = len(signals)
+    while len(signals) > 1:
+        gram, _, _ = get_gram(t, d, signals)
+
+        norms = jnp.sqrt(jnp.diag(gram))
+        normalized_gram = gram / jnp.outer(norms, norms)
+
+        eigenvalues, eigenvectors = jnp.linalg.eigh(normalized_gram)
 
         max_eigenvalue = jnp.max(eigenvalues)
-        min_eigenvalue = jnp.min(eigenvalues)
+        min_eigenvalue = jnp.maximum(
+            jnp.min(eigenvalues),
+            jnp.finfo(eigenvalues.dtype).eps * max_eigenvalue
+        )
 
-        k2 = max_eigenvalue / jnp.maximum(min_eigenvalue, 1e-12)
+        # Gram eigenvalues are squared singular values.
+        k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
 
-        if k2 > k2_threshold:
-            eigenvector_index = int(jnp.argmin(eigenvalues))
-            eigenvector = eigenvectors[:, eigenvector_index]
-
-            cosine_components = eigenvector[:m]
-            sine_components = eigenvector[m:]
-
-            signal_strength = jnp.sqrt(cosine_components ** 2 + sine_components ** 2)
-            signal_index = int(jnp.argmax(signal_strength))
-
-            f, k = signals[signal_index]
-            print(f"Removed signal with frequency {f} Hz and decay rate {k}.")
-
-            signals = jnp.delete(jnp.asarray(signals), signal_index, axis=0)
-            signals_bounds = jnp.delete(jnp.asarray(signals_bounds), signal_index, axis=0)
-
-            if nuts_args is not None:
-                signals = nuts(t, d, signal_space, signals, signals_bounds, nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs, nuts_args.run_kwargs, nuts_args.seed)
-
-        else:
+        if k2 <= k2_threshold:
             break
-        
+
+        eigenvector = eigenvectors[:, jnp.argmin(eigenvalues)]
+        m = len(signals)
+
+        cosine_components = eigenvector[:m]
+        sine_components = eigenvector[m:]
+
+        signal_strength = jnp.sqrt(
+            cosine_components ** 2 + sine_components ** 2
+        )
+
+        # Compare removal of the two signals most responsible for the
+        # degenerate direction.
+        candidate_indices = jnp.argsort(signal_strength)[-4:]
+
+        candidate_scores = []
+
+        for candidate_index in candidate_indices:
+            candidate_index = int(candidate_index)
+            candidate_signals = jnp.delete(signals, candidate_index, axis=0)
+            score = get_log_prob(t, d, candidate_signals)
+
+            candidate_scores.append((score, candidate_index))
+
+        _, signal_index = max(
+            candidate_scores,
+            key=lambda result: float(result[0])
+        )
+
+        f, k = signals[signal_index]
+        print(
+            f"Removed signal with frequency {f} Hz and decay rate {k}. "
+            f"Condition number: {k2}."
+        )
+
+        signals = jnp.delete(signals, signal_index, axis=0)
+        signals_bounds = jnp.delete(signals_bounds, signal_index, axis=0)
+
+        if nuts_args is not None:
+            signals = nuts(
+                t, d, signal_space, signals, signals_bounds,
+                nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs,
+                nuts_args.run_kwargs, nuts_args.seed
+            )
+
     return signals, signals_bounds
 
 def grid_search(
