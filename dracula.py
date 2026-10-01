@@ -82,6 +82,8 @@ class InitialConditionsTask:
     t: ArrayLike
     d: ArrayLike
     signal_space: SignalSpace
+    f_fraction: float
+    log_k_fraction: float
     depth: int
     grid_search_args: GridSearchArgs
     nuts_args: NUTSArgs
@@ -89,7 +91,7 @@ class InitialConditionsTask:
     path: str
     
 
-def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, nuts_args, perform_minimize, path):
+def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction, depth, grid_search_args, nuts_args, perform_minimize, path):
     '''
     Runs an instance of the initial conditions worker to find all signals in a subband.
     '''
@@ -123,7 +125,7 @@ def run_initial_conditions_worker(t, d, signal_space, depth, grid_search_args, n
         )
 
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
-        signal_candidate_bounds = utils.get_signal_bounds(signal_candidate, signal_space)
+        signal_candidate_bounds = utils.get_signal_bounds(signal_candidate, signal_space, f_fraction=f_fraction, log_k_fraction=log_k_fraction)
 
         if signals is None:
             signals = signal_candidate
@@ -406,6 +408,7 @@ class ReconcileTask:
     signal_space: SignalSpace
     signals: Any
     signals_bounds: Any
+    k2_threshold: float
     nuts_args: NUTSArgs
     perform_minimize: bool
     path: str
@@ -417,11 +420,12 @@ def run_reconcile_worker(
         signal_space,
         signals,
         signals_bounds,
+        k2_threshold,
         nuts_args,
         perform_minimize,
         path
     ):
-    signals, signals_bounds = bats.reconcile(t, d, signal_space, signals, signals_bounds, nuts_args)
+    signals, signals_bounds = bats.reconcile(t, d, signal_space, signals, signals_bounds, k2_threshold, nuts_args)
 
     return signals, signals_bounds
 
@@ -567,6 +571,8 @@ class Dracula():
             nuts_args: NUTSArgs,
             subband_count: int = 5,
             subband_scaling_factor: float = 1,
+            f_fraction: float = 8,
+            log_k_fraction: float = 8,
             depth: int = 5,
             cores_per_worker: Any = None,
     ):
@@ -611,6 +617,8 @@ class Dracula():
                 t=self.t,
                 d=self.d,
                 signal_space=signal_space,
+                f_fraction=f_fraction,
+                log_k_fraction=log_k_fraction,
                 depth=depth,
                 grid_search_args=grid_search_args,
                 nuts_args=nuts_args,
@@ -1005,6 +1013,7 @@ class Dracula():
             self, 
             signals: Any,
             signals_bounds: Any,
+            k2_threshold: float,
             nuts_args: Optional[NUTSArgs] = None,
             cores_per_worker: int = 1
         ):
@@ -1024,6 +1033,7 @@ class Dracula():
             self.signal_space,
             signals,
             signals_bounds,
+            k2_threshold,
             nuts_args,
             self.perform_minimize,
             path
@@ -1128,10 +1138,11 @@ class Dracula():
             self,
             subband_count: int = 2,
             subband_scaling_factor: float = 1,
+            f_fraction: float = 8,
+            log_k_fraction: float = 8,
             depth: int = 10,
             grid_search_args: Optional[GridSearchArgs] = None,
             nuts_args_init: Optional[NUTSArgs] = None,
-            perform_minimize: bool = False,
             cores_per_initial_conditions_worker: int = 1,
 
             signals_per_block: int = 1,
@@ -1139,8 +1150,11 @@ class Dracula():
             nuts_args_sample: Optional[NUTSArgs] = None,
             cores_per_sample_worker: int = 1,
 
-            cores_per_reconcile_worker: int = 1,
+            k2_threshold: float = 1e2,
             nuts_args_reconcile: Optional[NUTSArgs] = None,
+            cores_per_reconcile_worker: int = 1,
+
+            perform_minimize: bool = False,
     ):        
         if not grid_search_args:
             grid_search_args = self.default_grid_search_args
@@ -1151,6 +1165,8 @@ class Dracula():
         self.initialize(
             subband_count=subband_count,
             subband_scaling_factor=subband_scaling_factor,
+            f_fraction=f_fraction,
+            log_k_fraction=log_k_fraction,
             depth=depth,
             grid_search_args=grid_search_args,
             nuts_args=nuts_args_init,
@@ -1167,6 +1183,7 @@ class Dracula():
         self.reconcile(
             signals=self.signals_sample,
             signals_bounds=self.signals_bounds_sample,
+            k2_threshold=k2_threshold,
             nuts_args=nuts_args_reconcile,
             cores_per_worker=cores_per_reconcile_worker
         )

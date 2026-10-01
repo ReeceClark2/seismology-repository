@@ -391,8 +391,8 @@ def reconcile(
         signal_space,
         signals,
         signals_bounds,
+        k2_threshold=1e2,
         nuts_args=None,
-        k2_threshold=1e2
     ):
 
     signals = jnp.asarray(signals)

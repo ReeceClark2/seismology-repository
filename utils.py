@@ -81,13 +81,6 @@ def get_signal_bounds(
             "Signal frequencies must lie inside signal_space."
         )
 
-    if bool(jnp.any(ks < signal_space.k_min)) or bool(
-        jnp.any(ks > signal_space.k_max)
-    ):
-        raise ValueError(
-            "Signal decay rates must lie inside signal_space."
-        )
-
     frequency_halfwidth = (
         f_fraction
         * (signal_space.f_max - signal_space.f_min)

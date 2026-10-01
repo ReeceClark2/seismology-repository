@@ -62,8 +62,8 @@ def observed_data(
     return t, d
 
 def main():
-    network = "IU"
-    station = "KIP"
+    network = "II"
+    station = "BFO"
     location = "00"
     channel = "LHZ"
     stream_index = 0
@@ -137,7 +137,7 @@ def main():
 
     nuts_kwargs = dict(
         target_accept_prob=0.8,
-        max_tree_depth=(5,5)
+        max_tree_depth=(4,4)
     )
     mcmc_kwargs = dict(
         num_warmup=60,
@@ -157,8 +157,11 @@ def main():
     model.execute(
         subband_count=3, 
         subband_scaling_factor=1.0,
-        depth=25,
+        f_fraction=16,
+        log_k_fraction=8,
+        depth=20,
         grid_search_args=grid_search_args,
+        nuts_args_init=None,
         cores_per_initial_conditions_worker=1,
 
         signals_per_block=16,
@@ -166,6 +169,7 @@ def main():
         nuts_args_sample=nuts_args_sample,
         cores_per_sample_worker=4,
 
+        k2_threshold=1e2,
         nuts_args_reconcile=nuts_args_reconcile,
         cores_per_reconcile_worker=32,
 
