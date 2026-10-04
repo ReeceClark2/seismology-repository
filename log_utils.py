@@ -1,12 +1,14 @@
+# Internal Python libraries
 import csv
 from collections.abc import Mapping
 
-import numpy as np
-
+# External libraries
 import matplotlib.pyplot as plt
-from matplotlib.ticker import LogLocator, FuncFormatter
-from matplotlib.patches import Rectangle, Ellipse
+import numpy as np
+from matplotlib.patches import Ellipse, Rectangle
+from matplotlib.ticker import FuncFormatter, LogLocator
 
+# Repository files
 import utils
 
 
@@ -346,7 +348,6 @@ def plot_signal_space(
     fig.savefig(path, dpi=300)
     plt.close(fig)
 
-
 def plot_fourier_space(
     path,
     t,
@@ -508,7 +509,6 @@ def plot_fourier_space(
     fig.savefig(path.with_suffix(".svg"))
     plt.close(fig)
 
-
 def save_subband_csv(path, signals, noise_variances, snrs, glob_lls):
     fieldnames = [
         "Signal",
@@ -554,7 +554,6 @@ def save_subband_csv(path, signals, noise_variances, snrs, glob_lls):
                 }
             )
 
-
 def save_initialize_csv(path, signals_by_subband):
     fieldnames = [
         "Subband",
@@ -587,7 +586,6 @@ def save_initialize_csv(path, signals_by_subband):
                 }
             )
 
-
 def save_block_csv(path, signals):
     fieldnames = [
         "Signal",
@@ -612,10 +610,10 @@ def save_block_csv(path, signals):
                 }
             )
 
-
-def save_signals_csv(path, signals, amplitudes, uncertainties):
+def save_signals_csv(path, signals, amplitudes, phases, uncertainties):
     signals = list(signals)
     amplitudes = list(amplitudes)
+    phases = list(phases)
     uncertainties = list(uncertainties)
 
     if len(signals) != len(uncertainties):
@@ -625,7 +623,7 @@ def save_signals_csv(path, signals, amplitudes, uncertainties):
 
     rows = []
 
-    for signal, amplitude, uncertainty in zip(signals, amplitudes, uncertainties):
+    for signal, amplitude, phase, uncertainty in zip(signals, amplitudes, phases, uncertainties):
         try:
             frequency, decay_rate = signal
             frequency_uncertainty, decay_rate_uncertainty = uncertainty
@@ -638,6 +636,7 @@ def save_signals_csv(path, signals, amplitudes, uncertainties):
 
         rows.append({
             "Amplitude": amplitude,
+            "Phase": phase,
             "Frequency": frequency,
             "Frequency Uncertainty": frequency_uncertainty,
             "Decay Rate": decay_rate,
@@ -646,6 +645,7 @@ def save_signals_csv(path, signals, amplitudes, uncertainties):
 
     fieldnames = [
         "Amplitude",
+        "Phase",
         "Frequency",
         "Frequency Uncertainty",
         "Decay Rate",
@@ -656,7 +656,6 @@ def save_signals_csv(path, signals, amplitudes, uncertainties):
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
 
 def save_report_csv(path, results, uncertainties):
     if isinstance(results, Mapping):
@@ -748,9 +747,9 @@ def save_report_csv(path, results, uncertainties):
         writer.writeheader()
         writer.writerows(rows)
 
-
 def save_report_txt(path, signal_count, noise_variance, snr):
     with open(path, "w", encoding="utf-8") as file:
         file.write(f"Signal count: {signal_count}\n")
         file.write(f"Noise variance: {noise_variance}\n")
         file.write(f"SNR: {snr}\n")
+

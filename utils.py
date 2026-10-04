@@ -1,10 +1,13 @@
-from collections.abc import Mapping
+# Internal Python libraries
 from collections import defaultdict
+from collections.abc import Mapping
 
+# External libraries
 import jax.numpy as jnp
 import numpy as np
 from scipy import signal
 
+# Repository files
 import rcrpy
 
 
@@ -52,7 +55,6 @@ def unpack_signals(signals):
     ks = signals[:, 1]
 
     return fs, ks
-
 
 def get_signal_bounds(
     signals,
@@ -128,7 +130,6 @@ def get_signal_bounds(
         axis=-1,
     )
 
-
 def is_signal_detected(probability_surface, log_prob=None, n=5):
     _, _, log_prob_space = probability_surface
     log_prob_space = log_prob_space.ravel()
@@ -191,7 +192,6 @@ def unpack_signal_results(results):
         )
 
     return averaged_signals
-
 
 def get_variance_break(
     variances,
@@ -257,7 +257,6 @@ def get_variance_break(
         return None
 
     return best_index
-
 
 def get_snr_index_break(snrs):
     heuristic = []
