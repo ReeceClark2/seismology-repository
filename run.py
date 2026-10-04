@@ -1,8 +1,16 @@
+# Internal Python libraries
+import shutil
+import sys
+import tomllib
+from pathlib import Path
+
+# External libraries
 import numpy as np
 from obspy.clients.fdsn import Client
 from obspy.core import UTCDateTime
 
-from dracula import Dracula, NUTSArgs, GridSearchArgs
+# Repository files
+from dracula import Dracula, GridSearchArgs, NUTSArgs
 
 
 def observed_data(
@@ -61,121 +69,54 @@ def observed_data(
 
     return t, d
 
-def main():
-    network = "II"
-    station = "BFO"
-    location = "00"
-    channel = "LHZ"
-    stream_index = 0
+def main(config_path="dracula_config.toml"):
+    config_path = Path(config_path)
 
-    start_time = UTCDateTime("2025-07-30T01:24:50")
-    end_time = UTCDateTime("2025-08-05T20:24:50")
+    with config_path.open("rb") as file:
+        config = tomllib.load(file)
 
-    f_min = 0.003
-    f_max = 0.004
+    parameter_txt_path = Path(config["runtime"]["parameter_txt"])
+    parameter_txt_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(config_path, parameter_txt_path)
 
-    t, d = observed_data(
-        network=network,
-        station=station,
-        channel=channel,
-        location=location,
-        stream_index=stream_index,
-        start_time=start_time,
-        end_time=end_time,
-        min_f=f_min,
-        max_f=f_max,
-    )
+    data_config = config["data"]
+    data_config["start_time"] = UTCDateTime(data_config["start_time"])
+    data_config["end_time"] = UTCDateTime(data_config["end_time"])
+
+    t, d = observed_data(**data_config)
 
     model = Dracula(
-        t, 
+        t,
         d,
-        f_min=0.0027,
-        f_max=0.0043,
-        k_min=1e-5,
-        k_max=1e-4
+        **config["model"],
     )
 
     grid_search_args = GridSearchArgs(
-        f_points=100,
-        k_points=100
-    )
-    nuts_kwargs = dict(
-        target_accept_prob=0.75,
-    )
-    mcmc_kwargs = dict(
-        num_warmup=20,
-        num_samples=60,
-        num_chains=1,
-        chain_method="parallel"
-    )
-    run_kwargs = dict()
-
-    nuts_args_init = NUTSArgs(
-        nuts_kwargs=nuts_kwargs,
-        mcmc_kwargs=mcmc_kwargs,
-        run_kwargs=run_kwargs,
-        seed=5
+        **config["grid_search"],
     )
 
-    nuts_kwargs = dict(
-        target_accept_prob=0.85,
-    )
-    mcmc_kwargs = dict(
-        num_warmup=100,
-        num_samples=300,
-        num_chains=4,
-        chain_method="parallel"
-    )
-    run_kwargs = dict()
+    nuts_args = {}
 
-    nuts_args_sample = NUTSArgs(
-        nuts_kwargs=nuts_kwargs,
-        mcmc_kwargs=mcmc_kwargs,
-        run_kwargs=run_kwargs,
-        seed=54
-    )
+    for name in ("init", "sample", "reconcile"):
+        nuts_config = config["nuts"][name]
 
-    nuts_kwargs = dict(
-        target_accept_prob=0.8,
-        max_tree_depth=(4,4)
-    )
-    mcmc_kwargs = dict(
-        num_warmup=60,
-        num_samples=100,
-        num_chains=32,
-        chain_method="parallel"
-    )
-    run_kwargs = dict()
+        if "max_tree_depth" in nuts_config["nuts_kwargs"]:
+            nuts_config["nuts_kwargs"]["max_tree_depth"] = tuple(
+                nuts_config["nuts_kwargs"]["max_tree_depth"]
+            )
 
-    nuts_args_reconcile = NUTSArgs(
-        nuts_kwargs=nuts_kwargs,
-        mcmc_kwargs=mcmc_kwargs,
-        run_kwargs=run_kwargs,
-        seed=3
-    )
+        nuts_args[name] = NUTSArgs(
+            **nuts_config,
+        )
 
-    model.execute(
-        subband_count=3, 
-        subband_scaling_factor=1.0,
-        f_fraction=16,
-        log_k_fraction=8,
-        depth=20,
-        grid_search_args=grid_search_args,
-        nuts_args_init=None,
-        cores_per_initial_conditions_worker=1,
+    execute_args = config["execute"]
+    execute_args["grid_search_args"] = grid_search_args
+    execute_args["nuts_args_init"] = nuts_args["init"]
+    execute_args["nuts_args_sample"] = nuts_args["sample"]
+    execute_args["nuts_args_reconcile"] = nuts_args["reconcile"]
 
-        signals_per_block=16,
-        fill_order=0,
-        nuts_args_sample=nuts_args_sample,
-        cores_per_sample_worker=4,
-
-        k2_threshold=1e2,
-        nuts_args_reconcile=nuts_args_reconcile,
-        cores_per_reconcile_worker=32,
-
-        perform_minimize=False,
-    )
-
+    model.execute(**execute_args)
 
 if __name__ == "__main__":
-    main()
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.toml"
+    main(config_path)

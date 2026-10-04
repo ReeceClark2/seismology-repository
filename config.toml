@@ -1,0 +1,81 @@
+[runtime]
+parameter_txt = "dracula_run_parameters.txt"
+
+[data]
+network = "II"
+station = "BFO"
+channel = "LHZ"
+location = "00"
+stream_index = 0
+start_time = "2025-07-30T01:24:50"
+end_time = "2025-08-05T20:24:50"
+min_f = 0.003
+max_f = 0.004
+
+[model]
+f_min = 0.0027
+f_max = 0.0043
+k_min = 1e-5
+k_max = 1e-4
+path = "testing"
+
+[grid_search]
+f_points = 100
+k_points = 100
+
+[nuts.init.nuts_kwargs]
+target_accept_prob = 0.75
+
+[nuts.init.mcmc_kwargs]
+num_warmup = 20
+num_samples = 60
+num_chains = 1
+chain_method = "parallel"
+
+[nuts.init.run_kwargs]
+
+[nuts.init]
+seed = 5
+
+[nuts.sample.nuts_kwargs]
+target_accept_prob = 0.85
+
+[nuts.sample.mcmc_kwargs]
+num_warmup = 100
+num_samples = 300
+num_chains = 4
+chain_method = "parallel"
+
+[nuts.sample.run_kwargs]
+
+[nuts.sample]
+seed = 54
+
+[nuts.reconcile.nuts_kwargs]
+target_accept_prob = 0.8
+max_tree_depth = [4, 4]
+
+[nuts.reconcile.mcmc_kwargs]
+num_warmup = 60
+num_samples = 100
+num_chains = 32
+chain_method = "parallel"
+
+[nuts.reconcile.run_kwargs]
+
+[nuts.reconcile]
+seed = 3
+
+[execute]
+subband_count = 3
+subband_scaling_factor = 1.0
+f_fraction = 16
+log_k_fraction = 8
+depth = 20
+cores_per_initial_conditions_worker = 1
+signals_per_block = 16
+fill_order = 0
+cores_per_sample_worker = 4
+k2_threshold = 1e2
+cores_per_reconcile_worker = 32
+perform_minimize = false
