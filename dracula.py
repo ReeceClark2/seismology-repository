@@ -1,19 +1,31 @@
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
-from itertools import chain
-from dataclasses import dataclass, field, fields
-from typing import Any, Optional
-from pathlib import Path
-from datetime import datetime
-import traceback
+# Internal Python libraries
 import math
-from copy import deepcopy
-from collections import defaultdict
+import multiprocessing as mp
 import os
-import psutil
+import traceback
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import deepcopy
+from dataclasses import dataclass, field, fields
+from datetime import datetime
+from itertools import chain
+from pathlib import Path
+from typing import Any, Optional
 
+# External libraries
+import jax.numpy as jnp
 import numpy as np
 import numpyro
+import psutil
+from jax.typing import ArrayLike
+from tqdm import tqdm
+
+# Repository files
+import bats
+import log_utils
+import utils
+
+
 numpyro.set_host_device_count(32)
 
 os.environ["XLA_FLAGS"] = (
@@ -24,15 +36,6 @@ os.environ["XLA_FLAGS"] = (
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-
-import jax.numpy as jnp
-from jax.typing import ArrayLike
-
-from tqdm import tqdm
-
-import bats
-import utils
-import log_utils
 
 
 def initialize_worker(core_queue):
@@ -90,7 +93,6 @@ class InitialConditionsTask:
     perform_minimize: bool
     path: str
     
-
 def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction, depth, grid_search_args, nuts_args, perform_minimize, path):
     '''
     Runs an instance of the initial conditions worker to find all signals in a subband.
@@ -309,7 +311,6 @@ class SampleTask:
     perform_minimize: bool
     path: str
 
-
 def run_sample_worker(
     t,
     d,
@@ -367,7 +368,6 @@ def run_sample_worker(
 
     return list(zip(signal_indices, signals))
 
-
 def run_sample_worker_wrapper(config: SampleTask):
     '''
     Wrapper function for the sample worker to flatten and pass SampleTask dictionary.
@@ -397,7 +397,6 @@ def run_sample_worker_wrapper(config: SampleTask):
             f"Original worker traceback:\n{worker_traceback}"
         ) from None
 
-
 @dataclass
 class ReconcileTask:
     '''
@@ -413,7 +412,6 @@ class ReconcileTask:
     perform_minimize: bool
     path: str
 
-
 def run_reconcile_worker(
         t,
         d,
@@ -428,7 +426,6 @@ def run_reconcile_worker(
     signals, signals_bounds = bats.reconcile(t, d, signal_space, signals, signals_bounds, k2_threshold, nuts_args)
 
     return signals, signals_bounds
-
 
 def run_reconcile_worker_wrapper(config: ReconcileTask):
     '''
@@ -459,14 +456,17 @@ def run_reconcile_worker_wrapper(config: ReconcileTask):
             f"Original worker traceback:\n{worker_traceback}"
         ) from None
 
-
 def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
     model = bats.get_model(t, d, signals)
-    amplitudes = bats.get_amplitudes(t, d, signals)
+    amplitudes, phases = bats.get_phasor_parameters(t, d, signals)
     uncertainties = bats.get_uncertainties(t, d, signals)
+    cov_mat = bats.get_cov_mat(t, d, signals)
 
     noise_variance = bats.get_noise_variance(t, d, signals)
     snr = bats.get_snr(t, d, signals)
+
+    log_utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
+    log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
     log_utils.plot_time_series(
         path / f"{len(signals)}_time_series.png", 
@@ -499,6 +499,7 @@ def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
         path / "signals.csv",
         signals,
         amplitudes,
+        phases,
         uncertainties
     )
     log_utils.save_report_txt(
@@ -507,8 +508,6 @@ def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
         noise_variance,
         snr
     )
-
-
 
 class Dracula():
     def __init__(
@@ -1189,7 +1188,6 @@ class Dracula():
         )
 
         print("Dracula complete!")
-
 
 if __name__ == "__main__":
     t = np.linspace(0, 100, 2000)

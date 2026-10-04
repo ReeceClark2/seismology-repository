@@ -1,23 +1,24 @@
-from typing import Any
+# Internal Python libraries
 import random
+from typing import Any
 
-from scipy.optimize import minimize as scipy_minimize
-from scipy.optimize import Bounds
-import numpy as np
-
+# External libraries
 import jax
-jax.config.update("jax_enable_x64", True)
-
 import jax.numpy as jnp
 import jax.scipy.special as jsp
-from jax.flatten_util import ravel_pytree
-
+import numpy as np
 import numpyro
 import numpyro.distributions as dist
-from numpyro.distributions import constraints, transforms
+from jax.flatten_util import ravel_pytree
 from numpyro.infer import MCMC, NUTS, init_to_value
+from scipy.optimize import Bounds
+from scipy.optimize import minimize as scipy_minimize
 
+# Repository files
 import utils
+
+
+jax.config.update("jax_enable_x64", True)
 
 
 def get_log_prob(
@@ -25,6 +26,10 @@ def get_log_prob(
         d: jax.Array,
         signals
     ):
+    '''
+    Bretthorst Eq. 3.17
+    '''
+    
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -61,6 +66,10 @@ def get_gram(
         d: jax.Array,
         signals
     ):
+    '''
+    Bretthorst Eq. 3.4
+    '''
+
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -85,6 +94,10 @@ def get_model(
         d: jax.Array,
         signals
     ):
+    '''
+    Bretthorst Eq. 3.5 and Eq. 3.13
+    '''
+
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -97,13 +110,18 @@ def get_model(
     ))
 
     coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
+
     return G.T @ coefficients
 
 def get_noise_variance(
         t: jax.Array, 
         d: jax.Array, 
         signals
-    ) -> jax.Array:
+    ):
+    '''
+    Bretthorst Eq. 4.7
+    '''
+
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -138,7 +156,11 @@ def get_snr(
         t: jax.Array, 
         d: jax.Array, 
         signals
-    ) -> jax.Array:
+    ):
+    '''
+    Bretthorst Eq. 4.8
+    '''
+    
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -176,6 +198,10 @@ def get_mean_sq_proj(
         d: jax.Array, 
         signals
     ) -> jax.Array:
+    '''
+    Bretthorst Eq. 3.15
+    '''
+
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -201,13 +227,17 @@ def get_mean_sq_proj(
     # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
-    return jnp.mean(h ** 2)
+    return len(h) * jnp.sum(h ** 2)
 
 def get_glob_ll(
         t: jax.Array, 
         d: jax.Array, 
         signals
     ) -> jax.Array:
+    '''
+    Bretthorst Eq. 5.9
+    '''
+
     fs, ks = utils.unpack_signals(signals)
     d_scale = jnp.std(d)
     d = d / jnp.maximum(d_scale, jnp.finfo(d.dtype).eps)
@@ -224,32 +254,37 @@ def get_glob_ll(
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
 
-    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     g_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
     g_floor = jnp.finfo(g.dtype).eps * g_scale
     eigenvalues = jnp.maximum(eigenvalues, g_floor)
 
-    # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (0.5 / m) * jnp.sum(omegas ** 2 + ks ** 2)
+    mean_sq_param = (1 / r) * jnp.sum(omegas ** 2 + ks ** 2)
 
-    noise_floor = 1
+    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
+    model = G.T @ coefficients
+    residual = d - model
 
-    log_R_delta = jnp.log(jnp.max(jnp.abs(d)) / noise_floor)
-    log_R_gamma = jnp.log((jnp.max(d) - jnp.min(d)) / noise_floor)
-    log_R_sigma = jnp.log(jnp.std(d) / noise_floor)
+    eps = jnp.finfo(d.dtype).eps
+
+    amplitude_max = jnp.maximum(jnp.max(jnp.abs(d)), eps)
+    amplitude_min = jnp.maximum(jnp.quantile(jnp.abs(d), 0.05), eps)
+
+    variance_data = jnp.maximum(jnp.var(d), eps)
+    variance_residual = jnp.maximum(jnp.var(residual), eps)
+
+    log_R_delta = 2.0 * jnp.log(amplitude_max / amplitude_min)
+    log_R_gamma = jnp.log(1e3)
+    log_R_sigma = jnp.log(jnp.maximum(variance_data / variance_residual, 1.0))
 
     theta, unravel = ravel_pytree(signals)
 
@@ -268,30 +303,36 @@ def get_glob_ll(
     log_jacobian_factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
 
     delta_term = (
-        (jsp.gammaln(m / 2))
+        jsp.gammaln(m / 2)
         - jnp.log(2) - log_R_delta
         + (-m / 2) * jnp.log(m * mean_sq_proj / 2.0)
     )
 
     gamma_term = (
-        (jsp.gammaln(r / 2))
+        jsp.gammaln(r / 2)
         - jnp.log(2) - log_R_gamma
         + (-r / 2) * jnp.log((r * mean_sq_param) / 2)
     )
 
     sigma_term = (
-        (jsp.gammaln((N - m - r) / 2))
+        jsp.gammaln((N - m - r) / 2)
         - jnp.log(2) - log_R_sigma
-        + ((m + r - N) / 2) * jnp.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2)
+        + ((m + r - N) / 2) * jnp.log(
+            ((N * mean_sq_data) - (m * mean_sq_proj)) / 2
+        )
     )
 
     return delta_term + sigma_term + gamma_term + log_jacobian_factor
 
-def get_amplitudes(
+def get_phasor_parameters(
         t: jax.Array, 
         d: jax.Array, 
         signals
-    ) -> jax.Array:
+    ):
+    '''
+    Definition of model functions
+    '''
+
     fs, ks = utils.unpack_signals(signals)
 
     omegas = 2.0 * jnp.pi * fs
@@ -314,13 +355,65 @@ def get_amplitudes(
         cosine_coefficients**2 + sine_coefficients**2
     )
 
-    return amplitudes
+    phases = jnp.atan(cosine_coefficients / sine_coefficients)
+
+    return amplitudes, phases
+
+def get_cov_mat(
+        t: jax.Array, 
+        d: jax.Array, 
+        signals
+    ):
+    '''
+    Bretthorst Eq. 4.11
+    '''
+    
+    fs, ks = utils.unpack_signals(signals)
+
+    omegas = fs * 2.0 * jnp.pi
+    
+    r = omegas.shape[0]
+    m = 2 * r
+    N = d.shape[0]
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+    g_scale = jnp.maximum(jnp.max(jnp.abs(eigenvalues)), 1.0)
+    g_floor = jnp.finfo(g.dtype).eps * g_scale
+    eigenvalues = jnp.maximum(eigenvalues, g_floor)
+
+    # Bretthorst Eq. 3.6: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    theta, unravel = ravel_pytree(signals)
+
+    def objective(theta):
+        return get_mean_sq_proj(t, d, unravel(theta))
+
+    b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
+
+    return b
 
 def get_uncertainties(
         t: jax.Array, 
         d: jax.Array, 
         signals
     ) -> jax.Array:
+    '''
+    Bretthorst Eq. 4.13
+    '''
+
     fs, ks = utils.unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
@@ -394,6 +487,12 @@ def reconcile(
         k2_threshold=1e2,
         nuts_args=None,
     ):
+    '''
+    Procedure for removing degenerate signals.
+    1) Identify smallest eigenvalue (most dependent / smallest amplitude signal).
+    2) Evaluate signals for largest contribution to dependent direction.
+    3) Remove most impactful signal to probability.
+    '''
 
     signals = jnp.asarray(signals)
     signals_bounds = jnp.asarray(signals_bounds)
@@ -407,10 +506,7 @@ def reconcile(
         eigenvalues, eigenvectors = jnp.linalg.eigh(normalized_gram)
 
         max_eigenvalue = jnp.max(eigenvalues)
-        min_eigenvalue = jnp.maximum(
-            jnp.min(eigenvalues),
-            jnp.finfo(eigenvalues.dtype).eps * max_eigenvalue
-        )
+        min_eigenvalue = jnp.maximum(jnp.min(eigenvalues), jnp.finfo(eigenvalues.dtype).eps * max_eigenvalue)
 
         # Gram eigenvalues are squared singular values.
         k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
@@ -428,8 +524,6 @@ def reconcile(
             cosine_components ** 2 + sine_components ** 2
         )
 
-        # Compare removal of the two signals most responsible for the
-        # degenerate direction.
         candidate_indices = jnp.argsort(signal_strength)[-4:]
 
         candidate_scores = []
@@ -448,8 +542,8 @@ def reconcile(
 
         f, k = signals[signal_index]
         print(
-            f"Removed signal with frequency {f} Hz and decay rate {k}. "
-            f"Condition number: {k2}."
+            f"Removed signal with frequency {round(f, 8)} Hz and decay rate {round(k, 8)}. "
+            f"Condition number: {round(k2, 5)}."
         )
 
         signals = jnp.delete(signals, signal_index, axis=0)
@@ -457,9 +551,15 @@ def reconcile(
 
         if nuts_args is not None:
             signals = nuts(
-                t, d, signal_space, signals, signals_bounds,
-                nuts_args.nuts_kwargs, nuts_args.mcmc_kwargs,
-                nuts_args.run_kwargs, nuts_args.seed
+                t, 
+                d, 
+                signal_space, 
+                signals, 
+                signals_bounds,
+                nuts_args.nuts_kwargs, 
+                nuts_args.mcmc_kwargs,
+                nuts_args.run_kwargs, 
+                nuts_args.seed
             )
 
     return signals, signals_bounds
@@ -473,6 +573,13 @@ def grid_search(
         return_probability_surface=False, 
         batch_size=256
     ):
+    '''
+    Procedure for identifying candidate signal with a grid search.
+    1) Create grid across chosen parameter set of frequencies and decay rates.
+    2) Evaluate probability across the grid.
+    3) Return signal with highest probability.
+    '''
+
     f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
 
     f_space = jnp.linspace(f_min, f_max, f_points)
@@ -523,6 +630,10 @@ def bats_model(
     k_min: jax.Array,
     k_max: jax.Array,
 ) -> None:
+    '''
+    Identify sampling space and method for NUTS.
+    '''
+    
     f_min = jnp.atleast_1d(jnp.asarray(f_min))
     f_max = jnp.broadcast_to(
         jnp.asarray(f_max, dtype=f_min.dtype),
@@ -574,6 +685,10 @@ def nuts(
     run_kwargs,
     rng_key_value,
 ):
+    '''
+    Run NUTS for chosen signals.
+    '''
+    
     f_init, k_init = utils.unpack_signals(signals)
 
     f_init = jnp.atleast_1d(jnp.asarray(f_init))
@@ -700,7 +815,6 @@ def nuts(
         axis=-1,
     )
 
-
 def minimize(
         t,
         d,
@@ -708,6 +822,9 @@ def minimize(
         signals,
         maxiter=2_000,
     ):
+    '''
+    Experimental minimization function to improve grid search / NUTS results.
+    '''
 
     signals = jnp.asarray(signals)
 
