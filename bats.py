@@ -86,7 +86,7 @@ def get_gram(
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
 
     return g, eigenvalues, eigenvectors
 
@@ -490,7 +490,7 @@ def reconcile(
 
         # Gram eigenvalues are squared singular values.
         k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
-
+        print(round(k2, 3))
         if k2 <= k2_threshold:
             break
 
