@@ -69,15 +69,17 @@ def observed_data(
 
     return t, d
 
-def main(config_path="dracula_config.toml"):
+
+def main(config_path):
     config_path = Path(config_path)
+
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Configuration file does not exist: {config_path}"
+        )
 
     with config_path.open("rb") as file:
         config = tomllib.load(file)
-
-    parameter_txt_path = Path(config["runtime"]["parameter_txt"])
-    parameter_txt_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(config_path, parameter_txt_path)
 
     data_config = config["data"]
     data_config["start_time"] = UTCDateTime(data_config["start_time"])
@@ -115,8 +117,20 @@ def main(config_path="dracula_config.toml"):
     execute_args["nuts_args_sample"] = nuts_args["sample"]
     execute_args["nuts_args_reconcile"] = nuts_args["reconcile"]
 
+    dracula_output_path = Path(config["model"]["path"])
+    parameter_txt_path = dracula_output_path / f"{config_path.stem}.txt"
+    shutil.copy2(config_path, parameter_txt_path)
+
+    print(f"Configuration copied to: {parameter_txt_path}")
+
     model.execute(**execute_args)
 
+
 if __name__ == "__main__":
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.toml"
-    main(config_path)
+    if len(sys.argv) != 2:
+        raise SystemExit(
+            "Usage: python run.py {toml}\n"
+            "Example: python run.py dracula_config.toml"
+        )
+
+    main(sys.argv[1])
