@@ -99,7 +99,7 @@ def main(config_path):
 
     nuts_args = {}
 
-    for name in ("init", "sample", "reconcile"):
+    for name in ("sample", "reconcile"):
         nuts_config = config["nuts"][name]
 
         if "max_tree_depth" in nuts_config["nuts_kwargs"]:
@@ -107,9 +107,20 @@ def main(config_path):
                 nuts_config["nuts_kwargs"]["max_tree_depth"]
             )
 
-        nuts_args[name] = NUTSArgs(
-            **nuts_config,
-        )
+        nuts_args[name] = NUTSArgs(**nuts_config)
+
+    # Optional init configuration
+    init_config = config["nuts"].get("init")
+
+    if init_config is not None:
+        if "max_tree_depth" in init_config["nuts_kwargs"]:
+            init_config["nuts_kwargs"]["max_tree_depth"] = tuple(
+                init_config["nuts_kwargs"]["max_tree_depth"]
+            )
+
+        nuts_args["init"] = NUTSArgs(**init_config)
+    else:
+        nuts_args["init"] = None
 
     execute_args = config["execute"]
     execute_args["grid_search_args"] = grid_search_args
