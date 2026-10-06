@@ -1,5 +1,5 @@
 [runtime]
-parameter_txt = "dracula_run_parameters.txt"
+parameter_txt = "trial_10_parameters_1.txt"
 
 [data]
 network = "II"
@@ -17,65 +17,51 @@ f_min = 0.0027
 f_max = 0.0043
 k_min = 1e-5
 k_max = 1e-4
-path = "testing"
+path = "trial_10"
 
 [grid_search]
-f_points = 100
-k_points = 100
-
-[nuts.init.nuts_kwargs]
-target_accept_prob = 0.8
-
-[nuts.init.mcmc_kwargs]
-num_warmup = 20
-num_samples = 60
-num_chains = 1
-chain_method = "parallel"
-
-[nuts.init.run_kwargs]
-
-[nuts.init]
-seed = 5
+f_points = 200
+k_points = 200
 
 [nuts.sample.nuts_kwargs]
-target_accept_prob = 0.85
+target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
-num_warmup = 100
-num_samples = 300
+num_warmup = 400
+num_samples = 1400
 num_chains = 4
 chain_method = "parallel"
 
 [nuts.sample.run_kwargs]
 
 [nuts.sample]
-seed = 54
+seed = 1
 
 [nuts.reconcile.nuts_kwargs]
 target_accept_prob = 0.8
-max_tree_depth = [4, 4]
+max_tree_depth = [5, 5]
 
 [nuts.reconcile.mcmc_kwargs]
-num_warmup = 60
-num_samples = 100
-num_chains = 32
+num_warmup = 800
+num_samples = 2600
+num_chains = 4
 chain_method = "parallel"
 
 [nuts.reconcile.run_kwargs]
 
 [nuts.reconcile]
-seed = 3
+seed = 1
 
 [execute]
-subband_count = 3
+subband_count = 4
 subband_scaling_factor = 1.0
-f_fraction = 16
-log_k_fraction = 8
-depth = 20
+f_fraction = 12
+log_k_fraction = 4
+depth = 15
 cores_per_initial_conditions_worker = 1
-signals_per_block = 16
+signals_per_block = 20
 fill_order = 0
 cores_per_sample_worker = 4
-k2_threshold = 1e2
-cores_per_reconcile_worker = 32
+k2_threshold = 1e8
+cores_per_reconcile_worker = 4
 perform_minimize = false
