@@ -27,8 +27,8 @@ k_points = 200
 target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
-num_warmup = 800
-num_samples = 2000
+num_warmup = 200
+num_samples = 400
 num_chains = 4
 chain_method = "parallel"
 
@@ -42,8 +42,8 @@ target_accept_prob = 0.8
 max_tree_depth = [5, 5]
 
 [nuts.reconcile.mcmc_kwargs]
-num_warmup = 400
-num_samples = 1400
+num_warmup = 200
+num_samples = 400
 num_chains = 4
 chain_method = "parallel"
 
@@ -58,10 +58,10 @@ subband_scaling_factor = 1.0
 f_fraction = 12
 log_k_fraction = 4
 depth = 15
-cores_per_initial_conditions_worker = 4
+cores_per_initial_conditions_worker = 1
 signals_per_block = 20
 fill_order = 0
 cores_per_sample_worker = 4
-k2_threshold = 1e2
+k2_threshold = 30
 cores_per_reconcile_worker = 4
 perform_minimize = false

@@ -258,7 +258,6 @@ def get_glob_ll(
     g = 0.5 * (g + g.T)
 
     eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
-    print(eigenvalues)
 
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d

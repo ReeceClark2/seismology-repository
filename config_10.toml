@@ -1,5 +1,5 @@
 [runtime]
-parameter_txt = "trial_10_parameters_1.txt"
+parameter_txt = "trial_10_parameters.txt"
 
 [data]
 network = "II"
@@ -27,8 +27,8 @@ k_points = 200
 target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
-num_warmup = 400
-num_samples = 1400
+num_warmup = 200
+num_samples = 400
 num_chains = 4
 chain_method = "parallel"
 
@@ -42,8 +42,8 @@ target_accept_prob = 0.8
 max_tree_depth = [5, 5]
 
 [nuts.reconcile.mcmc_kwargs]
-num_warmup = 800
-num_samples = 2600
+num_warmup = 200
+num_samples = 400
 num_chains = 4
 chain_method = "parallel"
 
@@ -62,6 +62,6 @@ cores_per_initial_conditions_worker = 1
 signals_per_block = 20
 fill_order = 0
 cores_per_sample_worker = 4
-k2_threshold = 1e8
+k2_threshold = 30
 cores_per_reconcile_worker = 4
 perform_minimize = false
