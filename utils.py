@@ -84,17 +84,15 @@ def get_signal_bounds(
         )
 
     frequency_halfwidth = (
-        f_fraction
-        * (signal_space.f_max - signal_space.f_min)
-    )
+        signal_space.f_max - signal_space.f_min
+    ) / f_fraction
 
     log_k_space_min = jnp.log(signal_space.k_min)
     log_k_space_max = jnp.log(signal_space.k_max)
 
     log_k_halfwidth = (
-        log_k_fraction
-        * (log_k_space_max - log_k_space_min)
-    )
+        log_k_space_max - log_k_space_min
+    ) / log_k_fraction
 
     frequency_min = jnp.maximum(
         fs - frequency_halfwidth,
@@ -258,9 +256,27 @@ def get_variance_break(
 
     return best_index
 
-def get_snr_index_break(snrs):
-    heuristic = []
 
-    index = heuristic.index(max(heuristic))
+def get_eigendecomposition(
+        matrix, 
+        tolerance=1e-10
+    ):
+    matrix = 0.5 * (matrix + matrix.T)
 
-    return index
+    eigenvalues, eigenvectors = jnp.linalg.eigh(matrix)
+
+    matrix_scale = jnp.maximum(
+        jnp.max(jnp.abs(eigenvalues)),
+        1.0,
+    )
+
+    tolerance = tolerance * matrix_scale
+
+    # Enforce positive definiteness.
+    eigenvalues = jnp.where(
+        eigenvalues < tolerance,
+        1e-12,
+        eigenvalues,
+    )
+
+    return eigenvalues, eigenvectors
