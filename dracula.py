@@ -48,6 +48,36 @@ def initialize_worker(core_queue):
 
     numpyro.set_host_device_count(len(worker_cores))
 
+def resolve_worker_count(available_cores, cores_per_worker, task_count):
+    if available_cores < 1:
+        raise RuntimeError("No CPU cores are available.")
+
+    if cores_per_worker is None:
+        cores_per_worker = 1
+
+    if not isinstance(cores_per_worker, (int, np.integer)):
+        raise TypeError(
+            "cores_per_worker must be an integer or None."
+        )
+
+    if cores_per_worker < 1:
+        raise ValueError(
+            "cores_per_worker must be at least 1."
+        )
+
+    max_workers = available_cores // cores_per_worker
+
+    if max_workers < 1:
+        raise RuntimeError(
+            f"Each worker requires {cores_per_worker} cores, "
+            f"but only {available_cores} are available."
+        )
+
+    # Avoid launching more workers than there are tasks.
+    actual_workers = min(max_workers, max(1, task_count))
+
+    return cores_per_worker, actual_workers
+
 @dataclass
 class SignalSpace:
     '''
@@ -465,6 +495,7 @@ def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
     noise_variance = bats.get_noise_variance(t, d, signals)
     snr = bats.get_snr(t, d, signals)
 
+    log_utils.plot_covariance_and_correlation(path / f"{len(signals)}_covariance_correlation.png", cov_mat, signals)
     log_utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
@@ -579,7 +610,6 @@ class Dracula():
 
         path = self.path / "initialize"
         path.mkdir(parents=True, exist_ok=True)
-        pbar = tqdm(total=subband_count)
 
         if subband_count == 1:
             subbands = [(self.signal_space.f_min, self.signal_space.f_max)]
@@ -629,7 +659,6 @@ class Dracula():
 
         context = mp.get_context("spawn")
 
-        # Determine the cores available to this process.
         if hasattr(os, "sched_getaffinity"):
             available_core_ids = sorted(os.sched_getaffinity(0))
         else:
@@ -637,38 +666,10 @@ class Dracula():
                 psutil.Process().cpu_affinity()
             )
 
-        available_cores = len(available_core_ids)
-
-        if available_cores == 0:
-            raise RuntimeError("No CPU cores are available.")
-
-        max_workers = available_cores // cores_per_worker
-        requested_workers = max(1, max_workers)
-
-        if cores_per_worker is None:
-            cores_per_worker = max(
-                1,
-                available_cores // requested_workers,
-            )
-
-        elif cores_per_worker < 1:
-            raise ValueError(
-                "cores_per_worker must be at least 1."
-            )
-
-        max_affinity_workers = (
-            available_cores // cores_per_worker
-        )
-
-        if max_affinity_workers < 1:
-            raise RuntimeError(
-                f"Each worker requires {cores_per_worker} cores, "
-                f"but only {available_cores} cores are available."
-            )
-
-        actual_workers = min(
-            requested_workers,
-            max_affinity_workers,
+        cores_per_worker, actual_workers = resolve_worker_count(
+            available_cores=len(available_core_ids),
+            cores_per_worker=cores_per_worker,
+            task_count=len(tasks),
         )
 
         required_cores = actual_workers * cores_per_worker
@@ -676,9 +677,10 @@ class Dracula():
         print(
             f"Launching {actual_workers} workers "
             f"with {cores_per_worker} cores per worker "
-            f"using {required_cores} of {available_cores} available cores."
+            f"using {required_cores} of {len(available_core_ids)} available cores."
         )
 
+        pbar = tqdm(total=subband_count)
         with context.Manager() as manager:
 
             core_queue = manager.Queue()
@@ -790,7 +792,6 @@ class Dracula():
             return
         
         return
-
                         
     def sample(
             self,
@@ -818,8 +819,6 @@ class Dracula():
         )
 
         tasks = []
-
-        pbar = tqdm(total=blocks)
 
         for ind in range(blocks):
             start = int(ind * stride)
@@ -885,7 +884,6 @@ class Dracula():
 
         context = mp.get_context("spawn")
 
-        # Determine the cores available to this process.
         if hasattr(os, "sched_getaffinity"):
             available_core_ids = sorted(os.sched_getaffinity(0))
         else:
@@ -893,38 +891,10 @@ class Dracula():
                 psutil.Process().cpu_affinity()
             )
 
-        available_cores = len(available_core_ids)
-
-        if available_cores == 0:
-            raise RuntimeError("No CPU cores are available.")
-
-        max_workers = available_cores // cores_per_worker
-        requested_workers = max(1, max_workers)
-
-        if cores_per_worker is None:
-            cores_per_worker = max(
-                1,
-                available_cores // requested_workers,
-            )
-
-        elif cores_per_worker < 1:
-            raise ValueError(
-                "cores_per_worker must be at least 1."
-            )
-
-        max_affinity_workers = (
-            available_cores // cores_per_worker
-        )
-
-        if max_affinity_workers < 1:
-            raise RuntimeError(
-                f"Each worker requires {cores_per_worker} cores, "
-                f"but only {available_cores} cores are available."
-            )
-
-        actual_workers = min(
-            requested_workers,
-            max_affinity_workers,
+        cores_per_worker, actual_workers = resolve_worker_count(
+            available_cores=len(available_core_ids),
+            cores_per_worker=cores_per_worker,
+            task_count=len(tasks),
         )
 
         required_cores = actual_workers * cores_per_worker
@@ -932,9 +902,10 @@ class Dracula():
         print(
             f"Launching {actual_workers} workers "
             f"with {cores_per_worker} cores per worker "
-            f"using {required_cores} of {available_cores} available cores."
+            f"using {required_cores} of {len(available_core_ids)} available cores."
         )
 
+        pbar = tqdm(total=blocks)
         with context.Manager() as manager:
 
             core_queue = manager.Queue()
@@ -1003,10 +974,8 @@ class Dracula():
             self.t,
             self.d,
             self.signals_sample,
-            self.signal_space,
-            signals_bounds=self.signals_bounds_sample,
+            self.signal_space
         )
-
 
     def reconcile(
             self, 
@@ -1017,8 +986,6 @@ class Dracula():
             cores_per_worker: int = 1
         ):
         "Reconciling degenerate signals..."
-
-        pbar = tqdm(total=1)
 
         path = self.path / "reconcile"
         path.mkdir(parents=True, exist_ok=True)
@@ -1040,7 +1007,6 @@ class Dracula():
 
         context = mp.get_context("spawn")
 
-        # Determine the cores available to this process.
         if hasattr(os, "sched_getaffinity"):
             available_core_ids = sorted(os.sched_getaffinity(0))
         else:
@@ -1048,38 +1014,10 @@ class Dracula():
                 psutil.Process().cpu_affinity()
             )
 
-        available_cores = len(available_core_ids)
-
-        if available_cores == 0:
-            raise RuntimeError("No CPU cores are available.")
-
-        max_workers = available_cores // cores_per_worker
-        requested_workers = max(1, max_workers)
-
-        if cores_per_worker is None:
-            cores_per_worker = max(
-                1,
-                available_cores // requested_workers,
-            )
-
-        elif cores_per_worker < 1:
-            raise ValueError(
-                "cores_per_worker must be at least 1."
-            )
-
-        max_affinity_workers = (
-            available_cores // cores_per_worker
-        )
-
-        if max_affinity_workers < 1:
-            raise RuntimeError(
-                f"Each worker requires {cores_per_worker} cores, "
-                f"but only {available_cores} cores are available."
-            )
-
-        actual_workers = min(
-            requested_workers,
-            max_affinity_workers,
+        cores_per_worker, actual_workers = resolve_worker_count(
+            available_cores=len(available_core_ids),
+            cores_per_worker=cores_per_worker,
+            task_count=1,
         )
 
         required_cores = actual_workers * cores_per_worker
@@ -1087,9 +1025,10 @@ class Dracula():
         print(
             f"Launching {actual_workers} workers "
             f"with {cores_per_worker} cores per worker "
-            f"using {required_cores} of {available_cores} available cores."
+            f"using {required_cores} of {len(available_core_ids)} available cores."
         )
 
+        pbar = tqdm(total=1)
         with context.Manager() as manager:
 
             core_queue = manager.Queue()
@@ -1132,7 +1071,6 @@ class Dracula():
             self.signal_space
         )
 
-
     def execute(
             self,
             subband_count: int = 2,
@@ -1155,6 +1093,11 @@ class Dracula():
 
             perform_minimize: bool = False,
     ):        
+        '''
+        Execution procedure for Dracula.
+        subband_count: number of subbands to split         
+        '''
+
         if not grid_search_args:
             grid_search_args = self.default_grid_search_args
         if not nuts_args_sample:
@@ -1221,8 +1164,8 @@ if __name__ == "__main__":
 
     nuts_kwargs = dict()
     mcmc_kwargs = dict(
-        num_warmup=20,
-        num_samples=20,
+        num_warmup=100,
+        num_samples=300,
         num_chains=2,
         progress_bar=True
     )
@@ -1237,11 +1180,14 @@ if __name__ == "__main__":
     model.execute(
         subband_count=1, 
         subband_scaling_factor=0.5,
+        f_fraction=2,
+        log_k_fraction=2,
         grid_search_args=grid_search_args,
-        cores_per_initial_conditions_worker=1,
-        depth=5,
+        nuts_args_init=None,
+        cores_per_initial_conditions_worker=2,
+        depth=15,
 
-        signals_per_block=5,
+        signals_per_block=15,
         fill_order=0,
         nuts_args_sample=nuts_args,
         cores_per_sample_worker=2,
