@@ -62,6 +62,6 @@ cores_per_initial_conditions_worker = 1
 signals_per_block = 20
 fill_order = 0
 cores_per_sample_worker = 4
-k2_threshold = 30
+k2_threshold = 20
 cores_per_reconcile_worker = 4
 perform_minimize = false
