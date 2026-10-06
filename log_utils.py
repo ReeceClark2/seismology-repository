@@ -753,3 +753,243 @@ def save_report_txt(path, signal_count, noise_variance, snr):
         file.write(f"Noise variance: {noise_variance}\n")
         file.write(f"SNR: {snr}\n")
 
+def plot_covariance_and_correlation(
+    path,
+    cov_mat,
+    signals,
+):
+    """
+    Plot raw covariance, quadrant-normalized covariance, and correlation.
+
+    The covariance matrix is assumed to use the flattened parameter order:
+
+        [f0, k0, f1, k1, ...]
+
+    For plotting, it is reordered to:
+
+        [f0, f1, ..., fn, k0, k1, ..., kn]
+    """
+    covariance = np.asarray(cov_mat, dtype=float)
+    signals = np.asarray(signals)
+
+    if signals.ndim == 1:
+        if signals.shape != (2,):
+            raise ValueError(
+                f"A single signal must have shape (2,), got {signals.shape}"
+            )
+        signals = signals[None, :]
+
+    if signals.ndim != 2 or signals.shape[1] != 2:
+        raise ValueError(
+            "signals must have shape (n_signals, 2), "
+            f"got {signals.shape}"
+        )
+
+    if covariance.ndim != 2:
+        raise ValueError(
+            f"cov_mat must be two-dimensional, got {covariance.shape}"
+        )
+
+    if covariance.shape[0] != covariance.shape[1]:
+        raise ValueError(
+            f"cov_mat must be square, got {covariance.shape}"
+        )
+
+    n_signals = len(signals)
+    parameter_count = 2 * n_signals
+
+    if covariance.shape != (parameter_count, parameter_count):
+        raise ValueError(
+            "cov_mat shape must match the flattened signal parameters. "
+            f"Expected {(parameter_count, parameter_count)}, "
+            f"got {covariance.shape}"
+        )
+
+    if not np.all(np.isfinite(covariance)):
+        raise ValueError("cov_mat must contain only finite values.")
+
+    # Remove small numerical asymmetries.
+    covariance = 0.5 * (covariance + covariance.T)
+
+    # Original order:
+    # [f0, k0, f1, k1, ...]
+    #
+    # Plotting order:
+    # [f0, f1, ..., fn, k0, k1, ..., kn]
+    permutation = np.concatenate((
+        2 * np.arange(n_signals),
+        2 * np.arange(n_signals) + 1,
+    ))
+
+    covariance = covariance[
+        np.ix_(permutation, permutation)
+    ]
+
+    labels = (
+        [
+            rf"$f_{index}$"
+            for index in range(n_signals)
+        ]
+        + [
+            rf"$k_{index}$"
+            for index in range(n_signals)
+        ]
+    )
+
+    # ------------------------------------------------------------------
+    # Create quadrant-normalized covariance.
+    #
+    # Matrix layout:
+    #
+    #              frequencies       decay rates
+    #       frequencies       FF                FK
+    #       decay rates       KF                KK
+    #
+    # Each quadrant is independently divided by its largest absolute
+    # value. This preserves relative structure within each quadrant.
+    # ------------------------------------------------------------------
+    normalized_covariance = np.empty_like(covariance)
+
+    frequency_indices = np.arange(n_signals)
+    decay_indices = np.arange(n_signals, parameter_count)
+
+    quadrants = (
+        (frequency_indices, frequency_indices),  # FF
+        (frequency_indices, decay_indices),      # FK
+        (decay_indices, frequency_indices),      # KF
+        (decay_indices, decay_indices),           # KK
+    )
+
+    for row_indices, column_indices in quadrants:
+        block = covariance[
+            np.ix_(row_indices, column_indices)
+        ]
+
+        scale = np.max(np.abs(block))
+
+        if scale > 0:
+            normalized_block = block / scale
+        else:
+            normalized_block = np.zeros_like(block)
+
+        normalized_covariance[
+            np.ix_(row_indices, column_indices)
+        ] = normalized_block
+
+    # Re-enforce symmetry to remove tiny numerical differences between
+    # the independently normalized off-diagonal blocks.
+    normalized_covariance = (
+        0.5
+        * (normalized_covariance + normalized_covariance.T)
+    )
+
+    # ------------------------------------------------------------------
+    # Calculate the ordinary correlation matrix from the raw covariance.
+    # ------------------------------------------------------------------
+    variances = np.diag(covariance)
+
+    if np.any(variances < 0):
+        raise ValueError(
+            "Covariance matrix contains negative diagonal entries."
+        )
+
+    standard_deviations = np.sqrt(variances)
+    denominator = np.outer(
+        standard_deviations,
+        standard_deviations,
+    )
+
+    correlation = np.full_like(covariance, np.nan)
+
+    valid = denominator > 0
+    correlation[valid] = covariance[valid] / denominator[valid]
+
+    positive_variance = variances > 0
+    diagonal_indices = np.diag_indices_from(correlation)
+    correlation[diagonal_indices] = np.where(
+        positive_variance,
+        1.0,
+        np.nan,
+    )
+
+    # ------------------------------------------------------------------
+    # Plot all three matrices.
+    # ------------------------------------------------------------------
+    raw_covariance_scale = np.max(np.abs(covariance))
+
+    if raw_covariance_scale == 0:
+        raw_covariance_scale = 1.0
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(18, 5.5),
+        constrained_layout=True,
+    )
+
+    raw_image = axes[0].imshow(
+        covariance,
+        cmap="RdBu_r",
+        vmin=-raw_covariance_scale,
+        vmax=raw_covariance_scale,
+        interpolation="nearest",
+    )
+
+    normalized_image = axes[1].imshow(
+        normalized_covariance,
+        cmap="RdBu_r",
+        vmin=-1.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+
+    correlation_image = axes[2].imshow(
+        np.ma.masked_invalid(correlation),
+        cmap="RdBu_r",
+        vmin=-1.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+
+    titles = (
+        "Raw Covariance",
+        "Quadrant-Normalized Covariance",
+        "Correlation",
+    )
+
+    for ax, title in zip(axes, titles):
+        ax.set_title(title)
+        ax.set_xticks(np.arange(parameter_count))
+        ax.set_yticks(np.arange(parameter_count))
+        ax.set_xticklabels(labels, rotation=90)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("Parameter")
+        ax.set_ylabel("Parameter")
+
+    raw_colorbar = fig.colorbar(
+        raw_image,
+        ax=axes[0],
+        fraction=0.046,
+        pad=0.04,
+    )
+    raw_colorbar.set_label("Covariance")
+
+    normalized_colorbar = fig.colorbar(
+        normalized_image,
+        ax=axes[1],
+        fraction=0.046,
+        pad=0.04,
+    )
+    normalized_colorbar.set_label("Scaled covariance")
+
+    correlation_colorbar = fig.colorbar(
+        correlation_image,
+        ax=axes[2],
+        fraction=0.046,
+        pad=0.04,
+    )
+    correlation_colorbar.set_label("Correlation")
+
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    
