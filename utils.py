@@ -256,43 +256,61 @@ def get_variance_break(
 
     return best_index
 
+
+def _get_eigenvalue_scale(eigenvalues):
+    """Compute a spectral scale independently for each matrix."""
+    scale = jnp.max(
+        jnp.abs(eigenvalues),
+        axis=-1,
+        keepdims=True,
+    )
+
+    # Relative scaling is undefined for an exactly zero matrix.
+    return jnp.where(
+        scale > 0,
+        scale,
+        jnp.ones_like(scale),
+    )
+
+
 def get_g_eigendecomposition(
     matrix,
     tolerance=1e-10,
 ):
-    matrix = 0.5 * (matrix + matrix.T)
+    matrix = jnp.asarray(matrix)
+    matrix = 0.5 * (
+        matrix
+        + jnp.swapaxes(jnp.conj(matrix), -1, -2)
+    )
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(matrix)
 
-    scale = jnp.maximum(
-        jnp.max(jnp.abs(eigenvalues)),
-        jnp.finfo(matrix.dtype).tiny,
-    )
+    scale = _get_eigenvalue_scale(eigenvalues)
     eigenvalue_floor = tolerance * scale
 
-    eigenvalues = jnp.maximum(eigenvalues, eigenvalue_floor)
+    eigenvalues = jnp.maximum(
+        eigenvalues,
+        eigenvalue_floor,
+    )
 
     return eigenvalues, eigenvectors
 
 
 def get_h_eigendecomposition(
     matrix,
-    tolerance=1e-8,
-    ridge=1e-10,
+    ridge=1e-8,
 ):
-    matrix = 0.5 * (matrix + matrix.T)
+    matrix = jnp.asarray(matrix)
+    matrix = 0.5 * (
+        matrix
+        + jnp.swapaxes(jnp.conj(matrix), -1, -2)
+    )
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(matrix)
 
-    scale = jnp.maximum(
-        jnp.max(jnp.abs(eigenvalues)),
-        jnp.finfo(matrix.dtype).tiny,
-    )
-    eigenvalue_floor = tolerance * scale
+    scale = _get_eigenvalue_scale(eigenvalues)
+    relative_ridge = ridge * scale
 
-    eigenvalues = jnp.maximum(
-        eigenvalues + ridge,
-        eigenvalue_floor,
-    )
+    eigenvalues = eigenvalues + relative_ridge
 
     return eigenvalues, eigenvectors

@@ -362,6 +362,10 @@ def get_cov_mat(t, d, signals):
     '''
     Return covariance matrix for parameters.
     '''
+    fs, ks = utils.unpack_signals(signals)
+    r = fs.shape[0]
+    m = 2 * r
+    N = d.shape[0]
 
     theta, unravel = ravel_pytree(signals)
     
@@ -378,11 +382,6 @@ def get_cov_mat(t, d, signals):
         @ jnp.diag(1.0 / eigenvalues)
         @ eigenvectors.T
     )
-
-    fs, ks = utils.unpack_signals(signals)
-    r = fs.shape[0]
-    m = 2 * r
-    N = d.shape[0]
 
     # Use the same projection calculations as get_noise_variance.
     noise_variance = get_noise_variance(t, d, signals)
