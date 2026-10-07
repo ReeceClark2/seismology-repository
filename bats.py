@@ -46,9 +46,9 @@ def get_log_prob(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
-    # Bretthorst Eq. 3.6: orthonormal functions H
+    # Bretthorst Eq. 3.5: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     
     # Bretthorst Eq. 3.13: projection amplitudes h
@@ -86,7 +86,7 @@ def get_gram(
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
     return g, eigenvalues, eigenvectors
 
@@ -140,7 +140,7 @@ def get_noise_variance(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -178,7 +178,7 @@ def get_snr(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -218,7 +218,7 @@ def get_mean_sq_proj(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -257,7 +257,7 @@ def get_glob_ll(
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d
@@ -290,7 +290,7 @@ def get_glob_ll(
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(b)
+    eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
 
     log_jacobian_factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
 
@@ -335,49 +335,43 @@ def get_phasor_parameters(
         jnp.cos(arg) * decay,
         jnp.sin(arg) * decay,
     ))
+    g = G @ G.T
 
-    # G.T has shape (N, 2r)
-    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
+    # Bretthorst Eq. 3.5: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    beta = eigenvectors @ (h / jnp.sqrt(eigenvalues))
     n_components = fs.shape[0]
-    cosine_coefficients = coefficients[:n_components]
-    sine_coefficients = coefficients[n_components:]
 
-    amplitudes = jnp.sqrt(
-        cosine_coefficients**2 + sine_coefficients**2
-    )
+    cosine_coefficients = beta[:n_components]
+    sine_coefficients = beta[n_components:]
 
+    amplitudes = jnp.sqrt(cosine_coefficients**2 + sine_coefficients**2)
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
 
     return amplitudes, phases
 
-def get_information_matrix(t, d, signals):
-    '''
-    Bretthorst Eq. 4.11
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
-
-    omegas = 2.0 * jnp.pi * fs
-    r = omegas.shape[0]
-    m = 2 * r
-
-    theta, unravel = ravel_pytree(signals)
-
-    def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
-
-    b = (-m / 2) * jax.hessian(objective)(theta)
-    return 0.5 * (b + b.T)
 
 def get_cov_mat(t, d, signals):
     '''
     Return covariance matrix for parameters.
     '''
 
-    information = get_information_matrix(t, d, signals)
+    theta, unravel = ravel_pytree(signals)
+    
+    def objective(theta):
+        return get_mean_sq_proj(t, d, unravel(theta))
 
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(information)
+    b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
+
+    eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
 
     information_inverse = (
         eigenvectors
@@ -420,7 +414,7 @@ def get_uncertainties(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(g)
+    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -436,7 +430,7 @@ def get_uncertainties(
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = utils.get_eigendecomposition(b)
+    eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
 
     sum_sq_data = jnp.sum(d**2)
     sum_sq_proj = jnp.sum(h**2)
@@ -464,7 +458,7 @@ def reconcile(
         signal_space,
         signals,
         signals_bounds,
-        k2_threshold=1e2,
+        k2_threshold=10,
         nuts_args=None,
     ):
     '''
@@ -490,7 +484,6 @@ def reconcile(
 
         # Gram eigenvalues are squared singular values.
         k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
-        print(round(k2, 3))
         if k2 <= k2_threshold:
             break
 

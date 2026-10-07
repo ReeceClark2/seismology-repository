@@ -256,27 +256,43 @@ def get_variance_break(
 
     return best_index
 
-
-def get_eigendecomposition(
-        matrix, 
-        tolerance=1e-10
-    ):
+def get_g_eigendecomposition(
+    matrix,
+    tolerance=1e-10,
+):
     matrix = 0.5 * (matrix + matrix.T)
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(matrix)
 
-    matrix_scale = jnp.maximum(
+    scale = jnp.maximum(
         jnp.max(jnp.abs(eigenvalues)),
-        1.0,
+        jnp.finfo(matrix.dtype).tiny,
     )
+    eigenvalue_floor = tolerance * scale
 
-    tolerance = tolerance * matrix_scale
+    eigenvalues = jnp.maximum(eigenvalues, eigenvalue_floor)
 
-    # Enforce positive definiteness.
-    eigenvalues = jnp.where(
-        eigenvalues < tolerance,
-        1e-12,
-        eigenvalues,
+    return eigenvalues, eigenvectors
+
+
+def get_h_eigendecomposition(
+    matrix,
+    tolerance=1e-8,
+    ridge=1e-10,
+):
+    matrix = 0.5 * (matrix + matrix.T)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(matrix)
+
+    scale = jnp.maximum(
+        jnp.max(jnp.abs(eigenvalues)),
+        jnp.finfo(matrix.dtype).tiny,
+    )
+    eigenvalue_floor = tolerance * scale
+
+    eigenvalues = jnp.maximum(
+        eigenvalues + ridge,
+        eigenvalue_floor,
     )
 
     return eigenvalues, eigenvectors
