@@ -53,15 +53,15 @@ chain_method = "parallel"
 seed = 1
 
 [execute]
-subband_count = 4
+subband_count = 2
 subband_scaling_factor = 1.0
 f_fraction = 12
 log_k_fraction = 4
-depth = 15
+depth = 20
 cores_per_initial_conditions_worker = 1
 signals_per_block = 20
 fill_order = 0
 cores_per_sample_worker = 4
-k2_threshold = 25
+k2_threshold = 10
 cores_per_reconcile_worker = 4
 perform_minimize = false

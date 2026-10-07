@@ -23,6 +23,20 @@ path = "trial_9"
 f_points = 200
 k_points = 200
 
+[nuts.init.nuts_kwargs]
+target_accept_prob = 0.8
+
+[nuts.init.mcmc_kwargs]
+num_warmup = 100
+num_samples = 200
+num_chains = 8
+chain_method = "parallel"
+
+[nuts.init.run_kwargs]
+
+[nuts.init]
+seed = 1
+
 [nuts.sample.nuts_kwargs]
 target_accept_prob = 0.8
 
@@ -53,15 +67,15 @@ chain_method = "parallel"
 seed = 1
 
 [execute]
-subband_count = 4
+subband_count = 1
 subband_scaling_factor = 1.0
 f_fraction = 12
 log_k_fraction = 4
-depth = 15
-cores_per_initial_conditions_worker = 1
+depth = 40
+cores_per_initial_conditions_worker = 8
 signals_per_block = 20
 fill_order = 0
 cores_per_sample_worker = 4
-k2_threshold = 5
+k2_threshold = 6
 cores_per_reconcile_worker = 4
 perform_minimize = false
