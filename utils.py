@@ -300,6 +300,7 @@ def get_h_eigendecomposition(
     matrix,
     ridge=1e-8,
 ):
+    """Return an eigendecomposition of a positive-definite shifted Hessian."""
     matrix = jnp.asarray(matrix)
     matrix = 0.5 * (
         matrix
@@ -311,6 +312,20 @@ def get_h_eigendecomposition(
     scale = _get_eigenvalue_scale(eigenvalues)
     relative_ridge = ridge * scale
 
-    eigenvalues = eigenvalues + relative_ridge
+    minimum_eigenvalue = jnp.min(
+        eigenvalues,
+        axis=-1,
+        keepdims=True,
+    )
+
+    # Apply one scalar diagonal shift per matrix. If the Hessian is
+    # indefinite, first eliminate its negative curvature and then add
+    # the requested relative ridge.
+    diagonal_shift = (
+        jnp.maximum(-minimum_eigenvalue, 0.0)
+        + relative_ridge
+    )
+
+    eigenvalues = eigenvalues + diagonal_shift
 
     return eigenvalues, eigenvectors
