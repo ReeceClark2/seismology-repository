@@ -23,19 +23,33 @@ path = "trial_3"
 f_points = 200
 k_points = 200
 
+[nuts.init.nuts_kwargs]
+target_accept_prob = 0.8
+
+[nuts.init.mcmc_kwargs]
+num_warmup = 100
+num_samples = 100
+num_chains = 8
+chain_method = "parallel"
+
+[nuts.init.run_kwargs]
+
+[nuts.init]
+seed = 3
+
 [nuts.sample.nuts_kwargs]
 target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
 num_warmup = 200
 num_samples = 400
-num_chains = 4
+num_chains = 8
 chain_method = "parallel"
 
 [nuts.sample.run_kwargs]
 
 [nuts.sample]
-seed = 1
+seed = 3
 
 [nuts.reconcile.nuts_kwargs]
 target_accept_prob = 0.8
@@ -44,24 +58,24 @@ max_tree_depth = [5, 5]
 [nuts.reconcile.mcmc_kwargs]
 num_warmup = 200
 num_samples = 400
-num_chains = 4
+num_chains = 8
 chain_method = "parallel"
 
 [nuts.reconcile.run_kwargs]
 
 [nuts.reconcile]
-seed = 1
+seed = 3
 
 [execute]
-subband_count = 3
+subband_count = 2
 subband_scaling_factor = 1.0
 f_fraction = 12
 log_k_fraction = 4
-depth = 15
-cores_per_initial_conditions_worker = 1
-signals_per_block = 20
+depth = 20
+cores_per_initial_conditions_worker = 8
+signals_per_block = 40
 fill_order = 0
-cores_per_sample_worker = 4
+cores_per_sample_worker = 8
 k2_threshold = 10
-cores_per_reconcile_worker = 4
+cores_per_reconcile_worker = 8
 perform_minimize = false
