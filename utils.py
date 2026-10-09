@@ -298,7 +298,7 @@ def get_g_eigendecomposition(
 
 def get_h_eigendecomposition(
     matrix,
-    ridge=1e-8,
+    ridge=1e-6,
 ):
     """Return an eigendecomposition of a positive-definite shifted Hessian."""
     matrix = jnp.asarray(matrix)

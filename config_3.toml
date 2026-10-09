@@ -20,8 +20,8 @@ k_max = 1e-4
 path = "trial_3"
 
 [grid_search]
-f_points = 200
-k_points = 200
+f_points = 500
+k_points = 500
 
 [nuts.init.nuts_kwargs]
 target_accept_prob = 0.8
@@ -41,8 +41,8 @@ seed = 3
 target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
-num_warmup = 200
-num_samples = 400
+num_warmup = 300
+num_samples = 600
 num_chains = 8
 chain_method = "parallel"
 
@@ -56,8 +56,8 @@ target_accept_prob = 0.8
 max_tree_depth = [5, 5]
 
 [nuts.reconcile.mcmc_kwargs]
-num_warmup = 200
-num_samples = 400
+num_warmup = 300
+num_samples = 600
 num_chains = 8
 chain_method = "parallel"
 

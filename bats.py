@@ -483,6 +483,7 @@ def reconcile(
 
         # Gram eigenvalues are squared singular values.
         k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
+        print(round(k2, 3))
         if k2 <= k2_threshold:
             break
 
