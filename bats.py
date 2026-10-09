@@ -745,7 +745,7 @@ def nuts(
     nuts_config.update(nuts_kwargs)
 
     if rng_key_value is None:
-        rng_key_value = random.randint(1, 1_000)
+        rng_key_value = random.randint(1, 10_000)
     else:
         rng_key_value = rng_key_value + len(signals)
 

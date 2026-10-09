@@ -35,7 +35,7 @@ chain_method = "parallel"
 [nuts.init.run_kwargs]
 
 [nuts.init]
-seed = 1
+seed = None
 
 [nuts.sample.nuts_kwargs]
 target_accept_prob = 0.8
@@ -49,7 +49,7 @@ chain_method = "parallel"
 [nuts.sample.run_kwargs]
 
 [nuts.sample]
-seed = 1
+seed = None
 
 [nuts.reconcile.nuts_kwargs]
 target_accept_prob = 0.8
@@ -64,7 +64,7 @@ chain_method = "parallel"
 [nuts.reconcile.run_kwargs]
 
 [nuts.reconcile]
-seed = 1
+seed = None
 
 [execute]
 subband_count = 2
