@@ -102,7 +102,7 @@ class NUTSArgs:
     '''
     Defines the NUTS dictionaries to pass all numpyro kwargs.
     '''
-    seed: Any
+    seed: Any = None
     nuts_kwargs: dict[str, Any] = field(default_factory=dict)
     mcmc_kwargs: dict[str, Any] = field(default_factory=dict)
     run_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -273,11 +273,11 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     index = glob_lls.index(max(glob_lls))
     stop = index + 1
 
-    signals = deepcopy(signals_by_depth)
-    signals_bounds = deepcopy(signals_bounds_by_depth)
-    noise_variances = noise_variances
-    snrs = snrs
-    glob_lls = glob_lls
+    signals = deepcopy(signals_by_depth[stop])
+    signals_bounds = deepcopy(signals_bounds_by_depth[stop])
+    noise_variances = noise_variances[:stop]
+    snrs = snrs[:stop]
+    glob_lls = glob_lls[:stop]
 
     signals = deepcopy(signals_by_depth[len(signals)])
     signals_bounds = deepcopy(signals_bounds_by_depth[len(signals_bounds)])

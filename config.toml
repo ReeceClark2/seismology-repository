@@ -7,14 +7,14 @@ station = "BFO"
 channel = "LHZ"
 location = "00"
 stream_index = 0
-start_time = "2025-07-30T01:24:50"
-end_time = "2025-08-05T20:24:50"
-min_f = 0.003
-max_f = 0.004
+start_time = "2025-07-30T04:24:50"
+end_time = "2025-08-11T20:24:50"
+min_f = 0.0002
+max_f = 0.0012
 
 [model]
-f_min = 0.0027
-f_max = 0.0043
+f_min = 0.0002
+f_max = 0.0014
 k_min = 1e-5
 k_max = 1e-4
 path = "testing"

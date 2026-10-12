@@ -278,6 +278,7 @@ def get_glob_ll(
     variance_data = jnp.maximum(jnp.var(d), eps)
     variance_residual = jnp.maximum(jnp.var(residual), eps)
 
+    # TODO: Fix the variance integration bounds.
     log_R_delta = 2.0 * jnp.log(amplitude_max / amplitude_min)
     log_R_gamma = jnp.log(1e3)
     log_R_sigma = jnp.log(jnp.maximum(variance_data / variance_residual, 1.0))
@@ -375,7 +376,7 @@ def get_cov_mat(t, d, signals):
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
 
     information_inverse = (
         eigenvectors

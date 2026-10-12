@@ -57,8 +57,6 @@ def observed_data(
         "bandpass",
         freqmin=min_f,
         freqmax=max_f,
-        corners=2,
-        zerophase=True,
     )
 
     delta = float(trace.stats.delta)
