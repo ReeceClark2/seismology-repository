@@ -47,7 +47,7 @@ def observed_data(
     )
 
     trace = stream[stream_index]
-    trace.detrend("constant")
+    trace.detrend("linear")
     trace.remove_response(inventory=inventory, output="ACC")
 
     trace.decimate(5, no_filter=False)

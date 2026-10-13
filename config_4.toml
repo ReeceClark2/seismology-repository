@@ -23,26 +23,13 @@ path = "trial_4"
 f_points = 500
 k_points = 500
 
-[nuts.init.nuts_kwargs]
-target_accept_prob = 0.8
-
-[nuts.init.mcmc_kwargs]
-num_warmup = 100
-num_samples = 100
-num_chains = 8
-chain_method = "parallel"
-
-[nuts.init.run_kwargs]
-
-[nuts.init]
-
 
 [nuts.sample.nuts_kwargs]
 target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
-num_warmup = 300
-num_samples = 600
+num_warmup = 400
+num_samples = 900
 num_chains = 8
 chain_method = "parallel"
 
