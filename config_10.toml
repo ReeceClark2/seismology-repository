@@ -1,0 +1,68 @@
+[runtime]
+parameter_txt = "trial_10_parameters.txt"
+
+[data]
+network = "II"
+station = "BFO"
+channel = "LHZ"
+location = "00"
+stream_index = 0
+start_time = "2025-07-30T04:24:50"
+end_time = "2025-08-11T20:24:50"
+min_f = 0.0002
+max_f = 0.0012
+
+[model]
+f_min = 0.0002
+f_max = 0.0014
+k_min = 4.4e-7
+k_max = 5e-5
+path = "trial_10"
+
+[grid_search]
+f_points = 500
+k_points = 500
+
+
+[nuts.sample.nuts_kwargs]
+target_accept_prob = 0.8
+
+[nuts.sample.mcmc_kwargs]
+num_warmup = 400
+num_samples = 900
+num_chains = 8
+chain_method = "parallel"
+
+[nuts.sample.run_kwargs]
+
+[nuts.sample]
+
+
+[nuts.reconcile.nuts_kwargs]
+target_accept_prob = 0.8
+max_tree_depth = [5, 5]
+
+[nuts.reconcile.mcmc_kwargs]
+num_warmup = 300
+num_samples = 600
+num_chains = 8
+chain_method = "parallel"
+
+[nuts.reconcile.run_kwargs]
+
+[nuts.reconcile]
+
+
+[execute]
+subband_count = 4
+subband_scaling_factor = 1.0
+f_fraction = 12
+log_k_fraction = 3
+depth = 12
+cores_per_initial_conditions_worker = 8
+signals_per_block = 40
+fill_order = 0
+cores_per_sample_worker = 8
+k2_threshold = 10
+cores_per_reconcile_worker = 8
+perform_minimize = false
