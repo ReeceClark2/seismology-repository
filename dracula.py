@@ -497,7 +497,7 @@ def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
 
     log_utils.plot_covariance_and_correlation(path / f"{len(signals)}_covariance_correlation.png", cov_mat, signals)
     log_utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
-    log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
+    log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000, amplitudes=amplitudes, phases=phases)
 
     log_utils.plot_time_series(
         path / f"{len(signals)}_time_series.png", 

@@ -357,36 +357,43 @@ def plot_fourier_space(
     f_max,
     f_points,
     signals=None,
-    model=None,
+    amplitudes=None,
+    phases=None,
 ):
-    t = np.asarray(t)
-    d = np.asarray(d)
+    """
+    Plot one-sided, length-normalized Fourier amplitudes.
+
+    If signals, amplitudes, and phases are all supplied, construct a
+    Fourier-space model from exponentially decaying sinusoids:
+
+        A * sin(2 * pi * f0 * t + phi) * exp(-k * t)
+
+    where `signals` must unpack into (frequencies, decay_rates).
+
+    The Fourier-space model uses the convention
+
+        F(nu) = integral_0^inf x(t) exp(-2j*pi*nu*t) dt
+
+    and is scaled by the observation duration so that it is compatible
+    with the FFT/N normalization used for the data.
+    """
+    t = np.asarray(t, dtype=float)
+    d = np.asarray(d, dtype=float)
 
     if t.ndim != 1 or d.ndim != 1:
-        raise ValueError("t and d must be one-dimensional")
+        raise ValueError("t and d must be one-dimensional.")
 
     if len(t) != len(d):
-        raise ValueError("t and d must have matching lengths")
+        raise ValueError("t and d must have matching lengths.")
 
     if len(t) < 2:
-        raise ValueError("At least two time samples are required")
+        raise ValueError("At least two time samples are required.")
 
     if f_min < 0 or f_max <= f_min:
         raise ValueError("Require 0 <= f_min < f_max.")
 
     if f_points < 2:
         raise ValueError("f_points must be at least 2.")
-
-    if model is not None:
-        model = np.asarray(model)
-
-        if model.ndim != 1:
-            raise ValueError("model must be one-dimensional")
-
-        if len(model) != len(t):
-            raise ValueError(
-                "model must have the same length as t and d"
-            )
 
     dt_values = np.diff(t)
 
@@ -396,73 +403,259 @@ def plot_fourier_space(
         )
 
     sample_interval = float(dt_values[0])
+
+    if sample_interval <= 0:
+        raise ValueError("Time values must be strictly increasing.")
+
     sample_rate = 1.0 / sample_interval
     nyquist = 0.5 * sample_rate
 
     if f_max > nyquist:
         raise ValueError(
-            f"f_max={f_max} exceeds the Nyquist frequency "
-            f"{nyquist}."
+            f"f_max={f_max} exceeds the Nyquist frequency {nyquist}."
         )
 
-    # Exactly f_points frequencies in [f_min, f_max].
+    have_model_parameters = (
+        signals is not None
+        or amplitudes is not None
+        or phases is not None
+    )
+
+    if have_model_parameters and (
+        signals is None
+        or amplitudes is None
+        or phases is None
+    ):
+        raise ValueError(
+            "signals, amplitudes, and phases must all be supplied "
+            "to construct a Fourier-space model."
+        )
+
+    frequencies_signal = None
+    decay_rates = None
+    amplitudes_array = None
+    phases_array = None
+
+    if signals is not None:
+        frequencies_signal, decay_rates = utils.unpack_signals(signals)
+
+        frequencies_signal = np.asarray(
+            frequencies_signal,
+            dtype=float,
+        ).ravel()
+
+        decay_rates = np.asarray(
+            decay_rates,
+            dtype=float,
+        ).ravel()
+
+        if len(frequencies_signal) != len(decay_rates):
+            raise ValueError(
+                "Signal frequencies and decay rates must have "
+                "matching lengths."
+            )
+
+        if np.any(frequencies_signal < 0):
+            raise ValueError(
+                "Signal frequencies must be non-negative."
+            )
+
+        if np.any(decay_rates <= 0):
+            raise ValueError(
+                "Decay rates must be strictly positive for the "
+                "Lorentzian Fourier-space model."
+            )
+
+    if have_model_parameters:
+        amplitudes_array = np.asarray(
+            amplitudes,
+            dtype=float,
+        ).ravel()
+
+        phases_array = np.asarray(
+            phases,
+            dtype=float,
+        ).ravel()
+
+        n_signals = len(frequencies_signal)
+
+        if len(amplitudes_array) != n_signals:
+            raise ValueError(
+                "amplitudes must have one value per signal."
+            )
+
+        if len(phases_array) != n_signals:
+            raise ValueError(
+                "phases must have one value per signal."
+            )
+
+        if np.any(phases_array < -np.pi) or np.any(
+            phases_array > np.pi
+        ):
+            raise ValueError(
+                "phases must lie in the interval [-pi, pi]."
+            )
+
     target_frequencies = np.linspace(
         f_min,
         f_max,
         f_points,
     )
 
-    # Native FFT frequency spacing should be fine enough for interpolation.
     target_spacing = (
         f_max - f_min
     ) / (f_points - 1)
 
     required_n_fft = int(
         np.ceil(
-            1.0
-            / (sample_interval * target_spacing)
+            1.0 / (sample_interval * target_spacing)
         )
     )
 
-    n_fft = max(len(t), required_n_fft)
+    n_samples = len(d)
+    n_fft = max(n_samples, required_n_fft)
 
-    frequencies = np.fft.rfftfreq(
+    fft_frequencies = np.fft.rfftfreq(
         n_fft,
         d=sample_interval,
     )
 
-    def interpolated_spectrum(x):
-        spectrum = np.abs(
-            np.fft.rfft(x, n=n_fft)
+    # The normalization deliberately uses n_samples rather than n_fft:
+    # zero-padding improves frequency resolution but must not change
+    # the plotted amplitude.
+    data_fft = np.fft.rfft(d, n=n_fft) / n_samples
+
+    def interpolate_complex_spectrum(
+        source_frequencies,
+        source_spectrum,
+        destination_frequencies,
+    ):
+        """Interpolate real and imaginary parts separately."""
+        real_part = np.interp(
+            destination_frequencies,
+            source_frequencies,
+            source_spectrum.real,
         )
 
-        return np.interp(
-            target_frequencies,
-            frequencies,
-            spectrum,
+        imaginary_part = np.interp(
+            destination_frequencies,
+            source_frequencies,
+            source_spectrum.imag,
         )
 
-    data_spectrum = interpolated_spectrum(d)
+        return real_part + 1j * imaginary_part
+
+    data_spectrum_complex = interpolate_complex_spectrum(
+        fft_frequencies,
+        data_fft,
+        target_frequencies,
+    )
+
+    # Convert a two-sided complex FFT coefficient into the standard
+    # one-sided amplitude representation. DC and Nyquist are not doubled.
+    one_sided_scale = np.full_like(
+        target_frequencies,
+        2.0,
+        dtype=float,
+    )
+
+    endpoint_mask = (
+        np.isclose(target_frequencies, 0.0)
+        | np.isclose(target_frequencies, nyquist)
+    )
+
+    one_sided_scale[endpoint_mask] = 1.0
+
+    data_amplitude = np.abs(
+        one_sided_scale * data_spectrum_complex
+    )
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
     ax.plot(
         target_frequencies,
-        data_spectrum,
+        data_amplitude,
         color="black",
         label="Data",
         linewidth=0.6,
     )
 
-    if model is not None:
-        residual = d - model
+    if have_model_parameters:
+        # The continuous Fourier transform of
+        #
+        # A * sin(2*pi*f0*t + phi) * exp(-k*t), for t >= 0,
+        #
+        # is
+        #
+        # A/(2j) * [
+        #   exp(j*phi) / (k + 2j*pi*(nu - f0))
+        #   - exp(-j*phi) / (k + 2j*pi*(nu + f0))
+        # ].
+        #
+        # Dividing by the observed duration makes it compatible with
+        # FFT(d) / n_samples, since dt * FFT(d) is the discrete
+        # approximation to the continuous Fourier transform.
+        observation_duration = n_samples * sample_interval
 
-        model_spectrum = interpolated_spectrum(model)
-        residual_spectrum = interpolated_spectrum(residual)
+        model_spectrum_complex = np.zeros_like(
+            target_frequencies,
+            dtype=complex,
+        )
+
+        for frequency, decay_rate, amplitude, phase in zip(
+            frequencies_signal,
+            decay_rates,
+            amplitudes_array,
+            phases_array,
+        ):
+            positive_frequency_term = (
+                np.exp(1j * phase)
+                / (
+                    decay_rate
+                    + 2j
+                    * np.pi
+                    * (target_frequencies - frequency)
+                )
+            )
+
+            negative_frequency_term = (
+                np.exp(-1j * phase)
+                / (
+                    decay_rate
+                    + 2j
+                    * np.pi
+                    * (target_frequencies + frequency)
+                )
+            )
+
+            lorentzian = (
+                amplitude
+                / (2j)
+                * (
+                    positive_frequency_term
+                    - negative_frequency_term
+                )
+            )
+
+            model_spectrum_complex += (
+                lorentzian / observation_duration
+            )
+
+        residual_spectrum_complex = (
+            data_spectrum_complex - model_spectrum_complex
+        )
+
+        model_amplitude = np.abs(
+            one_sided_scale * model_spectrum_complex
+        )
+
+        residual_amplitude = np.abs(
+            one_sided_scale * residual_spectrum_complex
+        )
 
         ax.plot(
             target_frequencies,
-            model_spectrum,
+            model_amplitude,
             color="red",
             label="Model",
             linewidth=0.6,
@@ -470,7 +663,7 @@ def plot_fourier_space(
 
         ax.plot(
             target_frequencies,
-            residual_spectrum,
+            residual_amplitude,
             color="blue",
             label="Residual",
             linewidth=0.6,
@@ -478,19 +671,14 @@ def plot_fourier_space(
 
     ax.set_xlim(f_min, f_max)
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Amplitude")
+    ax.set_ylabel("One-sided amplitude")
     ax.set_title(title)
 
-    if signals is not None:
-        fs, _ = utils.unpack_signals(signals)
-        fs = np.asarray(fs).ravel()
-
-        # Capture the limits established by the spectra before adding
-        # the vertical lines.
+    if frequencies_signal is not None:
         y_min, y_max = ax.get_ylim()
 
         ax.vlines(
-            fs,
+            frequencies_signal,
             ymin=y_min,
             ymax=y_max,
             color="red",
@@ -499,15 +687,55 @@ def plot_fourier_space(
             label="Signals",
         )
 
-        # Explicitly restore the original limits so the lines do not
-        # affect the y-axis scaling.
         ax.set_ylim(y_min, y_max)
 
     ax.legend()
-
     fig.tight_layout()
     fig.savefig(path.with_suffix(".svg"))
     plt.close(fig)
+
+    # Save a separate, uncluttered model-only plot when a model exists.
+    if have_model_parameters:
+        model_fig, model_ax = plt.subplots(figsize=(10, 5))
+
+        model_ax.plot(
+            target_frequencies,
+            model_amplitude,
+            color="black",
+            label="Model",
+            linewidth=0.6,
+        )
+
+        model_ax.set_xlim(f_min, f_max)
+        model_ax.set_xlabel("Frequency (Hz)")
+        model_ax.set_ylabel("One-sided amplitude")
+        model_ax.set_title(f"{title} — Model")
+
+        # Optional: retain the reference lines marking fitted signals.
+        if frequencies_signal is not None:
+            y_min, y_max = model_ax.get_ylim()
+
+            model_ax.vlines(
+                frequencies_signal,
+                ymin=y_min,
+                ymax=y_max,
+                color="red",
+                linestyle="--",
+                linewidth=0.4,
+                label="Signals",
+            )
+
+            model_ax.set_ylim(y_min, y_max)
+
+        model_ax.legend()
+        model_fig.tight_layout()
+
+        model_path = path.with_name(
+            f"{path.stem}_model.svg"
+        )
+
+        model_fig.savefig(model_path)
+        plt.close(model_fig)
 
 def save_subband_csv(path, signals, noise_variances, snrs, glob_lls):
     fieldnames = [
