@@ -200,17 +200,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     # subband_bounds = signal_space.f_max - signal_space.f_min
 
     subband_t = t.copy()
-    subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
-
-    t_max = jnp.log(0.2) / (-signal_space.k_min)
-
-    mask = t < t_max
-
-    subband_t = subband_t[mask]
-    subband_d = subband_d[mask]
-
-    t = t[mask]
-    d = d[mask]
+    # subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
+    subband_d = d.copy()
 
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
@@ -241,7 +232,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
 
     amplitudes, phases = bats.get_phasor_parameters(subband_t, subband_d, signals)
-    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model, amplitudes=amplitudes, phase=phases)
+    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
 
     reason = "depth"
     while True:
@@ -261,7 +252,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
         
         amplitudes, phases = bats.get_phasor_parameters(subband_t, subband_d, signals)
-        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model, amplitudes=amplitudes, phase=phases)
+        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
         
         signals_by_depth[len(signals)] = deepcopy(signals)
         signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
@@ -399,7 +390,7 @@ def run_sample_worker(
     log_utils.plot_time_series(path / f"model_time_series.png", t, d, "Model Time Series", model)
 
     amplitudes, phases = bats.get_phasor_parameters(t, d, signals)
-    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, model, amplitudes=amplitudes, phase=phases)
+    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
     log_utils.save_block_csv(path / "block_results.csv", signals)
 
     return list(zip(signal_indices, signals))
@@ -496,12 +487,12 @@ def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
     model = bats.get_model(t, d, signals)
     amplitudes, phases = bats.get_phasor_parameters(t, d, signals)
     uncertainties = bats.get_uncertainties(t, d, signals)
-    cov_mat = bats.get_cov_mat(t, d, signals)
+    # cov_mat = bats.get_cov_mat(t, d, signals)
 
     noise_variance = bats.get_noise_variance(t, d, signals)
     snr = bats.get_snr(t, d, signals)
 
-    log_utils.plot_covariance_and_correlation(path / f"{len(signals)}_covariance_correlation.png", cov_mat, signals)
+    # log_utils.plot_covariance_and_correlation(path / f"{len(signals)}_covariance_correlation.png", cov_mat, signals)
     log_utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
 
@@ -520,8 +511,7 @@ def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
         signal_space.f_min,
         signal_space.f_max,
         10_000,
-        signals,
-        model,
+        signals=signals,
         amplitudes=amplitudes, 
         phases=phases
     )

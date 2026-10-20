@@ -557,20 +557,27 @@ def grid_search(
     f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
 
     f_space = jnp.linspace(f_min, f_max, f_points)
-    f_delta = f_space[1] - f_space[0]
-
-    rng_key_value = random.randint(1, 10_000)
-    key = jax.random.key(rng_key_value)
-    jitter = jax.random.uniform(key, shape=(f_points,),minval=-f_delta / 2, maxval=f_delta / 2)
-    f_space = jnp.clip(f_space + jitter, f_min, f_max)
-
     k_space = jnp.geomspace(k_min, k_max, k_points)
+
+    f_delta = f_space[1] - f_space[0]
 
     f_grid, k_grid = jnp.meshgrid(
         f_space,
         k_space,
         indexing="ij",
     )
+
+    rng_key_value = random.randint(1, 10_000)
+    key = jax.random.key(rng_key_value)
+
+    f_jitter = jax.random.uniform(
+        key,
+        shape=(f_points, k_points),
+        minval=-f_delta / 2,
+        maxval=f_delta / 2,
+    )
+
+    f_grid = jnp.clip(f_grid + f_jitter, f_min, f_max)
 
     signal_grid = jnp.stack(
         [f_grid.ravel(), k_grid.ravel()],

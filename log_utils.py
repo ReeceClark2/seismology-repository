@@ -691,7 +691,7 @@ def plot_fourier_space(
 
     ax.legend()
     fig.tight_layout()
-    fig.savefig(path.with_suffix(".svg"))
+    fig.savefig(path.with_suffix(".png"), dpi=300)
     plt.close(fig)
 
     # Save a separate, uncluttered model-only plot when a model exists.
@@ -731,10 +731,10 @@ def plot_fourier_space(
         model_fig.tight_layout()
 
         model_path = path.with_name(
-            f"{path.stem}_model.svg"
+            f"{path.stem}_model.png"
         )
 
-        model_fig.savefig(model_path)
+        model_fig.savefig(model_path, dpi=300)
         plt.close(model_fig)
 
 def save_subband_csv(path, signals, noise_variances, snrs, glob_lls):
