@@ -616,6 +616,8 @@ def plot_fourier_space(
             dtype=complex,
         )
 
+        observation_duration = n_samples * sample_interval
+
         for frequency, decay_rate, amplitude, phase in zip(
             frequencies_signal,
             decay_rates,
@@ -636,52 +638,26 @@ def plot_fourier_space(
 
             positive_frequency_term = (
                 np.exp(1j * phase)
-                * (
-                    1.0
-                    - np.exp(
-                        -positive_denominator
-                        * observation_duration
-                    )
-                )
                 / positive_denominator
             )
 
             negative_frequency_term = (
                 np.exp(-1j * phase)
-                * (
-                    1.0
-                    - np.exp(
-                        -negative_denominator
-                        * observation_duration
-                    )
-                )
                 / negative_denominator
             )
 
-            finite_window_transform = (
+            model_spectrum_complex += (
                 amplitude
                 / (2j)
                 * (
                     positive_frequency_term
                     - negative_frequency_term
                 )
-            )
-
-            model_spectrum_complex += (
-                finite_window_transform
                 / observation_duration
             )
 
-        residual_spectrum_complex = (
-            data_spectrum_complex - model_spectrum_complex
-        )
-
         model_amplitude = np.abs(
             one_sided_scale * model_spectrum_complex
-        )
-
-        residual_amplitude = np.abs(
-            one_sided_scale * residual_spectrum_complex
         )
 
         ax.plot(
@@ -694,7 +670,7 @@ def plot_fourier_space(
 
         ax.plot(
             target_frequencies,
-            residual_amplitude,
+            data_amplitude-model_amplitude,
             color="blue",
             label="Residual",
             linewidth=0.6,
