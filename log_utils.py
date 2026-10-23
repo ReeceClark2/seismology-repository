@@ -3,8 +3,9 @@ import csv
 from collections.abc import Mapping
 
 # External libraries
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.ticker import FuncFormatter, LogLocator
 
@@ -12,10 +13,23 @@ from matplotlib.ticker import FuncFormatter, LogLocator
 import utils
 
 
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "font.size": 11,
+    "axes.titlesize": 11,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 11,
+    "mathtext.fontset": "stix",  # Helps math text resemble Times
+})
+
+
 def plot_time_series(path, t, d, title, model=None):
     if model is None:
         # Single plot when no model is provided
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(4, 2))
 
         ax.plot(t, d, color="black", label="Data", linewidth=0.6)
         ax.set_xlim(min(t), max(t))
@@ -29,7 +43,7 @@ def plot_time_series(path, t, d, title, model=None):
         fig, (ax_top, ax_bottom) = plt.subplots(
             2,
             1,
-            figsize=(10, 5),
+            figsize=(4, 2),
             sharex=True,
             gridspec_kw={"height_ratios": [2, 1]}
         )
@@ -61,7 +75,7 @@ def plot_probability_surface(path, probability_surface, title):
     f_space, k_space, log_prob_space = probability_surface
     log_prob_space = log_prob_space.T
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(4, 2))
 
     heatmap = ax.pcolormesh(
         f_space,
@@ -119,7 +133,7 @@ def plot_signal_space(
     signals_bounds=None,
     signal_space=None,
 ):
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(4, 2))
 
     fs, ks = utils.unpack_signals(signals)
 
@@ -570,7 +584,7 @@ def plot_fourier_space(
         one_sided_scale * data_spectrum_complex
     )
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(4, 2))
 
     ax.plot(
         target_frequencies,
@@ -696,7 +710,7 @@ def plot_fourier_space(
 
     # Save a separate, uncluttered model-only plot when a model exists.
     if have_model_parameters:
-        model_fig, model_ax = plt.subplots(figsize=(10, 5))
+        model_fig, model_ax = plt.subplots(figsize=(4, 2))
 
         model_ax.plot(
             target_frequencies,

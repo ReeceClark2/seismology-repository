@@ -4,78 +4,78 @@ parameter_txt = "dracula_run_parameters.txt"
 [data]
 network = "II"
 station = "BFO"
-channel = "LHZ"
+channel = "LG1"
 location = "00"
-stream_index = 0
-start_time = "2025-07-30T04:24:50"
-end_time = "2025-08-11T20:24:50"
-min_f = 0.0002
+stream_index = 1
+start_time = "2025-07-30T04:24:52"
+end_time = "2025-08-10T17:24:52"
+min_f = 0.0003
 max_f = 0.0012
 
 [model]
 f_min = 0.0002
-f_max = 0.0014
+f_max = 0.0016
 k_min = 4.4e-7
-k_max = 5e-5
-path = "testing"
+k_max = 1.5e-5
+path = "trial_BFO_10"
 
 [grid_search]
-f_points = 100
-k_points = 100
+f_points = 200
+k_points = 200
+
 
 [nuts.init.nuts_kwargs]
 target_accept_prob = 0.8
 
 [nuts.init.mcmc_kwargs]
-num_warmup = 20
-num_samples = 60
+num_warmup = 30
+num_samples = 70
 num_chains = 1
 chain_method = "parallel"
 
 [nuts.init.run_kwargs]
 
 [nuts.init]
-5
+
 
 [nuts.sample.nuts_kwargs]
-target_accept_prob = 0.85
+target_accept_prob = 0.8
 
 [nuts.sample.mcmc_kwargs]
-num_warmup = 100
-num_samples = 300
-num_chains = 4
+num_warmup = 20
+num_samples = 60
+num_chains = 32
 chain_method = "parallel"
 
 [nuts.sample.run_kwargs]
 
 [nuts.sample]
-54
+
 
 [nuts.reconcile.nuts_kwargs]
 target_accept_prob = 0.8
-max_tree_depth = [4, 4]
 
 [nuts.reconcile.mcmc_kwargs]
-num_warmup = 60
-num_samples = 100
+num_warmup = 20
+num_samples = 60
 num_chains = 32
 chain_method = "parallel"
 
 [nuts.reconcile.run_kwargs]
 
 [nuts.reconcile]
-3
+
 
 [execute]
-subband_count = 3
+subband_count = 6
 subband_scaling_factor = 1.0
-f_fraction = 16
-log_k_fraction = 8
-depth = 20
+f_fraction = 50
+log_k_fraction = 2
+depth = 10
 cores_per_initial_conditions_worker = 1
-signals_per_block = 16
+signals_per_block = 50
 fill_order = 0
-cores_per_sample_worker = 4
-k2_threshold = 1e2
-cores_per_reconcile_worker = 32
+cores_per_sample_worker = 1
+k2_threshold = 8
+cores_per_reconcile_worker = 1
 perform_minimize = false

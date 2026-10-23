@@ -11,6 +11,7 @@ import numpyro
 import numpyro.distributions as dist
 from jax.flatten_util import ravel_pytree
 from numpyro.infer import MCMC, NUTS, init_to_value
+import rcrpy
 from scipy.optimize import Bounds
 from scipy.optimize import minimize as scipy_minimize
 
@@ -279,9 +280,9 @@ def get_glob_ll(
     variance_residual = jnp.maximum(jnp.var(residual), eps)
 
     # TODO: Fix the variance integration bounds.
-    log_R_delta = 2.0 * jnp.log(amplitude_max / amplitude_min)
+    log_R_delta = jnp.log(1e3)
     log_R_gamma = jnp.log(1e3)
-    log_R_sigma = jnp.log(jnp.maximum(variance_data / variance_residual, 1.0))
+    log_R_sigma = jnp.log(1e2)
 
     theta, unravel = ravel_pytree(signals)
 

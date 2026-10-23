@@ -200,8 +200,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     # subband_bounds = signal_space.f_max - signal_space.f_min
 
     subband_t = t.copy()
-    # subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
-    subband_d = d.copy()
+    subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
+    # subband_d = d.copy()
 
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
@@ -258,7 +258,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
         noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
         snrs.append(bats.get_snr(subband_t, subband_d, signals))
-        glob_lls.append(bats.get_glob_ll(t, d, signals))
+        glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals))
 
         if len(signals) >= depth:
             break
