@@ -622,27 +622,43 @@ def plot_fourier_space(
             amplitudes_array,
             phases_array,
         ):
+            positive_denominator = (
+                decay_rate
+                + 2j * np.pi
+                * (target_frequencies - frequency)
+            )
+
+            negative_denominator = (
+                decay_rate
+                + 2j * np.pi
+                * (target_frequencies + frequency)
+            )
+
             positive_frequency_term = (
                 np.exp(1j * phase)
-                / (
-                    decay_rate
-                    + 2j
-                    * np.pi
-                    * (target_frequencies - frequency)
+                * (
+                    1.0
+                    - np.exp(
+                        -positive_denominator
+                        * observation_duration
+                    )
                 )
+                / positive_denominator
             )
 
             negative_frequency_term = (
                 np.exp(-1j * phase)
-                / (
-                    decay_rate
-                    + 2j
-                    * np.pi
-                    * (target_frequencies + frequency)
+                * (
+                    1.0
+                    - np.exp(
+                        -negative_denominator
+                        * observation_duration
+                    )
                 )
+                / negative_denominator
             )
 
-            lorentzian = (
+            finite_window_transform = (
                 amplitude
                 / (2j)
                 * (
@@ -652,7 +668,8 @@ def plot_fourier_space(
             )
 
             model_spectrum_complex += (
-                lorentzian / observation_duration
+                finite_window_transform
+                / observation_duration
             )
 
         residual_spectrum_complex = (
