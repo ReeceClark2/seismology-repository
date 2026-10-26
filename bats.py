@@ -36,7 +36,7 @@ def get_log_prob(
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -130,7 +130,7 @@ def get_noise_variance(
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -168,7 +168,7 @@ def get_snr(
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -208,7 +208,7 @@ def get_mean_sq_proj(
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -233,6 +233,7 @@ def get_glob_ll(
         t: jax.Array, 
         d: jax.Array, 
         signals,
+        signal_space,
         ratio_delta=1e2,
         ratio_gamma=1e2,
         ratio_sigma=1
@@ -248,7 +249,7 @@ def get_glob_ll(
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     if N <= m + r:
@@ -266,9 +267,12 @@ def get_glob_ll(
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d
 
+    omega_scale = (signal_space.f_max + signal_space.f_min) / 2
+    k_scale = 2.0 * jnp.pi * (signal_space.k_max + signal_space.k_min) / 2
+
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / r) * jnp.sum((omegas / max(omegas)) ** 2 + (ks / max(ks)) ** 2)
+    mean_sq_param = (1 / r) * jnp.sum((omegas / omega_scale) ** 2 + (ks / k_scale) ** 2)
 
     # TODO: Fix the variance integration bounds.
     log_R_delta = jnp.log(ratio_delta)
@@ -307,7 +311,9 @@ def get_glob_ll(
         )
     )
 
-    return delta_term + sigma_term + gamma_term + log_jacobian_factor
+    d_scale_eff = jnp.maximum(d_scale, jnp.finfo(d.dtype).eps)
+
+    return delta_term + sigma_term + gamma_term + log_jacobian_factor - N * jnp.log(d_scale_eff)
 
 def get_phasor_parameters(
         t: jax.Array, 
@@ -357,7 +363,7 @@ def get_cov_mat(t, d, signals):
     '''
     fs, ks = utils.unpack_signals(signals)
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     theta, unravel = ravel_pytree(signals)
@@ -395,7 +401,7 @@ def get_uncertainties(
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
-    m = r / 2
+    m = len(signals) * 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]

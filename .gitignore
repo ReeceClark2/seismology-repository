@@ -5,6 +5,7 @@ output/
 scripting/
 diagnostics_*/
 bats_inspect.py
+config.toml
 
 dracula_*/
 lbfgsb*/

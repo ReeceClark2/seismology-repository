@@ -234,7 +234,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     signals_bounds_by_depth = {}
     signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
 
-    glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, ratio_delta, ratio_gamma, ratio_sigma))
+    glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, signal_space, ratio_delta, ratio_gamma, ratio_sigma))
     noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
     snrs.append(bats.get_snr(subband_t, subband_d, signals))
 
@@ -242,7 +242,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
 
     amplitudes, phases = bats.get_phasor_parameters(subband_t, subband_d, signals)
-    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
+    log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", subband_t, subband_d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
 
     reason = "depth"
     while True:
@@ -262,13 +262,13 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
         
         amplitudes, phases = bats.get_phasor_parameters(subband_t, subband_d, signals)
-        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", t, d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
+        log_utils.plot_fourier_space(path / f"{len(signals)}_signal_fourier_space", subband_t, subband_d, f"Fourier Space for {len(signals)} Signal Model", signal_space.f_min, signal_space.f_max, 10_000, signals, amplitudes=amplitudes, phases=phases)
         
         signals_by_depth[len(signals)] = deepcopy(signals)
         signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
         noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
         snrs.append(bats.get_snr(subband_t, subband_d, signals))
-        glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, ratio_delta, ratio_gamma, ratio_sigma))
+        glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, signal_space, ratio_delta, ratio_gamma, ratio_sigma))
 
         if len(signals) >= depth:
             break
@@ -289,7 +289,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
 
     noise_variance = bats.get_noise_variance(subband_t, subband_d, signals)
     snr = bats.get_snr(subband_t, subband_d, signals)
-    glob_ll = bats.get_glob_ll(subband_t, subband_d, signals, ratio_delta, ratio_gamma, ratio_sigma)
+    glob_ll = bats.get_glob_ll(subband_t, subband_d, signals, signal_space, ratio_delta, ratio_gamma, ratio_sigma)
 
     return {
         "f_min": signal_space.f_min,
