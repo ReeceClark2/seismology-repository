@@ -53,11 +53,11 @@ def observed_data(
     trace.decimate(5, no_filter=False)
     trace.decimate(5, no_filter=False)
 
-    # trace.filter(
-    #     "bandpass",
-    #     freqmin=min_f,
-    #     freqmax=max_f,
-    # )
+    trace.filter(
+        "bandpass",
+        freqmin=min_f,
+        freqmax=max_f,
+    )
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)

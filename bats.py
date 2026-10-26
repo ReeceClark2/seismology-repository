@@ -247,7 +247,7 @@ def get_glob_ll(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) / (d[1] - d[0]))
 
     if N <= m + r:
         return -jnp.inf
