@@ -267,8 +267,8 @@ def get_glob_ll(
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d
 
-    omega_scale = (signal_space.f_max + signal_space.f_min) / 2
-    k_scale = 2.0 * jnp.pi * (signal_space.k_max + signal_space.k_min) / 2
+    omega_scale = 2 * jnp.pi * (signal_space.f_max + signal_space.f_min) / 2
+    k_scale = (signal_space.k_max + signal_space.k_min) / 2
 
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
@@ -279,13 +279,24 @@ def get_glob_ll(
     log_R_gamma = jnp.log(ratio_gamma)
     log_R_sigma = jnp.log(ratio_sigma)
 
+    theta_scales = jnp.concatenate((
+        jnp.full_like(fs, omega_scale / (2.0 * jnp.pi)),
+        jnp.full_like(ks, k_scale),
+    ))
+
     theta, unravel = ravel_pytree(signals)
 
     def objective(theta):
         return get_mean_sq_proj(t, d, unravel(theta))
 
-    b = (-m / 2) * jax.hessian(objective)(theta)
-    b = 0.5 * (b + b.T)
+    b_theta = (-m / 2) * jax.hessian(objective)(theta)
+    b_theta = 0.5 * (b_theta + b_theta.T)
+
+    b = (
+        theta_scales[:, None]
+        * b_theta
+        * theta_scales[None, :]
+    )
 
     eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
 
