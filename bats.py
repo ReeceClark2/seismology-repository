@@ -35,8 +35,8 @@ def get_log_prob(
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = omegas.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -129,8 +129,8 @@ def get_noise_variance(
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = omegas.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -167,8 +167,8 @@ def get_snr(
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = omegas.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -207,8 +207,8 @@ def get_mean_sq_proj(
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = omegas.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
@@ -247,8 +247,8 @@ def get_glob_ll(
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = omegas.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     if N <= m + r:
@@ -268,7 +268,7 @@ def get_glob_ll(
 
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / (2 * r)) * jnp.sum((omegas / max(omegas)) ** 2 + (ks / max(ks)) ** 2)
+    mean_sq_param = (1 / r) * jnp.sum((omegas / max(omegas)) ** 2 + (ks / max(ks)) ** 2)
 
     # TODO: Fix the variance integration bounds.
     log_R_delta = jnp.log(ratio_delta)
@@ -356,8 +356,8 @@ def get_cov_mat(t, d, signals):
     Return covariance matrix for parameters.
     '''
     fs, ks = utils.unpack_signals(signals)
-    r = fs.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     theta, unravel = ravel_pytree(signals)
@@ -394,8 +394,8 @@ def get_uncertainties(
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = omegas.shape[0]
-    m = 2 * r
+    r = len(signals) * 2
+    m = r / 2
     N = d.shape[0]
 
     arg = omegas[:, None] * t[None, :]
