@@ -120,14 +120,24 @@ class InitialConditionsTask:
     depth: int
     grid_search_args: GridSearchArgs
     nuts_args: NUTSArgs
+    glob_ll_args: ArrayLike
     perform_minimize: bool
     path: str
     
-def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction, depth, grid_search_args, nuts_args, perform_minimize, path):
+def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction, depth, grid_search_args, nuts_args, glob_ll_args, perform_minimize, path):
     '''
     Runs an instance of the initial conditions worker to find all signals in a subband.
     '''
     path.mkdir(parents=True, exist_ok=True)
+
+    if glob_ll_args is not None:
+        ratio_delta = glob_ll_args[0]
+        ratio_gamma = glob_ll_args[1]
+        ratio_sigma = glob_ll_args[2]
+    else:
+        ratio_delta = 1e2
+        ratio_gamma = 1e2
+        ratio_sigma = 1
 
     def update_signals(
             t,
@@ -597,6 +607,7 @@ class Dracula():
             self,
             grid_search_args: GridSearchArgs,
             nuts_args: NUTSArgs,
+            glob_ll_args: ArrayLike,
             subband_count: int = 5,
             subband_scaling_factor: float = 1,
             f_fraction: float = 8,
@@ -649,6 +660,7 @@ class Dracula():
                 depth=depth,
                 grid_search_args=grid_search_args,
                 nuts_args=nuts_args,
+                glob_ll_args=glob_ll_args,
                 perform_minimize=self.perform_minimize,
                 path=path / f"subband_{ind + 1}r{subband_count}"
             )
@@ -1078,6 +1090,7 @@ class Dracula():
             depth: int = 10,
             grid_search_args: Optional[GridSearchArgs] = None,
             nuts_args_init: Optional[NUTSArgs] = None,
+            glob_ll_args: Optional[ArrayLike] = None,
             cores_per_initial_conditions_worker: int = 1,
 
             signals_per_block: int = 1,
@@ -1110,6 +1123,7 @@ class Dracula():
             depth=depth,
             grid_search_args=grid_search_args,
             nuts_args=nuts_args_init,
+            glob_ll_args=glob_ll_args,
             cores_per_worker=cores_per_initial_conditions_worker,
         )
         self.sample(

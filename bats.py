@@ -232,7 +232,10 @@ def get_mean_sq_proj(
 def get_glob_ll(
         t: jax.Array, 
         d: jax.Array, 
-        signals
+        signals,
+        ratio_delta=1e2,
+        ratio_gamma=1e2,
+        ratio_sigma=1
     ) -> jax.Array:
     '''
     Bretthorst Eq. 5.9
@@ -265,24 +268,12 @@ def get_glob_ll(
 
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / r) * jnp.sum(omegas ** 2 + ks ** 2)
-
-    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
-    model = G.T @ coefficients
-    residual = d - model
-
-    eps = jnp.finfo(d.dtype).eps
-
-    amplitude_max = jnp.maximum(jnp.max(jnp.abs(d)), eps)
-    amplitude_min = jnp.maximum(jnp.quantile(jnp.abs(d), 0.05), eps)
-
-    variance_data = jnp.maximum(jnp.var(d), eps)
-    variance_residual = jnp.maximum(jnp.var(residual), eps)
+    mean_sq_param = (1 / (2 * r)) * jnp.sum((omegas / max(omegas)) ** 2 + (ks / max(ks)) ** 2)
 
     # TODO: Fix the variance integration bounds.
-    log_R_delta = jnp.log(1e3)
-    log_R_gamma = jnp.log(1e3)
-    log_R_sigma = jnp.log(1e2)
+    log_R_delta = jnp.log(ratio_delta)
+    log_R_gamma = jnp.log(ratio_gamma)
+    log_R_sigma = jnp.log(ratio_sigma)
 
     theta, unravel = ravel_pytree(signals)
 
@@ -560,25 +551,11 @@ def grid_search(
     f_space = jnp.linspace(f_min, f_max, f_points)
     k_space = jnp.geomspace(k_min, k_max, k_points)
 
-    f_delta = f_space[1] - f_space[0]
-
     f_grid, k_grid = jnp.meshgrid(
         f_space,
         k_space,
         indexing="ij",
     )
-
-    rng_key_value = random.randint(1, 10_000)
-    key = jax.random.key(rng_key_value)
-
-    f_jitter = jax.random.uniform(
-        key,
-        shape=(f_points, k_points),
-        minval=-f_delta / 2,
-        maxval=f_delta / 2,
-    )
-
-    f_grid = jnp.clip(f_grid + f_jitter, f_min, f_max)
 
     signal_grid = jnp.stack(
         [f_grid.ravel(), k_grid.ravel()],

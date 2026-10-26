@@ -67,6 +67,7 @@ chain_method = "parallel"
 
 
 [execute]
+glob_ll_args = [1e2, 1e2, 1]
 subband_count = 6
 subband_scaling_factor = 1.0
 f_fraction = 50

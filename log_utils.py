@@ -22,14 +22,14 @@ mpl.rcParams.update({
     "xtick.labelsize": 11,
     "ytick.labelsize": 11,
     "legend.fontsize": 11,
-    "mathtext.fontset": "stix",  # Helps math text resemble Times
+    "mathtext.fontset": "stix",
 })
 
 
 def plot_time_series(path, t, d, title, model=None):
     if model is None:
         # Single plot when no model is provided
-        fig, ax = plt.subplots(figsize=(4, 2))
+        fig, ax = plt.subplots(figsize=(12, 8))
 
         ax.plot(t, d, color="black", label="Data", linewidth=0.6)
         ax.set_xlim(min(t), max(t))
@@ -43,7 +43,7 @@ def plot_time_series(path, t, d, title, model=None):
         fig, (ax_top, ax_bottom) = plt.subplots(
             2,
             1,
-            figsize=(4, 2),
+            figsize=(12, 8),
             sharex=True,
             gridspec_kw={"height_ratios": [2, 1]}
         )
@@ -75,7 +75,7 @@ def plot_probability_surface(path, probability_surface, title):
     f_space, k_space, log_prob_space = probability_surface
     log_prob_space = log_prob_space.T
 
-    fig, ax = plt.subplots(figsize=(4, 2))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     heatmap = ax.pcolormesh(
         f_space,
@@ -133,7 +133,7 @@ def plot_signal_space(
     signals_bounds=None,
     signal_space=None,
 ):
-    fig, ax = plt.subplots(figsize=(4, 2))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     fs, ks = utils.unpack_signals(signals)
 
@@ -584,7 +584,7 @@ def plot_fourier_space(
         one_sided_scale * data_spectrum_complex
     )
 
-    fig, ax = plt.subplots(figsize=(4, 2))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     ax.plot(
         target_frequencies,
@@ -703,7 +703,7 @@ def plot_fourier_space(
 
     # Save a separate, uncluttered model-only plot when a model exists.
     if have_model_parameters:
-        model_fig, model_ax = plt.subplots(figsize=(4, 2))
+        model_fig, model_ax = plt.subplots(figsize=(12, 8))
 
         model_ax.plot(
             target_frequencies,
