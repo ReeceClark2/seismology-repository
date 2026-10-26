@@ -13,7 +13,7 @@ import rcrpy
 
 def filter(t, d, f_min, f_max):
     sample_rate = 1 / np.mean(np.diff(t))
-    sos = signal.butter(2, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
+    sos = signal.butter(4, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
 
     return signal.sosfiltfilt(sos, d)
 
@@ -256,7 +256,6 @@ def get_variance_break(
 
     return best_index
 
-
 def _get_eigenvalue_scale(eigenvalues):
     """Compute a spectral scale independently for each matrix."""
     scale = jnp.max(
@@ -271,7 +270,6 @@ def _get_eigenvalue_scale(eigenvalues):
         scale,
         jnp.ones_like(scale),
     )
-
 
 def get_g_eigendecomposition(
     matrix,
@@ -294,7 +292,6 @@ def get_g_eigendecomposition(
     )
 
     return eigenvalues, eigenvectors
-
 
 def get_h_eigendecomposition(
     matrix,

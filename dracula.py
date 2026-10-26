@@ -210,8 +210,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     # subband_bounds = signal_space.f_max - signal_space.f_min
 
     subband_t = t.copy()
-    subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
-    # subband_d = d.copy()
+    # subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
+    subband_d = d.copy()
 
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
@@ -1170,14 +1170,14 @@ if __name__ == "__main__":
     )
 
     grid_search_args = GridSearchArgs(
-        f_points=100,
-        k_points=100
+        f_points=1000,
+        k_points=10
     )
 
     nuts_kwargs = dict()
     mcmc_kwargs = dict(
-        num_warmup=100,
-        num_samples=300,
+        num_warmup=20,
+        num_samples=70,
         num_chains=2,
         progress_bar=True
     )
@@ -1192,14 +1192,15 @@ if __name__ == "__main__":
     model.execute(
         subband_count=1, 
         subband_scaling_factor=0.5,
-        f_fraction=2,
-        log_k_fraction=2,
+        f_fraction=10,
+        log_k_fraction=10,
         grid_search_args=grid_search_args,
-        nuts_args_init=None,
+        nuts_args_init=nuts_args,
+        glob_ll_args=[1e3, 1e3, 1e3],
         cores_per_initial_conditions_worker=2,
-        depth=15,
+        depth=5,
 
-        signals_per_block=15,
+        signals_per_block=5,
         fill_order=0,
         nuts_args_sample=nuts_args,
         cores_per_sample_worker=2,

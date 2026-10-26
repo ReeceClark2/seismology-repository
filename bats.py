@@ -47,7 +47,7 @@ def get_log_prob(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     # Bretthorst Eq. 3.5: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -87,7 +87,7 @@ def get_gram(
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     return g, eigenvalues, eigenvectors
 
@@ -141,7 +141,7 @@ def get_noise_variance(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -179,7 +179,7 @@ def get_snr(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -219,7 +219,7 @@ def get_mean_sq_proj(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -236,16 +236,13 @@ def get_glob_ll(
         signal_space,
         ratio_delta=1e2,
         ratio_gamma=1e2,
-        ratio_sigma=1
+        ratio_sigma=1e2
     ) -> jax.Array:
     '''
     Bretthorst Eq. 5.9
     '''
 
     fs, ks = utils.unpack_signals(signals)
-    d_scale = jnp.std(d)
-    d = d / jnp.maximum(d_scale, jnp.finfo(d.dtype).eps)
-
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
@@ -262,13 +259,13 @@ def get_glob_ll(
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d
 
-    omega_scale = 2 * jnp.pi * (signal_space.f_max + signal_space.f_min) / 2
-    k_scale = (signal_space.k_max + signal_space.k_min) / 2
+    omega_scale = 2 * jnp.pi * (signal_space.f_max - signal_space.f_min) / 2
+    k_scale = (signal_space.k_max - signal_space.k_min) / 2
 
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
@@ -279,52 +276,41 @@ def get_glob_ll(
     log_R_gamma = jnp.log(ratio_gamma)
     log_R_sigma = jnp.log(ratio_sigma)
 
-    theta_scales = jnp.concatenate((
-        jnp.full_like(fs, omega_scale / (2.0 * jnp.pi)),
-        jnp.full_like(ks, k_scale),
-    ))
-
     theta, unravel = ravel_pytree(signals)
 
     def objective(theta):
         return get_mean_sq_proj(t, d, unravel(theta))
 
-    b_theta = (-m / 2) * jax.hessian(objective)(theta)
-    b_theta = 0.5 * (b_theta + b_theta.T)
+    b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
 
-    b = (
-        theta_scales[:, None]
-        * b_theta
-        * theta_scales[None, :]
-    )
-
-    eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
-
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
+    
     log_jacobian_factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
 
     delta_term = (
         jsp.gammaln(m / 2)
-        - jnp.log(2) - log_R_delta
+        - jnp.log(2) - jnp.log(log_R_delta)
         + (-m / 2) * jnp.log(m * mean_sq_proj / 2.0)
     )
 
     gamma_term = (
         jsp.gammaln(r / 2)
-        - jnp.log(2) - log_R_gamma
+        - jnp.log(2) - jnp.log(log_R_gamma)
         + (-r / 2) * jnp.log((r * mean_sq_param) / 2)
     )
 
     sigma_term = (
         jsp.gammaln((N - m - r) / 2)
-        - jnp.log(2) - log_R_sigma
+        - jnp.log(2) - jnp.log(log_R_sigma)
         + ((m + r - N) / 2) * jnp.log(
             ((N * mean_sq_data) - (m * mean_sq_proj)) / 2
         )
     )
 
-    d_scale_eff = jnp.maximum(d_scale, jnp.finfo(d.dtype).eps)
-
-    return delta_term + sigma_term + gamma_term + log_jacobian_factor - N * jnp.log(d_scale_eff)
+    print(delta_term, sigma_term, gamma_term, log_jacobian_factor)
+    print(jsp.gammaln((N - m - r) / 2), ((m + r - N) / 2), np.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2))
+    return delta_term + gamma_term + sigma_term + log_jacobian_factor
 
 def get_phasor_parameters(
         t: jax.Array, 
@@ -348,7 +334,7 @@ def get_phasor_parameters(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     # Bretthorst Eq. 3.5: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -423,7 +409,7 @@ def get_uncertainties(
     g = G @ G.T
 
     # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = utils.get_g_eigendecomposition(g)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
     # Bretthorst Eq. 3.6: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
@@ -439,7 +425,7 @@ def get_uncertainties(
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = utils.get_h_eigendecomposition(b)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
 
     sum_sq_data = jnp.sum(d**2)
     sum_sq_proj = jnp.sum(h**2)
