@@ -234,7 +234,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     signals_bounds_by_depth = {}
     signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
 
-    glob_lls.append(bats.get_glob_ll(t, d, signals))
+    glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, ratio_delta, ratio_gamma, ratio_sigma))
     noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
     snrs.append(bats.get_snr(subband_t, subband_d, signals))
 
@@ -268,7 +268,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
         noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
         snrs.append(bats.get_snr(subband_t, subband_d, signals))
-        glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals))
+        glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, ratio_delta, ratio_gamma, ratio_sigma))
 
         if len(signals) >= depth:
             break
@@ -289,7 +289,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
 
     noise_variance = bats.get_noise_variance(subband_t, subband_d, signals)
     snr = bats.get_snr(subband_t, subband_d, signals)
-    glob_ll = bats.get_glob_ll(t, d, signals)
+    glob_ll = bats.get_glob_ll(subband_t, subband_d, signals, ratio_delta, ratio_gamma, ratio_sigma)
 
     return {
         "f_min": signal_space.f_min,
