@@ -25,6 +25,7 @@ jax.config.update("jax_enable_x64", True)
 def get_log_prob(
         t: jax.Array, 
         d: jax.Array,
+        signal_space,
         signals
     ):
     '''
@@ -37,7 +38,7 @@ def get_log_prob(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -57,8 +58,6 @@ def get_log_prob(
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
-
-    N = d.shape[0]
 
     ratio = sum_sq_proj / sum_sq_data
 
@@ -119,6 +118,7 @@ def get_model(
 def get_noise_variance(
         t: jax.Array, 
         d: jax.Array, 
+        signal_space,
         signals
     ):
     '''
@@ -131,7 +131,7 @@ def get_noise_variance(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -157,6 +157,7 @@ def get_noise_variance(
 def get_snr(
         t: jax.Array, 
         d: jax.Array, 
+        signal_space,
         signals
     ):
     '''
@@ -169,7 +170,7 @@ def get_snr(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -197,6 +198,7 @@ def get_snr(
 def get_mean_sq_proj(
         t: jax.Array, 
         d: jax.Array, 
+        signal_space,
         signals
     ) -> jax.Array:
     '''
@@ -209,7 +211,7 @@ def get_mean_sq_proj(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -247,7 +249,7 @@ def get_glob_ll(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) / (d[1] - d[0]))
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     if N <= m + r:
         return -jnp.inf
@@ -279,7 +281,7 @@ def get_glob_ll(
     theta, unravel = ravel_pytree(signals)
 
     def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
+        return get_mean_sq_proj(t, d, signal_space, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
@@ -309,7 +311,7 @@ def get_glob_ll(
     )
 
     print(delta_term, sigma_term, gamma_term, log_jacobian_factor)
-    print(jsp.gammaln((N - m - r) / 2), ((m + r - N) / 2), np.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2))
+    print(N, jsp.gammaln((N - m - r) / 2), ((m + r - N) / 2), np.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2))
     return delta_term + gamma_term + sigma_term + log_jacobian_factor
 
 def get_phasor_parameters(
@@ -354,14 +356,14 @@ def get_phasor_parameters(
     return amplitudes, phases
 
 
-def get_cov_mat(t, d, signals):
+def get_cov_mat(t, d, signal_space, signals):
     '''
     Return covariance matrix for parameters.
     '''
     fs, ks = utils.unpack_signals(signals)
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     theta, unravel = ravel_pytree(signals)
     
@@ -387,6 +389,7 @@ def get_cov_mat(t, d, signals):
 def get_uncertainties(
         t: jax.Array, 
         d: jax.Array, 
+        signal_space,
         signals
     ) -> jax.Array:
     '''
@@ -399,7 +402,7 @@ def get_uncertainties(
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -566,7 +569,7 @@ def grid_search(
     )
 
     evaluate_batch = jax.jit(
-        jax.vmap(lambda signal: get_log_prob(t, d, signal))
+        jax.vmap(lambda signal: get_log_prob(t, d, signal_space, signal))
     )
 
     results = []
@@ -594,6 +597,7 @@ def grid_search(
 def bats_model(
     t: jax.Array,
     d: jax.Array,
+    signal_space: jax.Array,
     f_min: jax.Array,
     f_max: jax.Array,
     k_min: jax.Array,
@@ -640,7 +644,7 @@ def bats_model(
 
     numpyro.factor(
         "surface",
-        get_log_prob(t, d, signals),
+        get_log_prob(t, d, signal_space, signals),
     )
 
 def nuts(
@@ -720,7 +724,7 @@ def nuts(
         axis=-1,
     )
 
-    surface_value = get_log_prob(t, d, signals_init)
+    surface_value = get_log_prob(t, d, signal_space, signals_init)
 
     if not bool(jnp.isfinite(surface_value)):
         raise ValueError(
@@ -759,6 +763,7 @@ def nuts(
         jax.random.PRNGKey(int(rng_key_value)),
         t=t,
         d=d,
+        signal_space=signal_space,
         f_min=fs_min,
         f_max=fs_max,
         k_min=ks_min,
@@ -855,7 +860,7 @@ def minimize(
         signals_current = x_physical.reshape(original_shape)
 
         # This is the objective being minimized.
-        return -get_log_prob(t, d, signals_current)
+        return -get_log_prob(t, d, signal_space, signals_current)
 
     # Compute value, gradient, and exact Hessian with JAX.
     objective_derivatives = jax.jit(

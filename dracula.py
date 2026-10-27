@@ -235,8 +235,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
 
     glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, signal_space, ratio_delta, ratio_gamma, ratio_sigma))
-    noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
-    snrs.append(bats.get_snr(subband_t, subband_d, signals))
+    noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signal_space, signals))
+    snrs.append(bats.get_snr(subband_t, subband_d, signal_space, signals))
 
     model = bats.get_model(subband_t, subband_d, signals)
     log_utils.plot_time_series(path / f"{len(signals)}_signal_time_series.png", subband_t, subband_d, f"Time Series for {len(signals)} Signal Model", model)
@@ -266,8 +266,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         
         signals_by_depth[len(signals)] = deepcopy(signals)
         signals_bounds_by_depth[len(signals_bounds)] = deepcopy(signals_bounds)
-        noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signals))
-        snrs.append(bats.get_snr(subband_t, subband_d, signals))
+        noise_variances.append(bats.get_noise_variance(subband_t, subband_d, signal_space, signals))
+        snrs.append(bats.get_snr(subband_t, subband_d, signal_space, signals))
         glob_lls.append(bats.get_glob_ll(subband_t, subband_d, signals, signal_space, ratio_delta, ratio_gamma, ratio_sigma))
 
         if len(signals) >= depth:
@@ -287,8 +287,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     signals = deepcopy(signals_by_depth[len(signals)])
     signals_bounds = deepcopy(signals_bounds_by_depth[len(signals_bounds)])
 
-    noise_variance = bats.get_noise_variance(subband_t, subband_d, signals)
-    snr = bats.get_snr(subband_t, subband_d, signals)
+    noise_variance = bats.get_noise_variance(subband_t, subband_d, signal_space, signals)
+    snr = bats.get_snr(subband_t, subband_d, signal_space, signals)
     glob_ll = bats.get_glob_ll(subband_t, subband_d, signals, signal_space, ratio_delta, ratio_gamma, ratio_sigma)
 
     return {
@@ -496,11 +496,11 @@ def run_reconcile_worker_wrapper(config: ReconcileTask):
 def create_deliverables(path, t, d, signals, signal_space, signals_bounds=None):
     model = bats.get_model(t, d, signals)
     amplitudes, phases = bats.get_phasor_parameters(t, d, signals)
-    uncertainties = bats.get_uncertainties(t, d, signals)
-    # cov_mat = bats.get_cov_mat(t, d, signals)
+    uncertainties = bats.get_uncertainties(t, d, signal_space, signals)
+    # cov_mat = bats.get_cov_mat(t, d, signal_space, signals)
 
-    noise_variance = bats.get_noise_variance(t, d, signals)
-    snr = bats.get_snr(t, d, signals)
+    noise_variance = bats.get_noise_variance(t, d, signal_space, signals)
+    snr = bats.get_snr(t, d, signal_space, signals)
 
     # log_utils.plot_covariance_and_correlation(path / f"{len(signals)}_covariance_correlation.png", cov_mat, signals)
     log_utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
@@ -976,7 +976,7 @@ class Dracula():
         self.signals_sample = utils.unpack_signal_results(self.results)
         self.signals_bounds_sample = self.signals_bounds_init
 
-        uncertainties = bats.get_uncertainties(self.t, self.d, self.signals_sample)
+        uncertainties = bats.get_uncertainties(self.t, self.d, self.signal_space, self.signals_sample)
         log_utils.save_report_csv(path / "report.csv", self.results, uncertainties)
 
         create_deliverables(

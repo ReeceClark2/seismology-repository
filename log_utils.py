@@ -694,7 +694,7 @@ def plot_fourier_space(
             label="Signals",
         )
 
-        ax.set_ylim(y_min, y_max)
+        ax.set_ylim(0, y_max)
 
     ax.legend()
     fig.tight_layout()
@@ -732,7 +732,7 @@ def plot_fourier_space(
                 label="Signals",
             )
 
-            model_ax.set_ylim(y_min, y_max)
+            model_ax.set_ylim(0, y_max)
 
         model_ax.legend()
         model_fig.tight_layout()
