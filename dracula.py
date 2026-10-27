@@ -1198,7 +1198,7 @@ if __name__ == "__main__":
         nuts_args_init=nuts_args,
         glob_ll_args=[1e3, 1e3, 1e3],
         cores_per_initial_conditions_worker=2,
-        depth=5,
+        depth=10,
 
         signals_per_block=5,
         fill_order=0,

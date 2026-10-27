@@ -423,7 +423,7 @@ def get_uncertainties(
     theta, unravel = ravel_pytree(signals)
 
     def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
+        return get_mean_sq_proj(t, d, signal_space, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
@@ -482,7 +482,7 @@ def reconcile(
 
         # Gram eigenvalues are squared singular values.
         k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
-        print(round(k2, 3))
+
         if k2 <= k2_threshold:
             break
 
@@ -557,11 +557,25 @@ def grid_search(
     f_space = jnp.linspace(f_min, f_max, f_points)
     k_space = jnp.geomspace(k_min, k_max, k_points)
 
+    f_delta = f_space[1] - f_space[0]
+
     f_grid, k_grid = jnp.meshgrid(
         f_space,
         k_space,
         indexing="ij",
     )
+
+    rng_key_value = random.randint(1, 10_000)
+    key = jax.random.key(rng_key_value)
+
+    f_jitter = jax.random.uniform(
+        key,
+        shape=(f_points, k_points),
+        minval=-f_delta / 2,
+        maxval=f_delta / 2,
+    )
+
+    f_grid = jnp.clip(f_grid + f_jitter, f_min, f_max)
 
     signal_grid = jnp.stack(
         [f_grid.ravel(), k_grid.ravel()],
