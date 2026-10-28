@@ -11,13 +11,13 @@ from scipy import signal
 import rcrpy
 
 
-# def filter(t, d, f_min, f_max):
-#     sample_rate = 1 / np.mean(np.diff(t))
-#     sos = signal.butter(4, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
+def filter(t, d, f_min, f_max):
+    sample_rate = 1 / np.mean(np.diff(t))
+    sos = signal.butter(4, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
 
-#     return signal.sosfiltfilt(sos, d)
+    return signal.sosfiltfilt(sos, d)
 
-def filter(t, d, f_min, f_max, taper_fraction=0.1):
+def filter2(t, d, f_min, f_max, taper_fraction=0.1):
     t = np.asarray(t)
     d = np.asarray(d)
 

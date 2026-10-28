@@ -137,7 +137,7 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     else:
         ratio_delta = 1e2
         ratio_gamma = 1e2
-        ratio_sigma = 1
+        ratio_sigma = 1e1
 
     def update_signals(
             t,
@@ -370,11 +370,6 @@ def run_sample_worker(
     path.mkdir(parents=True, exist_ok=True)
 
     d = utils.filter(t, d, signal_space.f_min, signal_space.f_max)
-    t_max = jnp.log(0.2) / (-signal_space.k_min)
-    mask = t < t_max
-
-    t = t[mask]
-    d = d[mask]
 
     log_utils.plot_time_series(path / "raw_time_series.png", t, d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", t, d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)
@@ -572,6 +567,9 @@ class Dracula():
         self.t = jnp.asarray(t)
         self.d = jnp.asarray(d)
 
+        k_min = f_min * 2.332e-3
+        k_max = f_max * 2.798e-2
+
         self.signal_space = SignalSpace(
             f_min=f_min,
             f_max=f_max,
@@ -649,12 +647,13 @@ class Dracula():
 
         tasks: list[InitialConditionsTask | None] = [None] * len(subbands)
         for ind, _ in enumerate(subbands):
-            k_max = ((subbands[ind][1] + subbands[ind][0]) / 2) * 2.33207e-2 + self.signal_space.k_min
+            k_min = ((subbands[ind][1] + subbands[ind][0]) / 2) * 2.332e-3
+            k_max = ((subbands[ind][1] + subbands[ind][0]) / 2) * 2.798e-2
 
             signal_space = SignalSpace(
                 f_min=subbands[ind][0],
                 f_max=subbands[ind][1],
-                k_min=self.signal_space.k_min,
+                k_min=k_min,
                 k_max=k_max
             )
 
