@@ -7,8 +7,8 @@ station = "BFO"
 channel = "LHZ"
 location = "00"
 stream_index = 0
-start_time = "2025-07-30T04:24:50"
-end_time = "2025-08-11T20:24:50"
+start_time = "2025-07-21T04:24:50"
+end_time = "2025-07-23T20:24:50"
 min_f = 0.0002
 max_f = 0.0012
 

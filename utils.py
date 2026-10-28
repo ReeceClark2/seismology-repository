@@ -11,11 +11,49 @@ from scipy import signal
 import rcrpy
 
 
-def filter(t, d, f_min, f_max):
-    sample_rate = 1 / np.mean(np.diff(t))
-    sos = signal.butter(4, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
+# def filter(t, d, f_min, f_max):
+#     sample_rate = 1 / np.mean(np.diff(t))
+#     sos = signal.butter(4, [f_min, f_max], btype='bandpass', fs=sample_rate, output='sos')
 
-    return signal.sosfiltfilt(sos, d)
+#     return signal.sosfiltfilt(sos, d)
+
+def filter(t, d, f_min, f_max, taper_fraction=0.1):
+    t = np.asarray(t)
+    d = np.asarray(d)
+
+    dt = np.mean(np.diff(t))
+
+    n = len(d)
+    freqs = np.fft.rfftfreq(n, d=dt)
+    spectrum = np.fft.rfft(d)
+
+    bandwidth = f_max - f_min
+    taper_width = taper_fraction * bandwidth
+
+    mask = np.zeros_like(freqs)
+
+    # Rising cosine: 0 -> 1
+    rising = (freqs >= f_min) & (freqs < f_min + taper_width)
+    if taper_width > 0:
+        x = (freqs[rising] - f_min) / taper_width
+        mask[rising] = 0.5 * (1 - np.cos(np.pi * x))
+
+    # Flat passband
+    flat = (
+        (freqs >= f_min + taper_width)
+        & (freqs <= f_max - taper_width)
+    )
+    mask[flat] = 1.0
+
+    # Falling cosine: 1 -> 0
+    falling = (freqs > f_max - taper_width) & (freqs <= f_max)
+    if taper_width > 0:
+        x = (freqs[falling] - (f_max - taper_width)) / taper_width
+        mask[falling] = 0.5 * (1 + np.cos(np.pi * x))
+
+    filtered_spectrum = spectrum * mask
+
+    return np.fft.irfft(filtered_spectrum, n=n)
 
 def get_best_signal(probability_surface):
     f_space, k_space, log_prob_space = probability_surface

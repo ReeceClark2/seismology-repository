@@ -690,7 +690,7 @@ def plot_fourier_space(
             ymax=y_max,
             color="red",
             linestyle="--",
-            linewidth=0.4,
+            linewidth=0.1,
             label="Signals",
         )
 

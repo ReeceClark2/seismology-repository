@@ -2,13 +2,13 @@
 parameter_txt = "dracula_run_parameters.txt"
 
 [data]
-network = "II"
-station = "BFO"
-channel = "LG1"
+network = "IU"
+station = "PTCN"
+channel = "LHZ"
 location = "00"
-stream_index = 1
-start_time = "2025-07-30T04:24:52"
-end_time = "2025-08-10T17:24:52"
+stream_index = 0
+start_time = "2026-10-23T17:24:52"
+end_time = "2026-10-25T17:24:52"
 min_f = 0.0003
 max_f = 0.0012
 
@@ -17,11 +17,11 @@ f_min = 0.0002
 f_max = 0.0016
 k_min = 4.4e-7
 k_max = 1.5e-5
-path = "trial_BFO_10"
+path = "trial_noise2"
 
 [grid_search]
-f_points = 200
-k_points = 200
+f_points = 100
+k_points = 100
 
 
 [nuts.init.nuts_kwargs]
@@ -68,7 +68,7 @@ chain_method = "parallel"
 
 [execute]
 glob_ll_args = [1e2, 1e2, 1]
-subband_count = 6
+subband_count = 1
 subband_scaling_factor = 1.0
 f_fraction = 50
 log_k_fraction = 2
