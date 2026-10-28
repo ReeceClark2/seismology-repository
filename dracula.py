@@ -649,11 +649,13 @@ class Dracula():
 
         tasks: list[InitialConditionsTask | None] = [None] * len(subbands)
         for ind, _ in enumerate(subbands):
+            k_max = ((subbands[ind][1] + subbands[ind][0]) / 2) * 2.33207e-2 + self.signal_space.k_min
+
             signal_space = SignalSpace(
                 f_min=subbands[ind][0],
                 f_max=subbands[ind][1],
                 k_min=self.signal_space.k_min,
-                k_max=self.signal_space.k_max
+                k_max=k_max
             )
 
             tasks[ind] = InitialConditionsTask(
