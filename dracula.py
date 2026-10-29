@@ -169,6 +169,19 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
         signal_candidate_bounds = utils.get_signal_bounds(signal_candidate, signal_space, f_fraction=f_fraction, log_k_fraction=log_k_fraction)
 
+        if nuts_args is not None:
+            signals = bats.nuts(
+                t, 
+                d, 
+                signal_space,
+                signal_candidate, 
+                signals_bounds, 
+                nuts_args.nuts_kwargs, 
+                nuts_args.mcmc_kwargs, 
+                nuts_args.run_kwargs, 
+                nuts_args.seed
+            )
+
         if signals is None:
             signals = signal_candidate
             signals_0 = signal_candidate
@@ -180,19 +193,6 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
             signals = signals_0
         if model is not None:
             d = d + model
-
-        if nuts_args is not None:
-            signals = bats.nuts(
-                t, 
-                d, 
-                signal_space,
-                signals, 
-                signals_bounds, 
-                nuts_args.nuts_kwargs, 
-                nuts_args.mcmc_kwargs, 
-                nuts_args.run_kwargs, 
-                nuts_args.seed
-            )
 
         if perform_minimize is True:
             signals = bats.minimize(
