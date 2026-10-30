@@ -1,6 +1,7 @@
 # Internal Python libraries
 import random
 from typing import Any
+import sys
 
 # External libraries
 import jax
@@ -286,9 +287,9 @@ def get_glob_ll(
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
-    
-    log_jacobian_factor = -0.5 * jnp.sum(jnp.log(eigenvalues))
+    eigenvalues = jnp.linalg.eigvalsh(b)
+
+    log_jacobian_factor = -0.5 * jnp.sum(jnp.log(abs(eigenvalues)))
 
     delta_term = (
         jsp.gammaln(m / 2)
@@ -310,8 +311,10 @@ def get_glob_ll(
         )
     )
 
-    print(delta_term, sigma_term, gamma_term, log_jacobian_factor)
-    print(N, jsp.gammaln((N - m - r) / 2), ((m + r - N) / 2), np.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2))
+    jax.debug.print("Terms: {} {} {} {}", delta_term, sigma_term, gamma_term, log_jacobian_factor)
+    jax.debug.print("Stats: {} {} {} {}", N, jsp.gammaln((N - m - r) / 2), ((m + r - N) / 2), np.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2))
+    sys.stdout.flush()
+    sys.stderr.flush()
     return delta_term + gamma_term + sigma_term + log_jacobian_factor
 
 def get_phasor_parameters(
@@ -620,7 +623,7 @@ def bats_model(
     '''
     Identify sampling space and method for NUTS.
     '''
-    
+
     f_min = jnp.atleast_1d(jnp.asarray(f_min))
     f_max = jnp.broadcast_to(
         jnp.asarray(f_max, dtype=f_min.dtype),
@@ -675,7 +678,6 @@ def nuts(
     '''
     Run NUTS for chosen signals.
     '''
-    
     f_init, k_init = utils.unpack_signals(signals)
 
     f_init = jnp.atleast_1d(jnp.asarray(f_init))

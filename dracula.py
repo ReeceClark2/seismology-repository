@@ -30,7 +30,6 @@ numpyro.set_host_device_count(32)
 
 os.environ["XLA_FLAGS"] = (
     "--xla_cpu_multi_thread_eigen=false "
-    "intra_op_parallelism_threads=1"
 )
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -169,19 +168,6 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         signal_candidate = jnp.asarray(signal_candidate).reshape(1, 2)
         signal_candidate_bounds = utils.get_signal_bounds(signal_candidate, signal_space, f_fraction=f_fraction, log_k_fraction=log_k_fraction)
 
-        if nuts_args is not None:
-            signals = bats.nuts(
-                t, 
-                d, 
-                signal_space,
-                signal_candidate, 
-                signals_bounds, 
-                nuts_args.nuts_kwargs, 
-                nuts_args.mcmc_kwargs, 
-                nuts_args.run_kwargs, 
-                nuts_args.seed
-            )
-
         if signals is None:
             signals = signal_candidate
             signals_0 = signal_candidate
@@ -191,8 +177,22 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
             signals_0 = jnp.concatenate((signals, signal_candidate), axis=0)
             signals_bounds = jnp.concatenate((signals_bounds, signal_candidate_bounds), axis=0)
             signals = signals_0
+
         if model is not None:
             d = d + model
+
+        if nuts_args is not None:
+            signals = bats.nuts(
+                t, 
+                d, 
+                signal_space,
+                signals, 
+                signals_bounds, 
+                nuts_args.nuts_kwargs, 
+                nuts_args.mcmc_kwargs, 
+                nuts_args.run_kwargs, 
+                nuts_args.seed
+            )
 
         if perform_minimize is True:
             signals = bats.minimize(
@@ -206,13 +206,6 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         log_utils.plot_signal_space(path / f"{len(signals)}_signal_space.png", signals, f"Signal Space of {len(signals)} Signals", signals_0=signals_0, signals_bounds=signals_bounds, signal_space=signal_space)
 
         return signals, signals_bounds
-
-    t_stop = jnp.log(0.2) / -signal_space.k_min
-
-    mask = t <= t_stop
-
-    t = t[mask]
-    d = d[mask]
 
     subband_t = t.copy()
     subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
@@ -567,8 +560,8 @@ class Dracula():
         self.t = jnp.asarray(t)
         self.d = jnp.asarray(d)
 
-        k_min = f_min * 2.332e-3
-        k_max = f_max * 2.798e-2
+        # k_min = f_min * 2.332e-3
+        # k_max = f_max * 2.798e-2
 
         self.signal_space = SignalSpace(
             f_min=f_min,
@@ -647,14 +640,11 @@ class Dracula():
 
         tasks: list[InitialConditionsTask | None] = [None] * len(subbands)
         for ind, _ in enumerate(subbands):
-            k_min = ((subbands[ind][1] + subbands[ind][0]) / 2) * 2.332e-3
-            k_max = ((subbands[ind][1] + subbands[ind][0]) / 2) * 2.798e-2
-
             signal_space = SignalSpace(
                 f_min=subbands[ind][0],
                 f_max=subbands[ind][1],
-                k_min=k_min,
-                k_max=k_max
+                k_min=self.signal_space.k_min,
+                k_max=self.signal_space.k_max
             )
 
             tasks[ind] = InitialConditionsTask(
