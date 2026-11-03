@@ -126,7 +126,9 @@ def get_log_prob(t, d, signals):
 
 def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size=512):
     f_space = jnp.linspace(f_min, f_max, f_points)
-    k_space = jnp.geomspace(k_min, k_max, k_points)
+
+    k_margin = 1e-6 * (k_max - k_min)
+    k_space = jnp.geomspace(k_min + k_margin, k_max - k_margin, k_points)
 
     f_grid, k_grid = jnp.meshgrid(f_space, k_space, indexing="ij")
     signal_grid = jnp.stack([f_grid.ravel(), k_grid.ravel()], axis=-1)
@@ -240,7 +242,8 @@ def _run_grid_search(args):
     )
 
 def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points, k_points, cores):
-    full_f_space = np.linspace(f_min, f_max, f_points)
+    f_margin = 1e-6 * (f_max - f_min)
+    full_f_space = np.linspace(f_min + f_margin, f_max - f_margin, f_points)
 
     boundaries = np.linspace(
         0, f_points, cores + 1, dtype=int
@@ -776,6 +779,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         signal = grid_search_orchestrator(signals, t, residual, f_min, f_max, k_min, k_max, f_points, k_points, cores)
         signal_bounds = get_bounds(signal, f_min, f_max, k_min, k_max, f_frac, log_k_frac)
+
         signal = jnp.asarray(signal).reshape(1, 2)
         signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
 
@@ -798,11 +802,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
 
-        print(
-            f"Signal {len(signals)} completed in "
-            f"{iteration_elapsed:.2f} seconds "
-            f"(total elapsed: {total_elapsed:.2f} seconds)"
-        )
+        print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)")
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
