@@ -129,6 +129,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
     '''
     path.mkdir(parents=True, exist_ok=True)
 
+    d = bats.bretthorst_filter(t, d, signal_space, grid_search_args.f_points, grid_search_args.k_points)
+
     if glob_ll_args is not None:
         ratio_delta = glob_ll_args[0]
         ratio_gamma = glob_ll_args[1]
@@ -208,8 +210,8 @@ def run_initial_conditions_worker(t, d, signal_space, f_fraction, log_k_fraction
         return signals, signals_bounds
 
     subband_t = t.copy()
-    subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
-    # subband_d = d.copy()
+    # subband_d = utils.filter(subband_t, d.copy(), signal_space.f_min, signal_space.f_max)
+    subband_d = d.copy()
 
     log_utils.plot_time_series(path / "raw_time_series.png", subband_t, subband_d, "Original Time Series")
     log_utils.plot_fourier_space(path / "raw_fourier_space", subband_t, subband_d, "Original Fourier Space", signal_space.f_min, signal_space.f_max, 10_000)

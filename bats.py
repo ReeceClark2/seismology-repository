@@ -611,6 +611,68 @@ def grid_search(
 
     return signal
 
+
+# EXPERIMENTAL
+def bretthorst_filter(
+        t, 
+        d, 
+        signal_space,
+        f_points, 
+        k_points,
+        batch_size=256
+    ):
+    '''
+    Procedure for identifying candidate signal with a grid search.
+    1) Create grid across chosen parameter set of frequencies and decay rates.
+    2) Evaluate probability across the grid.
+    3) Return signal with highest probability.
+    '''
+
+    f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
+
+    f_space = jnp.linspace(f_min, f_max, f_points)
+    k_space = jnp.geomspace(k_min, k_max, k_points)
+
+    f_delta = f_space[1] - f_space[0]
+
+    f_grid, k_grid = jnp.meshgrid(
+        f_space,
+        k_space,
+        indexing="ij",
+    )
+
+    rng_key_value = random.randint(1, 10_000)
+    key = jax.random.key(rng_key_value)
+
+    f_jitter = jax.random.uniform(
+        key,
+        shape=(f_points, k_points),
+        minval=-f_delta / 2,
+        maxval=f_delta / 2,
+    )
+
+    f_grid = jnp.clip(f_grid + f_jitter, f_min, f_max)
+
+    signal_grid = jnp.stack(
+        [f_grid.ravel(), k_grid.ravel()],
+        axis=-1,
+    )
+
+    evaluate_batch = jax.jit(
+        jax.vmap(lambda signal: get_model(t, d, signal))
+    )
+
+    model = jnp.zeros_like(evaluate_batch(signal_grid[:1])[0])
+
+    for start in range(0, signal_grid.shape[0], batch_size):
+        batch = signal_grid[start:start + batch_size]
+        batch_models = evaluate_batch(batch)
+        model = model + jnp.sum(batch_models, axis=0)
+
+    return model
+
+
+
 def bats_model(
     t: jax.Array,
     d: jax.Array,
