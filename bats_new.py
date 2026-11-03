@@ -765,7 +765,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     bounds = jnp.empty((0, 4))
 
     start_time = perf_counter()
-        print("Starting...")
+    print("Starting...")
 
     for iteration in range(depth):
         iteration_start = perf_counter()
@@ -794,6 +794,9 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         save_iteration_diagnostics(path, signals, noise_variance, snr, glob_ll, k2)
         save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases)
         plot_fourier_space(f"Fourier Space {len(signals)} Signal Model",path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+
+        iteration_elapsed = perf_counter() - iteration_start
+        total_elapsed = perf_counter() - start_time
 
         print(
             f"Signal {len(signals)} completed in "
