@@ -2,6 +2,7 @@ import csv
 import multiprocessing as mp
 import os
 import random
+from time import perf_counter
 from datetime import datetime
 from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
@@ -763,10 +764,12 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
-    start_time = datetime.now()
-    print(f"Start: {start_time}")
+    start_time = perf_counter()
+        print("Starting...")
 
     for iteration in range(depth):
+        iteration_start = perf_counter()
+
         if len(signals) > 0:
             model = get_model(t, d, signals)
             residual = d - model
@@ -792,11 +795,13 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases)
         plot_fourier_space(f"Fourier Space {len(signals)} Signal Model",path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
 
-        duration = datetime.now() - start_time
-        print(f"Signal {len(signals)} completed in {timedelta(seconds=round(duration.total_seconds()))}!")
+        print(
+            f"Signal {len(signals)} completed in "
+            f"{iteration_elapsed:.2f} seconds "
+            f"(total elapsed: {total_elapsed:.2f} seconds)"
+        )
 
-    duration = datetime.now() - start_time
-    print(f"Dracula completed in {timedelta(seconds=round(duration.total_seconds()))}!")
+    print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
     return
 
