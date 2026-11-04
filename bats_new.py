@@ -126,6 +126,37 @@ def get_log_prob(t, d, signals):
 
     return 0.5 * (m - N) * jnp.log1p(-ratio)
 
+def get_log_prob_nuts(t, d, signals):
+    '''
+    Bretthorst Eq. 3.17
+    '''
+    
+    fs, ks = unpack_signals(signals)
+
+    omegas = fs * 2.0 * jnp.pi
+    
+    r = len(signals) * 2
+    m = len(signals) * 2
+    N = az.ess(np.array([d]))
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+
+    g_diag = jnp.sum(G ** 2, axis=1)
+    H = G / jnp.sqrt(g_diag[:, None])
+
+    h = H @ d
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    ratio = sum_sq_proj / sum_sq_data
+
+    return 0.5 * (m - N) * jnp.log1p(-ratio)
+
 def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size=512):
     f_space = jnp.linspace(f_min, f_max, f_points)
 
@@ -176,10 +207,7 @@ def objective(t, d, f_min, f_max, k_min, k_max):
         axis=-1,
     )
 
-    numpyro.factor(
-        "surface",
-        get_log_prob(t, d, signals),
-    )
+    numpyro.factor("surface", get_log_prob_nuts(t, d, signals))
  
 def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
     f_init, k_init = unpack_signals(signals)
@@ -556,7 +584,7 @@ def get_phasor(t, d, signals):
 
 # Plotting --------------------------------------------------------------------------------
 
-def save_iteration_diagnostics(path, signals, noise_variance, snr, glob_ll, k2):
+def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
     diagnostic_path = Path(path) / "diagnostic" / "tables"
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / "iteration_diagnostics.csv"
@@ -565,11 +593,12 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, glob_ll, k2):
     with csv_path.open("a", newline="") as file:
         writer = csv.writer(file)
         if write_header:
-            writer.writerow(["Signals", "Noise Variance", "SNR", "Global Likelihood", "2-norm"])
+            writer.writerow(["Signals", "Noise Variance", "SNR", "Probability", "Global Likelihood", "2-norm"])
         writer.writerow([
             len(signals),
             float(noise_variance),
             float(snr),
+            float(log_prob),
             float(glob_ll),
             float(k2),
         ])
@@ -696,18 +725,6 @@ def unpack_signals(signals):
             )
         signals = signals[None, :]
 
-    elif signals.ndim == 2:
-        if signals.shape[1] != 2:
-            raise ValueError(
-                f"Signals must have shape (n_signals, 2), got {signals.shape}"
-            )
-
-    else:
-        raise ValueError(
-            f"Signals must have shape (2,) or (n_signals, 2), "
-            f"got {signals.shape}"
-        )
-
     fs = signals[:, 0]
     ks = signals[:, 1]
 
@@ -779,7 +796,10 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
             model = get_model(t, d, signals)
             residual = d - model
 
+        grid_start = perf_counter()
         signal = grid_search_orchestrator(signals, t, residual, f_min, f_max, k_min, k_max, f_points, k_points, cores)
+        grid_elapsed = perf_counter() - grid_start
+
         signal_bounds = get_bounds(signal, f_min, f_max, k_min, k_max, f_frac, log_k_frac)
 
         signal = jnp.asarray(signal).reshape(1, 2)
@@ -787,8 +807,12 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         signals = jnp.concatenate([signals, signal], axis=0)
         bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
-        signals = nuts(t, d, signals, bounds, warmup, sample, cores)
 
+        nuts_start = perf_counter()
+        signals = nuts(t, d, signals, bounds, warmup, sample, cores)
+        nuts_elapsed = perf_counter() - nuts_start
+
+        log_prob = get_log_prob(t, d, signals)
         glob_ll = get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max)
         noise_variance = get_noise_variance(t, d, signals)
         snr = get_snr(t, d, signals)
@@ -797,14 +821,14 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         fs, ks = unpack_signals(signals)
         amplitudes, phases = get_phasor(t, d, signals)
 
-        save_iteration_diagnostics(path, signals, noise_variance, snr, glob_ll, k2)
+        save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
         save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases)
         plot_fourier_space(f"Fourier Space {len(signals)} Signal Model",path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
 
-        print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)")
+        print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
@@ -812,7 +836,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
 
 if __name__ == "__main__":
-    path = Path.cwd() / "dracula"
+    path = Path.cwd() / "dracula_nuts_filter_1"
     path.mkdir(parents=True, exist_ok=True)
 
     run(
@@ -824,22 +848,22 @@ if __name__ == "__main__":
         start_time="2025-07-30T04:24:52",
         end_time="2025-08-10T17:24:52",
 
-        f_min=0.0002,
-        f_max=0.0015,
-        k_min=4.5e-7,
-        k_max=4.3e-5,
+        f_min=0.00028,
+        f_max=0.00150,
+        k_min=4.0e-7,
+        k_max=5.0e-5,
 
-        f_points=400,
+        f_points=100,
         k_points=100,
 
-        f_frac=1,
-        log_k_frac=1,
+        f_frac=100,
+        log_k_frac=3,
 
-        depth=10,
+        depth=60,
 
         warmup=40,
         sample=100,
-        cores=8,
+        cores=4,
 
         path=path
     )
