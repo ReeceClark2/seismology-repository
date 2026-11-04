@@ -826,6 +826,9 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         signal_bounds = get_bounds(signal, f_min, f_max, k_min, k_max, f_frac, log_k_frac)
 
+        nuts_start = perf_counter()
+        signal = nuts(t, residual, signal, signal_bounds, warmup, sample, cores)
+
         signal = jnp.asarray(signal).reshape(1, 2)
         signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
 
@@ -850,10 +853,12 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         save_iteration_diagnostics(path / "diagnostic" / "tables", all_signals, noise_variance, snr, log_prob, glob_ll, k2)
         save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, amplitudes, phases)
-        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / f"batch {len(total_signals) % 20}" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / f"batch_{len(total_signals) % 20}r{depth % 20}" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
+
+        print(f"Signal {len(signals) + len(total_signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
 
         if len(signals) >= 20:
             total_signals = jnp.concatenate([total_signals, signals], axis=0)
@@ -863,8 +868,6 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
             signals = jnp.empty((0, 2))
             bounds = jnp.empty((0, 4))
-
-        print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
