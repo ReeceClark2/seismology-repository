@@ -8,6 +8,7 @@ from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+import arviz as az
 
 # Configure Matplotlib before importing pyplot.
 os.environ["MPLBACKEND"] = "Agg"
@@ -75,7 +76,8 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
 
     trace.decimate(5, no_filter=False)
     trace.decimate(5, no_filter=False)
-    trace.decimate(4, no_filter=False)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(2, no_filter=False)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -98,7 +100,7 @@ def get_log_prob(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = az.ess(np.array([d]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -312,7 +314,7 @@ def get_mean_sq_proj(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = az.ess(np.array([d]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -342,7 +344,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = az.ess(np.array([d]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -415,7 +417,7 @@ def get_condition_number(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = az.ess(np.array([d]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -463,7 +465,7 @@ def get_noise_variance(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = az.ess(np.array([d]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -494,7 +496,7 @@ def get_snr(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.shape[0]
+    N = az.ess(np.array([d]))
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
