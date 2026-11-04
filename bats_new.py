@@ -74,10 +74,10 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.detrend("spline", order=3, dspline=1728)
     trace.remove_response(inventory=inventory, output="ACC")
 
-    trace.decimate(5, no_filter=False)
-    trace.decimate(5, no_filter=False)
-    trace.decimate(5, no_filter=False)
-    trace.decimate(2, no_filter=False)
+    trace.decimate(5, no_filter=True)
+    trace.decimate(5, no_filter=True)
+    trace.decimate(5, no_filter=True)
+    trace.decimate(2, no_filter=True)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -100,7 +100,7 @@ def get_log_prob(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -137,7 +137,7 @@ def get_log_prob_nuts(t, d, signals):
 
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -362,7 +362,7 @@ def get_mean_sq_proj(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -392,7 +392,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -465,7 +465,7 @@ def get_condition_number(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -513,7 +513,7 @@ def get_noise_variance(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -544,7 +544,7 @@ def get_snr(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = az.ess(np.array([d]))
+    N = d.size
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
