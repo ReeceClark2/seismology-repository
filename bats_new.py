@@ -130,11 +130,11 @@ def get_log_prob_nuts(t, d, signals):
     '''
     Bretthorst Eq. 3.17
     '''
-    
+
     fs, ks = unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
-    
+
     r = len(signals) * 2
     m = len(signals) * 2
     N = az.ess(np.array([d]))
@@ -145,8 +145,28 @@ def get_log_prob_nuts(t, d, signals):
     # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
 
-    g_diag = jnp.sum(G ** 2, axis=1)
-    H = G / jnp.sqrt(g_diag[:, None])
+    L = len(signals)
+
+    G_cos = G[:L, :]
+    G_sin = G[L:, :]
+
+    g_cc = jnp.sum(G_cos ** 2, axis=1)
+    g_ss = jnp.sum(G_sin ** 2, axis=1)
+    g_cs = jnp.sum(G_cos * G_sin, axis=1)
+
+    g_blocks = jnp.stack((
+            jnp.stack((g_cc, g_cs), axis=-1),
+            jnp.stack((g_cs, g_ss), axis=-1),
+        ), axis=-2)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g_blocks)
+    eigenvalues = jnp.maximum(eigenvalues, jnp.finfo(G.dtype).eps)
+
+    G_pairs = jnp.stack((G_cos, G_sin), axis=1)
+
+    H_blocks = jnp.einsum("lij,ljt->lit", eigenvectors.transpose(0, 2, 1), G_pairs)
+    H_blocks = H_blocks / jnp.sqrt(eigenvalues[:, :, None])
+    H = H_blocks.reshape(2 * L, G.shape[1])
 
     h = H @ d
 
