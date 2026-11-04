@@ -227,7 +227,7 @@ def objective(t, d, f_min, f_max, k_min, k_max):
         axis=-1,
     )
 
-    numpyro.factor("surface", get_log_prob_nuts(t, d, signals))
+    numpyro.factor("surface", get_log_prob(t, d, signals))
  
 def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
     f_init, k_init = unpack_signals(signals)
@@ -605,7 +605,7 @@ def get_phasor(t, d, signals):
 # Plotting --------------------------------------------------------------------------------
 
 def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
-    diagnostic_path = Path(path) / "diagnostic" / "tables"
+    diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / "iteration_diagnostics.csv"
     write_header = not csv_path.exists()
@@ -624,7 +624,7 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
         ])
 
 def save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases):
-    diagnostic_path = Path(path) / "diagnostic" / "tables"
+    diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / f"signals_iteration_{iteration + 1}.csv"
 
@@ -745,6 +745,8 @@ def unpack_signals(signals):
             )
         signals = signals[None, :]
 
+    signals = signals[jnp.argsort(signals[:, 0])]
+
     fs = signals[:, 0]
     ks = signals[:, 1]
 
@@ -803,6 +805,8 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     initial_plot(path, t, d, f_min, f_max)
 
     residual = d
+
+    total_signals = jnp.empty((0, 2))
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
@@ -829,24 +833,36 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
 
         nuts_start = perf_counter()
-        signals = nuts(t, d, signals, bounds, warmup, sample, cores)
+        if len(signals) % 10 == 0:
+            signals = nuts(t, d, signals, bounds, warmup, sample, cores)
         nuts_elapsed = perf_counter() - nuts_start
 
-        log_prob = get_log_prob(t, d, signals)
-        glob_ll = get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max)
-        noise_variance = get_noise_variance(t, d, signals)
-        snr = get_snr(t, d, signals)
-        k2 = get_condition_number(t, d, signals)
+        all_signals = jnp.concatenate([total_signals, signals], axis=0)
 
-        fs, ks = unpack_signals(signals)
-        amplitudes, phases = get_phasor(t, d, signals)
+        log_prob = get_log_prob(t, d, all_signals)
+        glob_ll = get_glob_ll(t, d, all_signals, f_min, f_max, k_min, k_max)
+        noise_variance = get_noise_variance(t, d, all_signals)
+        snr = get_snr(t, d, all_signals)
+        k2 = get_condition_number(t, d, all_signals)
 
-        save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
-        save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases)
-        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model",path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+        fs, ks = unpack_signals(all_signals)
+        amplitudes, phases = get_phasor(t, d, all_signals)
+
+        save_iteration_diagnostics(path / "diagnostic" / "tables", all_signals, noise_variance, snr, log_prob, glob_ll, k2)
+        save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, amplitudes, phases)
+        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / f"batch {len(total_signals) % 20}" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
+
+        if len(signals) >= 20:
+            total_signals = jnp.concatenate([total_signals, signals], axis=0)
+
+            model = get_model(t, d, signals)
+            d = d - model
+
+            signals = jnp.empty((0, 2))
+            bounds = jnp.empty((0, 4))
 
         print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
 
