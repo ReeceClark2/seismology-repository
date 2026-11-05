@@ -778,24 +778,21 @@ def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    ymin, ymax = ax.get_ylim()
+    ax.scatter(fs, Q, color="red", s=15, zorder=3, label="Signals")
+
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
     for f, q, f_unc, q_unc in zip(fs, Q, fs_unc, Q_unc):
         for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
             ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
             ax.add_patch(ellipse)
 
-    ax.scatter(fs, Q, color="red", s=15, zorder=3, label="Signals")
-
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Quality Factor (Q)")
     ax.set_title(title)
 
-    f_min = np.min(fs)
-    f_max = np.max(fs)
-    f_margin = 0.05 * (f_max - f_min) if f_max > f_min else 1.0
-
-    ax.set_xlim(f_min - f_margin, f_max + f_margin)
-    ax.set_ylim(ymin, ymax)
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
 
     ax.legend()
 
