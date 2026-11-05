@@ -74,10 +74,10 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.detrend("spline", order=3, dspline=1728)
     trace.remove_response(inventory=inventory, output="ACC")
 
-    trace.decimate(5, no_filter=True)
-    trace.decimate(5, no_filter=True)
-    trace.decimate(5, no_filter=True)
-    trace.decimate(2, no_filter=True)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(2, no_filter=False)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -109,6 +109,7 @@ def get_log_prob(t, d, signals):
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
     g = 0.5 * (g + g.T)
+    # g = g + 1e-8 * jnp.eye(g.shape[0], dtype=g.dtype)
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
@@ -230,7 +231,7 @@ def objective(t, d, f_min, f_max, k_min, k_max):
     numpyro.factor("surface", get_log_prob(t, d, signals))
  
 def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
-    f_init, k_init = unpack_signals(signals)
+    f_init, k_init = unpack_signals(signals, sort=False)
 
     bounds = jnp.asarray(bounds).reshape(-1, 4)
 
@@ -249,7 +250,7 @@ def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
     rng_key = jax.random.PRNGKey(int(rng_key_value))
     warmup_key, sample_key = jax.random.split(rng_key)
 
-    kernel = NUTS(objective, init_strategy=init_strategy)
+    kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=5)
     mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
     mcmc.warmup(warmup_key, t=t, d=d, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
 
@@ -735,7 +736,7 @@ def initial_plot(path, t, d, f_min, f_max):
 
 # Utilities -------------------------------------------------------------------------------
 
-def unpack_signals(signals):
+def unpack_signals(signals, sort=True):
     signals = jnp.asarray(signals)
 
     if signals.ndim == 1:
@@ -745,7 +746,8 @@ def unpack_signals(signals):
             )
         signals = signals[None, :]
 
-    signals = signals[jnp.argsort(signals[:, 0])]
+    if sort is True:
+        signals = signals[jnp.argsort(signals[:, 0])]
 
     fs = signals[:, 0]
     ks = signals[:, 1]
@@ -806,7 +808,6 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
     residual = d
 
-    total_signals = jnp.empty((0, 2))
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
@@ -828,6 +829,8 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         signal = jnp.asarray(signal).reshape(1, 2)
         signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
+
+        # signal = nuts(t, residual, signal, signal_bounds, warmup, sample, cores)
 
         signals = jnp.concatenate([signals, signal], axis=0)
         bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
@@ -861,7 +864,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
 
 if __name__ == "__main__":
-    path = Path.cwd() / "dracula_nuts_filter_1"
+    path = Path.cwd() / "dracula_1104_10"
     path.mkdir(parents=True, exist_ok=True)
 
     run(
@@ -878,7 +881,7 @@ if __name__ == "__main__":
         k_min=4.0e-7,
         k_max=5.0e-5,
 
-        f_points=100,
+        f_points=2000,
         k_points=100,
 
         f_frac=100,
@@ -886,9 +889,9 @@ if __name__ == "__main__":
 
         depth=60,
 
-        warmup=40,
-        sample=100,
-        cores=4,
+        warmup=200,
+        sample=400,
+        cores=40,
 
         path=path
     )
