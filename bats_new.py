@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
 import matplotlib
+from matplotlib.patches import Ellipse
 
 matplotlib.use("Agg", force=True)
 
@@ -89,7 +90,7 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
 
 # Signal Update --------------------------------------------------------------------------
 
-def get_log_prob(t, d, signals):
+def get_log_prob(t, d, B, signals):
     '''
     Bretthorst Eq. 3.17
     '''
@@ -100,7 +101,7 @@ def get_log_prob(t, d, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.size
+    N = 2 * t[-1] * B
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -127,59 +128,9 @@ def get_log_prob(t, d, signals):
 
     return 0.5 * (m - N) * jnp.log1p(-ratio)
 
-def get_log_prob_nuts(t, d, signals):
-    '''
-    Bretthorst Eq. 3.17
-    '''
-
-    fs, ks = unpack_signals(signals)
-
-    omegas = fs * 2.0 * jnp.pi
-
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.size
-
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-
-    L = len(signals)
-
-    G_cos = G[:L, :]
-    G_sin = G[L:, :]
-
-    g_cc = jnp.sum(G_cos ** 2, axis=1)
-    g_ss = jnp.sum(G_sin ** 2, axis=1)
-    g_cs = jnp.sum(G_cos * G_sin, axis=1)
-
-    g_blocks = jnp.stack((
-            jnp.stack((g_cc, g_cs), axis=-1),
-            jnp.stack((g_cs, g_ss), axis=-1),
-        ), axis=-2)
-
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g_blocks)
-    eigenvalues = jnp.maximum(eigenvalues, jnp.finfo(G.dtype).eps)
-
-    G_pairs = jnp.stack((G_cos, G_sin), axis=1)
-
-    H_blocks = jnp.einsum("lij,ljt->lit", eigenvectors.transpose(0, 2, 1), G_pairs)
-    H_blocks = H_blocks / jnp.sqrt(eigenvalues[:, :, None])
-    H = H_blocks.reshape(2 * L, G.shape[1])
-
-    h = H @ d
-
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
-
-    ratio = sum_sq_proj / sum_sq_data
-
-    return 0.5 * (m - N) * jnp.log1p(-ratio)
-
 def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size=512):
     f_space = jnp.linspace(f_min, f_max, f_points)
+    B = f_max - f_min
 
     k_margin = 1e-6 * (k_max - k_min)
     k_space = jnp.geomspace(k_min + k_margin, k_max - k_margin, k_points)
@@ -188,7 +139,7 @@ def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size
     signal_grid = jnp.stack([f_grid.ravel(), k_grid.ravel()], axis=-1)
 
     evaluate_batch = jax.jit(
-        jax.vmap(lambda signal: get_log_prob(t, d, signal))
+        jax.vmap(lambda signal: get_log_prob(t, d, B, signal))
     )
 
     results = []
@@ -228,7 +179,8 @@ def objective(t, d, f_min, f_max, k_min, k_max):
         axis=-1,
     )
 
-    numpyro.factor("surface", get_log_prob(t, d, signals))
+    B = f_max - f_min
+    numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
 def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
     f_init, k_init = unpack_signals(signals, sort=False)
@@ -356,14 +308,14 @@ def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points
 
 # Evaluation (critical) -------------------------------------------------------------------
 
-def get_mean_sq_proj(t, d, signals):
+def get_mean_sq_proj(t, d, B, signals):
     fs, ks = unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.size
+    N = 2 * t[-1] * B
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -393,7 +345,8 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.size
+    B = f_max - f_min
+    N = 2 * t[-1] * B
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -427,7 +380,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     theta, unravel = ravel_pytree(signals)
     
     def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
+        return get_mean_sq_proj(t, d, B, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
@@ -459,14 +412,14 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
     return glob_ll
 
-def get_condition_number(t, d, signals):
+def get_condition_number(t, d, B, signals):
     fs, ks = unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.size
+    N = 2 * t[-1] * B
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -507,14 +460,14 @@ def get_model(t, d, signals):
 
 # Evaluation (minor) ----------------------------------------------------------------------
 
-def get_noise_variance(t, d, signals):
+def get_noise_variance(t, d, B, signals):
     fs, ks = unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.size
+    N = 2 * t[-1] * B
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -538,14 +491,14 @@ def get_noise_variance(t, d, signals):
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
     return noise_variance
 
-def get_snr(t, d, signals):
+def get_snr(t, d, B, signals):
     fs, ks = unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = d.size
+    N = 2 * t[-1] * B
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -603,6 +556,53 @@ def get_phasor(t, d, signals):
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
     return amplitudes, phases
 
+def get_uncertainties(t, d, B, signals):
+    fs, ks = unpack_signals(signals)
+
+    omegas = fs * 2.0 * jnp.pi
+    
+    r = len(signals) * 2
+    m = len(signals) * 2
+    N = 2 * t[-1] * B
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+    g = 0.5 * (g + g.T)
+
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+
+    # Bretthorst Eq. 3.5: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+
+    theta, unravel = ravel_pytree(signals)
+    
+    def objective(theta):
+        return get_mean_sq_proj(t, d, B, unravel(theta))
+
+    b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
+
+    variances = noise_variance * jnp.sum(eigenvectors**2 / eigenvalues[None, :], axis=1)
+    fs_unc = variances[::2]
+    ks_unc = variances[1::2]
+
+    return fs_unc, ks_unc
+
 # Plotting --------------------------------------------------------------------------------
 
 def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
@@ -624,15 +624,15 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
             float(k2),
         ])
 
-def save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases):
+def save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases):
     diagnostic_path = Path(path) / "diagnostic" / "tables"
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / f"signals_iteration_{iteration + 1}.csv"
 
     with csv_path.open("w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["Frequency", "Decay Rate", "Amplitude", "Phase"])
-        writer.writerows(zip(fs, ks, amplitudes, phases))
+        writer.writerow(["Frequency", "Frequency Uncertainty", "Decay Rate", "Decay Rate Uncertainty", "Amplitude", "Phase"])
+        writer.writerows(zip(fs, fs_unc, ks, ks_unc, amplitudes, phases))
 
 def plot_probability_surface(title, path, probability_surface):
     path = Path(path)
@@ -659,9 +659,48 @@ def plot_probability_surface(title, path, probability_surface):
 
     return
 
-def plot_signal_space(title, path, signals):
-    path = Path(path)
+def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
+    path = Path(path) / "diagnostic" / "signal_space"
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    fs = np.asarray(fs)
+    ks = np.asarray(ks)
+    fs_unc = np.asarray(fs_unc)
+    ks_unc = np.asarray(ks_unc)
+
+    Q = np.pi * fs / ks
+    Q_unc = np.sqrt((np.pi * fs_unc / ks) ** 2 + (np.pi * fs * ks_unc / ks**2) ** 2)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    for f, q, f_unc, q_unc in zip(fs, Q, fs_unc, Q_unc):
+        for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
+            ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
+            ax.add_patch(ellipse)
+
+    ax.scatter(fs, Q, color="black", s=35, zorder=3, label="Signals")
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Quality Factor (Q)")
+    ax.set_title(title)
+
+    f_min = np.min(fs - 3.0 * fs_unc)
+    f_max = np.max(fs + 3.0 * fs_unc)
+    q_min = np.min(Q - 3.0 * Q_unc)
+    q_max = np.max(Q + 3.0 * Q_unc)
+
+    f_margin = 0.05 * (f_max - f_min) if f_max > f_min else 1.0
+    q_margin = 0.05 * (q_max - q_min) if q_max > q_min else 1.0
+
+    ax.set_xlim(f_min - f_margin, f_max + f_margin)
+    ax.set_ylim(q_min - q_margin, q_max + q_margin)
+
+    ax.grid(alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
 
     return
 
@@ -698,7 +737,7 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    ax.plot(f, abs(p), color="black", label="Data")
+    ax.plot(f, abs(p), color="black", label="Data", linewidth=0.9)
     ax.set_xlim(f[0], f[-1])
 
     ax.set_xlabel("Frequency (Hz)")
@@ -710,14 +749,14 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
         amplitudes, phases = get_phasor(t, d, signals)
 
         model_p = get_model_fourier(f, fs, ks, amplitudes, phases)
-        ax.plot(f, abs(model_p), color="red", alpha=0.8, label="Model")
-        ax.plot(f, abs(p) - abs(model_p), color="blue", alpha=0.6, label="Residual")
+        ax.plot(f, abs(model_p), color="red", alpha=0.8, label="Model", linewidth=0.9)
+        ax.plot(f, abs(p) - abs(model_p), color="blue", alpha=0.6, label="Residual", linewidth=0.9)
 
         ymin, ymax = ax.get_ylim()
         ymin_val = -jnp.abs(jnp.min(jnp.abs(p) - jnp.abs(model_p))) * 100
         ymax_val = jnp.abs(jnp.max(jnp.abs(p) - jnp.abs(model_p))) * 100
 
-        ax.vlines(fs, ymin_val, ymax_val, color="red", linestyle="--", alpha=0.15)
+        ax.vlines(fs, ymin_val, ymax_val, color="red", linestyle="--", alpha=0.15, linewidth=0.4)
         ax.set_ylim(ymin, ymax)
 
         ax.legend()
@@ -803,6 +842,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     numpyro.set_host_device_count(cores)
 
     t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time)
+    B = f_max - f_min
 
     initial_plot(path, t, d, f_min, f_max)
 
@@ -840,17 +880,18 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
             signals = nuts(t, d, signals, bounds, warmup, sample, cores)
         nuts_elapsed = perf_counter() - nuts_start
 
-        log_prob = get_log_prob(t, d, signals)
+        log_prob = get_log_prob(t, d, B, signals)
         glob_ll = get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max)
-        noise_variance = get_noise_variance(t, d, signals)
-        snr = get_snr(t, d, signals)
-        k2 = get_condition_number(t, d, signals)
+        noise_variance = get_noise_variance(t, d, B, signals)
+        snr = get_snr(t, d, B, signals)
+        k2 = get_condition_number(t, d, B, signals)
 
         fs, ks = unpack_signals(signals)
+        fs_unc, ks_unc = get_uncertainties(t, d, B, signals)
         amplitudes, phases = get_phasor(t, d, signals)
 
         save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
-        save_signal_diagnostics(path, iteration, fs, ks, amplitudes, phases)
+        save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
         plot_fourier_space(f"Fourier Space {len(signals)} Signal Model",path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
 
         iteration_elapsed = perf_counter() - iteration_start
