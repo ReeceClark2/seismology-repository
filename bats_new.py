@@ -272,10 +272,7 @@ def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points
 
     ctx = mp.get_context("spawn")
 
-    with ProcessPoolExecutor(
-        max_workers=cores,
-        mp_context=ctx,
-    ) as executor:
+    with ProcessPoolExecutor(max_workers=cores, mp_context=ctx) as executor:
         surfaces = list(executor.map(_run_grid_search, args))
 
     log_prob_space = jnp.concatenate(
@@ -304,6 +301,43 @@ def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points
     signal = (f_space[f_index], k_space[k_index])
 
     return signal
+
+def _nuts_worker(args):
+    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed = args
+    signals, bounds = checkpoint
+
+    optimized_signals = nuts(
+        t=t,
+        d=d,
+        B=B,
+        signals=signals,
+        bounds=bounds,
+        warmup=warmup,
+        sample=sample,
+        chains=cores_per_worker,
+        rng_key_value=seed,
+    )
+
+    return optimized_signals, bounds
+
+def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, cores):
+    if not checkpoints:
+        return []
+
+    if cores < 1:
+        raise ValueError("cores must be at least 1")
+
+    n_checkpoints = len(checkpoints)
+    n_workers = min(cores, n_checkpoints)
+    cores_per_worker = max(1, cores // n_checkpoints)
+
+    tasks = [(checkpoint, t, d, B, warmup, sample, cores_per_worker, index) for index, checkpoint in enumerate(checkpoints)]
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        optimized_checkpoints = list(executor.map(_nuts_worker, tasks))
+
+    return optimized_checkpoints
 
 # Evaluation (critical) -------------------------------------------------------------------
 
@@ -711,7 +745,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2
 # Plotting --------------------------------------------------------------------------------
 
 def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
-    diagnostic_path = Path(path) / "diagnostic" / "tables"
+    diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / "iteration_diagnostics.csv"
     write_header = not csv_path.exists()
@@ -730,7 +764,7 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
         ])
 
 def save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases):
-    diagnostic_path = Path(path) / "diagnostic" / "tables"
+    diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / f"signals_iteration_{iteration + 1}.csv"
 
@@ -934,6 +968,12 @@ def get_bounds(signals, f_min, f_max, k_min, k_max, f_fraction=1 / 8, log_k_frac
 
     return jnp.stack((frequency_min, frequency_max, decay_rate_min, decay_rate_max), axis=-1)
 
+def get_shift(x, y):
+    a, b, c = np.polyfit(x, y, 2)
+    x_shift = -b / (2 * a)
+
+    return x_shift
+
 # Run -------------------------------------------------------------------------------------
 
 def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, k_min, k_max, f_points, k_points, f_frac, log_k_frac, depth, warmup, sample, cores, path):
@@ -946,6 +986,8 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
     residual = d
 
+    thumbprints = []
+    checkpoints = [jnp.empty((i,)) for i in range(1, depth + 1)]
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
@@ -978,10 +1020,15 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
             signals = nuts(t, d, B, signals, bounds, warmup, sample, cores)
         nuts_elapsed = perf_counter() - nuts_start
 
+        checkpoints[iteration] = (signals, bounds)
+
         log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
 
-        save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
-        save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+        if len(signals) % 10 == 0:
+            thumbprints.append((len(signals), glob_ll))
+
+        save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+        save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
         plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
         plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
 
@@ -990,6 +1037,31 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
 
+    final_start = perf_counter()
+    thumbprints = jnp.asarray(thumbprints)
+    best_signal = int(get_shift(thumbprints[:, 0], thumbprints[:, 1]))
+    best_checkpoint = best_signal - 1
+    checkpoints = nuts_orchestrator(checkpoints[(best_checkpoint - 2):(best_checkpoint + 3)], t, d, B, warmup, sample, cores)
+
+    glob_lls = jnp.zeros(len(checkpoints))
+
+    for ind, (signals, bounds) in enumerate(checkpoints):
+        log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+        save_iteration_diagnostics(path / "result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+        glob_lls = glob_lls.at[ind].set(glob_ll)
+
+    best_index = jnp.argmax(glob_lls)
+    signals, bounds = checkpoints[best_index]
+
+    log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+
+    save_signal_diagnostics(path / "result", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
+    final_elapsed = final_start - perf_counter()
+
+    print(f"Final stage completed in {final_elapsed:.2f} seconds")
+    
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
     return
