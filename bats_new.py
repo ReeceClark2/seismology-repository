@@ -660,7 +660,7 @@ def plot_probability_surface(title, path, probability_surface):
     return
 
 def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
-    path = Path(path) / "diagnostic" / "signal_space"
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fs = np.asarray(fs)
@@ -892,7 +892,8 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
         save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
-        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model",path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+        plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space", fs, ks, fs_unc, ks_unc)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
@@ -905,7 +906,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
 
 if __name__ == "__main__":
-    path = Path.cwd() / "dracula_1104_10"
+    path = Path.cwd() / "dracula_1105_2"
     path.mkdir(parents=True, exist_ok=True)
 
     run(
