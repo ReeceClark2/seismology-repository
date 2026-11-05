@@ -208,7 +208,7 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
     warmup_samples = mcmc.get_samples(group_by_chain=True)
     warmup_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
 
-    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
+    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
 
     sample_samples = mcmc.get_samples(group_by_chain=True)
     sample_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
@@ -602,6 +602,112 @@ def get_uncertainties(t, d, B, signals):
 
     return fs_unc, ks_unc
 
+# Evaluation (all) ------------------------------------------------------------------------
+
+def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, ratio_gamma=1e2, ratio_sigma=1e2):
+    fs, ks = unpack_signals(signals)
+
+    omegas = fs * 2.0 * jnp.pi
+
+    r = len(signals) * 2
+    m = len(signals) * 2
+    N = int(2 * t[-1] * B)
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+    g = 0.5 * (g + g.T)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    h = H @ d
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    mean_sq_data = (1 / N) * sum_sq_data
+    mean_sq_proj = (1 / m) * sum_sq_proj
+
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+
+    snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
+
+    g_norms = jnp.sqrt(jnp.diag(g))
+    g_normalized = g / jnp.outer(g_norms, g_norms)
+    g_eigenvalues = jnp.linalg.eigvalsh(g_normalized)
+
+    max_eigenvalue = jnp.max(g_eigenvalues)
+    min_eigenvalue = jnp.maximum(jnp.min(g_eigenvalues), jnp.finfo(g_eigenvalues.dtype).eps * max_eigenvalue)
+    k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
+
+    ratio = sum_sq_proj / sum_sq_data
+    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
+
+    omega_scale = 2 * jnp.pi * (f_max - f_min) / 2
+    k_scale = (k_max - k_min) / 2
+
+    mean_sq_param = (1 / r) * jnp.sum((omegas / omega_scale) ** 2 + (ks / k_scale) ** 2)
+
+    log_R_delta = jnp.log(ratio_delta)
+    log_R_gamma = jnp.log(ratio_gamma)
+    log_R_sigma = jnp.log(ratio_sigma)
+
+    theta, unravel = ravel_pytree(signals)
+
+    def objective(theta):
+        return get_mean_sq_proj(t, d, B, unravel(theta))
+
+    b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
+
+    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
+
+    unc = jnp.sqrt(noise_variance * jnp.sum(b_eigenvectors ** 2 / b_eigenvalues[None, :], axis=1))
+    fs_unc = unc[::2]
+    ks_unc = unc[1::2]
+
+    amplitudes = jnp.sqrt(
+        (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[:len(signals)] ** 2
+        + (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[len(signals):] ** 2
+    )
+
+    beta = eigenvectors @ (h / jnp.sqrt(eigenvalues))
+    cosine_coefficients = beta[:len(signals)]
+    sine_coefficients = beta[len(signals):]
+    amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
+    phases = jnp.atan2(cosine_coefficients, sine_coefficients)
+
+    delta_term = (
+        jsp.gammaln(m / 2)
+        - jnp.log(2)
+        - jnp.log(log_R_delta)
+        + (-m / 2) * jnp.log(m * mean_sq_proj / 2.0)
+    )
+
+    gamma_term = (
+        jsp.gammaln(r / 2)
+        - jnp.log(2)
+        - jnp.log(log_R_gamma)
+        + (-r / 2) * jnp.log((r * mean_sq_param) / 2)
+    )
+
+    sigma_term = (
+        jsp.gammaln((N - m - r) / 2)
+        - jnp.log(2)
+        - jnp.log(log_R_sigma)
+        + ((m + r - N) / 2) * jnp.log(
+            ((N * mean_sq_data) - (m * mean_sq_proj)) / 2
+        )
+    )
+
+    log_jacobian_factor = -0.5 * jnp.sum(jnp.log(jnp.abs(b_eigenvalues)))
+    glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
+
+    return log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases
+
 # Plotting --------------------------------------------------------------------------------
 
 def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
@@ -677,7 +783,6 @@ def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
         for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
             ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
             ax.add_patch(ellipse)
-    ax.set_ylim(ymin, ymax)
 
     ax.scatter(fs, Q, color="red", s=15, zorder=3, label="Signals")
 
@@ -685,16 +790,12 @@ def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
     ax.set_ylabel("Quality Factor (Q)")
     ax.set_title(title)
 
-    f_min = np.min(fs - 3.0 * fs_unc)
-    f_max = np.max(fs + 3.0 * fs_unc)
-    q_min = np.min(Q - 3.0 * Q_unc)
-    q_max = np.max(Q + 3.0 * Q_unc)
-
+    f_min = np.min(fs)
+    f_max = np.max(fs)
     f_margin = 0.05 * (f_max - f_min) if f_max > f_min else 1.0
-    q_margin = 0.05 * (q_max - q_min) if q_max > q_min else 1.0
 
     ax.set_xlim(f_min - f_margin, f_max + f_margin)
-    ax.set_ylim(q_min - q_margin, q_max + q_margin)
+    ax.set_ylim(ymin, ymax)
 
     ax.legend()
 
@@ -880,15 +981,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
             signals = nuts(t, d, B, signals, bounds, warmup, sample, cores)
         nuts_elapsed = perf_counter() - nuts_start
 
-        log_prob = get_log_prob(t, d, B, signals)
-        glob_ll = get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max)
-        noise_variance = get_noise_variance(t, d, B, signals)
-        snr = get_snr(t, d, B, signals)
-        k2 = get_condition_number(t, d, B, signals)
-
-        fs, ks = unpack_signals(signals)
-        fs_unc, ks_unc = get_uncertainties(t, d, B, signals)
-        amplitudes, phases = get_phasor(t, d, signals)
+        log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
 
         save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
         save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
