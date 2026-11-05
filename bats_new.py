@@ -597,7 +597,7 @@ def get_uncertainties(t, d, B, signals):
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(b)
 
-    variances = noise_variance * jnp.sum(eigenvectors**2 / eigenvalues[None, :], axis=1)
+    variances = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1))
     fs_unc = variances[::2]
     ks_unc = variances[1::2]
 
@@ -893,7 +893,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2)
         save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
         plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
-        plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space", fs, ks, fs_unc, ks_unc)
+        plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
