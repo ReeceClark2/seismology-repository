@@ -101,7 +101,7 @@ def get_log_prob(t, d, B, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -155,7 +155,7 @@ def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size
     
     return probability_surface
 
-def objective(t, d, f_min, f_max, k_min, k_max):
+def objective(t, d, B, f_min, f_max, k_min, k_max):
     fs = numpyro.sample(
         "fs",
         numpyro.distributions.Uniform(f_min, f_max).to_event(1),
@@ -179,10 +179,9 @@ def objective(t, d, f_min, f_max, k_min, k_max):
         axis=-1,
     )
 
-    B = f_max - f_min
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
-def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
+def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
     f_init, k_init = unpack_signals(signals, sort=False)
 
     bounds = jnp.asarray(bounds).reshape(-1, 4)
@@ -204,7 +203,7 @@ def nuts(t, d, signals, bounds, warmup, sample, chains, rng_key_value=None):
 
     kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=5)
     mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
-    mcmc.warmup(warmup_key, t=t, d=d, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
+    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
 
     warmup_samples = mcmc.get_samples(group_by_chain=True)
     warmup_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
@@ -315,7 +314,7 @@ def get_mean_sq_proj(t, d, B, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -346,7 +345,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     r = len(signals) * 2
     m = len(signals) * 2
     B = f_max - f_min
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -419,7 +418,7 @@ def get_condition_number(t, d, B, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -467,7 +466,7 @@ def get_noise_variance(t, d, B, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -498,7 +497,7 @@ def get_snr(t, d, B, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -563,7 +562,7 @@ def get_uncertainties(t, d, B, signals):
     
     r = len(signals) * 2
     m = len(signals) * 2
-    N = 2 * t[-1] * B
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -677,7 +676,7 @@ def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
     for f, q, f_unc, q_unc in zip(fs, Q, fs_unc, Q_unc):
         for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
             ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
-            ax.add_patch(ellipse, scaley=False)
+            ax.add_patch(ellipse)
     ax.set_ylim(ymin, ymax)
 
     ax.scatter(fs, Q, color="red", s=15, zorder=3, label="Signals")
@@ -878,7 +877,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         nuts_start = perf_counter()
         if len(signals) % 10 == 0:
-            signals = nuts(t, d, signals, bounds, warmup, sample, cores)
+            signals = nuts(t, d, B, signals, bounds, warmup, sample, cores)
         nuts_elapsed = perf_counter() - nuts_start
 
         log_prob = get_log_prob(t, d, B, signals)
