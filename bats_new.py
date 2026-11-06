@@ -80,6 +80,8 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.decimate(5, no_filter=False)
     trace.decimate(2, no_filter=False)
 
+    trace.filter("bandpass", freqmin=0.00028, freqmax=0.0015)
+
     delta = float(trace.stats.delta)
     sample_count = len(trace)
 
@@ -869,6 +871,10 @@ def plot_time_series(title, path, t, d, signals=None):
 
     return
 
+def plot_covariance(title, path, t, d, signals):
+
+    return
+
 def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -995,7 +1001,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     residual = d
 
     thumbprints = []
-    checkpoints = [jnp.empty((i,)) for i in range(1, depth + 1)]
+    checkpoints = [None] * depth
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
@@ -1059,7 +1065,8 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     best_signal = int(get_shift(thumbprints[:, 0], thumbprints[:, 1]))
 
     checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
-    best_checkpoint_index = min(range(len(checkpoints)), key=lambda i: abs(len(checkpoints[i][0]) - best_signal))
+    best_checkpoint_index = min(range(len(checkpoints)),key=lambda i: abs(checkpoints[i][0].shape[0] - best_signal))
+
     start = max(0, best_checkpoint_index - 2)
     stop = min(len(checkpoints), best_checkpoint_index + 3)
 
