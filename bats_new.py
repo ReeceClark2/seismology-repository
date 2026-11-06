@@ -98,9 +98,10 @@ def get_log_prob(t, d, B, signals):
     fs, ks = unpack_signals(signals)
 
     omegas = fs * 2.0 * jnp.pi
-    
-    r = len(signals) * 2
-    m = len(signals) * 2
+
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -346,8 +347,9 @@ def get_mean_sq_proj(t, d, B, signals):
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -376,8 +378,9 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     B = f_max - f_min
     N = int(2 * t[-1] * B)
 
@@ -450,8 +453,9 @@ def get_condition_number(t, d, B, signals):
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -498,8 +502,9 @@ def get_noise_variance(t, d, B, signals):
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -529,8 +534,9 @@ def get_snr(t, d, B, signals):
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -594,8 +600,9 @@ def get_uncertainties(t, d, B, signals):
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -643,8 +650,9 @@ def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2
 
     omegas = fs * 2.0 * jnp.pi
 
-    r = len(signals) * 2
-    m = len(signals) * 2
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
     N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
@@ -976,8 +984,9 @@ def get_shift(x, y):
 
 # Run -------------------------------------------------------------------------------------
 
-def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, k_min, k_max, f_points, k_points, f_frac, log_k_frac, depth, warmup, sample, cores, path):
-    numpyro.set_host_device_count(cores)
+def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, k_min, k_max, f_points, k_points, f_frac, log_k_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
+    numpyro.set_host_device_count(devices)
+    chains = cores // devices
 
     t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time)
     B = f_max - f_min
@@ -1010,27 +1019,36 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         signal = jnp.asarray(signal).reshape(1, 2)
         signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
 
-        # signal = nuts(t, residual, signal, signal_bounds, warmup, sample, cores)
-
         signals = jnp.concatenate([signals, signal], axis=0)
         bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
 
         nuts_start = perf_counter()
-        if len(signals) % 10 == 0:
-            signals = nuts(t, d, B, signals, bounds, warmup, sample, cores)
+        if len(signals) % signal_step == 0:
+            signals = nuts(t, d, B, signals, bounds, warmup, sample, chains)
         nuts_elapsed = perf_counter() - nuts_start
 
-        checkpoints[iteration] = (signals, bounds)
+        if diagnostics == "full":
+            checkpoints[iteration] = (signals, bounds)
 
-        log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
 
-        if len(signals) % 10 == 0:
-            thumbprints.append((len(signals), glob_ll))
+            if len(signals) % signal_step == 0:
+                thumbprints.append((len(signals), glob_ll))
 
-        save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-        save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
-        plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
-        plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
+            save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+            save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+            plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+            plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
+        else:
+            if len(signals) % signal_step == 0:
+                checkpoints[iteration] = (signals, bounds)
+                log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+                thumbprints.append((len(signals), glob_ll))
+
+                save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+                save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+                plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+                plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
@@ -1040,8 +1058,10 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     final_start = perf_counter()
     thumbprints = jnp.asarray(thumbprints)
     best_signal = int(get_shift(thumbprints[:, 0], thumbprints[:, 1]))
-    best_checkpoint = best_signal - 1
-    checkpoints = nuts_orchestrator(checkpoints[(best_checkpoint - 2):(best_checkpoint + 3)], t, d, B, warmup, sample, cores)
+    best_checkpoint = min(max(best_signal - 1, 0), len(checkpoints) - 1)
+    start = max(0, best_checkpoint - 2)
+    stop = min(len(checkpoints), best_checkpoint + 3)
+    checkpoints = nuts_orchestrator(checkpoints[start:stop], t, d, B, 500, 1_000, chains)
 
     glob_lls = jnp.zeros(len(checkpoints))
 
@@ -1058,7 +1078,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     save_signal_diagnostics(path / "result", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
-    final_elapsed = final_start - perf_counter()
+    final_elapsed = perf_counter() - final_start
 
     print(f"Final stage completed in {final_elapsed:.2f} seconds")
     
@@ -1095,7 +1115,11 @@ if __name__ == "__main__":
 
         warmup=200,
         sample=400,
+        devices=10,
         cores=40,
+
+        diagnostics="partial",
+        signal_step=10,
 
         path=path
     )
