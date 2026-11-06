@@ -45,7 +45,7 @@ class GridSearchTask:
 
 # Data Acquisition -----------------------------------------------------------------------
 
-def get_observed_data(network, station, channel, location, stream_index, start_time, end_time):
+def get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max):
     """Download, response-correct, decimate, and broadly bandpass the data."""
     start_time = UTCDateTime(start_time)
     end_time = UTCDateTime(end_time)
@@ -77,10 +77,9 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
 
     trace.decimate(5, no_filter=False)
     trace.decimate(5, no_filter=False)
-    trace.decimate(5, no_filter=False)
-    trace.decimate(2, no_filter=False)
+    trace.decimate(3, no_filter=False)
 
-    trace.filter("bandpass", freqmin=0.00028, freqmax=0.0015)
+    trace.filter("bandpass", freqmin=f_min, freqmax=f_max)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -993,7 +992,7 @@ def get_shift(x, y):
 def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, k_min, k_max, f_points, k_points, f_frac, log_k_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
     numpyro.set_host_device_count(devices)
 
-    t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time)
+    t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max)
     B = f_max - f_min
 
     initial_plot(path, t, d, f_min, f_max)
@@ -1097,38 +1096,46 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
 
 if __name__ == "__main__":
-    path = Path.cwd() / "dracula_1105_2"
-    path.mkdir(parents=True, exist_ok=True)
+    name = "dracula_01-05mHz"
+    total_iterations = 6
+    f_min_total = 0.00028
+    f_max_total = 0.00500
+    bandwidth = (f_max_total - f_min_total) / total_iterations
 
-    run(
-        network="IU",
-        station="ANMO",
-        channel="LHZ",
-        location="00",
-        stream_index=0,
-        start_time="2025-07-30T04:24:52",
-        end_time="2025-08-10T17:24:52",
+    for i in range(total_iterations):
+        print(f"Starting iteration {i}...")
+        iteration = i + 1
+        f_min = f_min_total + i * bandwidth
+        f_max = f_min_total + (i + 1) * bandwidth
+        path = Path.cwd() / f"dracula_{round(1e3 * f_min, 1)}r{round(1e3 * f_max, 1)}_{iteration}r{total_iterations}"
+        path.mkdir(parents=True, exist_ok=True)
 
-        f_min=0.00028,
-        f_max=0.00150,
-        k_min=4.0e-7,
-        k_max=5.0e-5,
+        run(network="IU", 
+            station="ANMO", 
+            channel="LHZ", 
+            location="00", 
+            stream_index=0, 
+            start_time="2025-07-30T04:24:52", 
+            end_time="2025-08-10T17:24:52", 
 
-        f_points=2000,
-        k_points=100,
+            f_min=f_min, 
+            f_max=f_max, 
+            k_min=4.4e-7, 
+            k_max=1.3e-4, 
 
-        f_frac=100,
-        log_k_frac=3,
+            f_points=2000, 
+            k_points=100, 
+            f_frac=100, 
+            log_k_frac=3, 
+            depth=50, 
 
-        depth=60,
+            warmup=200, 
+            sample=400, 
 
-        warmup=200,
-        sample=400,
-        devices=10,
-        cores=40,
+            devices=5, 
+            cores=40, 
+            diagnostics="partial", 
+            signal_step=10, 
 
-        diagnostics="partial",
-        signal_step=10,
-
-        path=path
-    )
+            path=path
+        )
