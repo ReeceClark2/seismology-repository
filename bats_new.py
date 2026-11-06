@@ -986,7 +986,6 @@ def get_shift(x, y):
 
 def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, k_min, k_max, f_points, k_points, f_frac, log_k_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
     numpyro.set_host_device_count(devices)
-    chains = cores // devices
 
     t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time)
     B = f_max - f_min
@@ -1024,7 +1023,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         nuts_start = perf_counter()
         if len(signals) % signal_step == 0:
-            signals = nuts(t, d, B, signals, bounds, warmup, sample, chains)
+            signals = nuts(t, d, B, signals, bounds, warmup, sample, devices)
         nuts_elapsed = perf_counter() - nuts_start
 
         if diagnostics == "full":
@@ -1058,10 +1057,13 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     final_start = perf_counter()
     thumbprints = jnp.asarray(thumbprints)
     best_signal = int(get_shift(thumbprints[:, 0], thumbprints[:, 1]))
-    best_checkpoint = min(max(best_signal - 1, 0), len(checkpoints) - 1)
-    start = max(0, best_checkpoint - 2)
-    stop = min(len(checkpoints), best_checkpoint + 3)
-    checkpoints = nuts_orchestrator(checkpoints[start:stop], t, d, B, 500, 1_000, chains)
+
+    checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
+    best_checkpoint_index = min(range(len(checkpoints)), key=lambda i: abs(len(checkpoints[i][0]) - best_signal))
+    start = max(0, best_checkpoint_index - 2)
+    stop = min(len(checkpoints), best_checkpoint_index + 3)
+
+    checkpoints = nuts_orchestrator(checkpoints[start:stop], t, d, B, 500, 1_000, devices)
 
     glob_lls = jnp.zeros(len(checkpoints))
 
