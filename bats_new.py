@@ -8,7 +8,6 @@ from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-import arviz as az
 
 # Configure Matplotlib before importing pyplot.
 os.environ["MPLBACKEND"] = "Agg"
@@ -75,11 +74,11 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.detrend("spline", order=3, dspline=1728)
     trace.remove_response(inventory=inventory, output="ACC")
 
-    trace.decimate(5, no_filter=False)
-    trace.decimate(5, no_filter=False)
-    trace.decimate(3, no_filter=False)
+    trace.decimate(5, no_filter=True)
+    trace.decimate(5, no_filter=True)
+    trace.decimate(3, no_filter=True)
 
-    trace.filter("bandpass", freqmin=f_min, freqmax=f_max)
+    trace.filter("bandpass", freqmin=f_min, freqmax=f_max, corners=12)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -1044,8 +1043,9 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
             plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
         else:
+            checkpoints[iteration] = (signals, bounds)
+
             if len(signals) % signal_step == 0:
-                checkpoints[iteration] = (signals, bounds)
                 log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
                 thumbprints.append((len(signals), glob_ll))
 
@@ -1060,26 +1060,49 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
 
     final_start = perf_counter()
-    thumbprints = jnp.asarray(thumbprints)
-    best_signal = int(get_shift(thumbprints[:, 0], thumbprints[:, 1]))
-
     checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
-    best_checkpoint_index = min(range(len(checkpoints)),key=lambda i: abs(checkpoints[i][0].shape[0] - best_signal))
+    checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
 
-    start = max(0, best_checkpoint_index - 2)
-    stop = min(len(checkpoints), best_checkpoint_index + 3)
+    thumbprints = np.asarray(thumbprints, dtype=float)
 
-    checkpoints = nuts_orchestrator(checkpoints[start:stop], t, d, B, 500, 1_000, devices)
+    glob_lls = {int(count): float(score) for count, score in thumbprints if np.isfinite(score) and int(count) in checkpoint_by_count}
+    refined_checkpoints = {count: checkpoint_by_count[count] for count in glob_lls}
 
-    glob_lls = jnp.zeros(len(checkpoints))
+    while True:
+        best_count = max(glob_lls, key=glob_lls.get)
+        measured_counts = sorted(glob_lls)
 
-    for ind, (signals, bounds) in enumerate(checkpoints):
-        log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
-        save_iteration_diagnostics(path / "result", signals, noise_variance, snr, log_prob, glob_ll, k2)
-        glob_lls = glob_lls.at[ind].set(glob_ll)
+        left_counts = [count for count in measured_counts if count < best_count]
+        right_counts = [count for count in measured_counts if count > best_count]
 
-    best_index = jnp.argmax(glob_lls)
-    signals, bounds = checkpoints[best_index]
+        left_limit = left_counts[-1] if left_counts else 1
+        right_limit = right_counts[0] if right_counts else depth
+
+        candidates = []
+
+        if best_count - left_limit > 1:
+            candidate = (left_limit + best_count) // 2
+            if candidate not in glob_lls:
+                candidates.append(candidate)
+
+        if right_limit - best_count > 1:
+            candidate = (best_count + right_limit) // 2
+            if candidate not in glob_lls:
+                candidates.append(candidate)
+
+        candidates = sorted(set(candidates))
+        if not candidates:
+            break
+
+        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices)
+
+        for count, checkpoint in zip(candidates, candidate_refits):
+            refined_checkpoints[count] = checkpoint
+            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, k_min, k_max)
+            glob_lls[count] = float(statistics[1])
+
+    best_count = max(glob_lls, key=glob_lls.get)
+    signals, bounds = refined_checkpoints[best_count]
 
     log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
 
@@ -1089,14 +1112,13 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     final_elapsed = perf_counter() - final_start
 
     print(f"Final stage completed in {final_elapsed:.2f} seconds")
-    
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
     return
 
 
 if __name__ == "__main__":
-    name = "dracula_01-05mHz"
+    name = "dracula_01-05mHz_1109_1"
     total_iterations = 6
     f_min_total = 0.00028
     f_max_total = 0.00500
@@ -1107,7 +1129,7 @@ if __name__ == "__main__":
         iteration = i + 1
         f_min = f_min_total + i * bandwidth
         f_max = f_min_total + (i + 1) * bandwidth
-        path = Path.cwd() / f"dracula_{round(1e3 * f_min, 1)}r{round(1e3 * f_max, 1)}_{iteration}r{total_iterations}"
+        path = Path.cwd() / name / f"dracula_{round(1e3 * f_min, 1)}r{round(1e3 * f_max, 1)}_{iteration}r{total_iterations}"
         path.mkdir(parents=True, exist_ok=True)
 
         run(network="IU", 
@@ -1132,8 +1154,8 @@ if __name__ == "__main__":
             warmup=200, 
             sample=400, 
 
-            devices=5, 
-            cores=40, 
+            devices=7, 
+            cores=56, 
             diagnostics="partial", 
             signal_step=10, 
 
