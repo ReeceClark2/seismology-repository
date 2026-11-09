@@ -37,10 +37,10 @@ jax.config.update("jax_enable_x64", True)
 class GridSearchTask:
     f_min: float
     f_max: float
-    k_min: float
-    k_max: float
+    Q_min: float
+    Q_max: float
     f_points: int
-    k_points: int
+    Q_points: int
 
 # Data Acquisition -----------------------------------------------------------------------
 
@@ -78,7 +78,7 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.decimate(5, no_filter=True)
     trace.decimate(3, no_filter=True)
 
-    trace.filter("bandpass", freqmin=f_min, freqmax=f_max, corners=12)
+    trace.filter("bandpass", freqmin=f_min, freqmax=f_max, corners=2)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -95,7 +95,8 @@ def get_log_prob(t, d, B, signals):
     Bretthorst Eq. 3.17
     '''
     
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
 
@@ -129,15 +130,15 @@ def get_log_prob(t, d, B, signals):
 
     return 0.5 * (m - N) * jnp.log1p(-ratio)
 
-def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size=512):
+def grid_search(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, batch_size=512):
     f_space = jnp.linspace(f_min, f_max, f_points)
     B = f_max - f_min
 
-    k_margin = 1e-6 * (k_max - k_min)
-    k_space = jnp.geomspace(k_min + k_margin, k_max - k_margin, k_points)
+    Q_margin = 1e-6 * (Q_max - Q_min)
+    Q_space = jnp.geomspace(Q_min + Q_margin, Q_max - Q_margin, Q_points)
 
-    f_grid, k_grid = jnp.meshgrid(f_space, k_space, indexing="ij")
-    signal_grid = jnp.stack([f_grid.ravel(), k_grid.ravel()], axis=-1)
+    f_grid, Q_grid = jnp.meshgrid(f_space, Q_space, indexing="ij")
+    signal_grid = jnp.stack([f_grid.ravel(), Q_grid.ravel()], axis=-1)
 
     evaluate_batch = jax.jit(
         jax.vmap(lambda signal: get_log_prob(t, d, B, signal))
@@ -150,51 +151,37 @@ def grid_search(t, d, f_min, f_max, k_min, k_max, f_points, k_points, batch_size
         results.append(evaluate_batch(batch))
 
     log_probs = jnp.concatenate(results)
-    log_prob_space = log_probs.reshape(f_space.size, k_space.size)
+    log_prob_space = log_probs.reshape(f_space.size, Q_space.size)
 
-    probability_surface = (f_space, k_space, log_prob_space)
+    probability_surface = (f_space, Q_space, log_prob_space)
     
     return probability_surface
 
-def objective(t, d, B, f_min, f_max, k_min, k_max):
-    fs = numpyro.sample(
-        "fs",
-        numpyro.distributions.Uniform(f_min, f_max).to_event(1),
-    )
+def objective(t, d, B, f_min, f_max, Q_min, Q_max):
+    fs = numpyro.sample("fs", numpyro.distributions.Uniform(f_min, f_max).to_event(1))
+    log_Qs = numpyro.sample("log_Qs", numpyro.distributions.Uniform(jnp.log(Q_min), jnp.log(Q_max)).to_event(1))
 
-    log_k_min = jnp.log(k_min)
-    log_k_max = jnp.log(k_max)
-
-    log_ks = numpyro.sample(
-        "log_ks",
-        numpyro.distributions.Uniform(log_k_min, log_k_max).to_event(1),
-    )
-
-    ks = numpyro.deterministic(
-        "ks",
-        jnp.exp(log_ks),
-    )
-
-    signals = jnp.stack(
-        (fs, ks),
-        axis=-1,
-    )
+    Qs = numpyro.deterministic("Qs", jnp.exp(log_Qs))
+    signals = jnp.stack((fs, Qs), axis=-1)
 
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
 def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
-    f_init, k_init = unpack_signals(signals, sort=False)
+    f_init, Q_init = unpack_signals(signals, sort=False)
+    k_init = jnp.pi * f_init / Q_init
 
     bounds = jnp.asarray(bounds).reshape(-1, 4)
 
     fs_min = bounds[:, 0].astype(f_init.dtype)
     fs_max = bounds[:, 1].astype(f_init.dtype)
-    ks_min = bounds[:, 2].astype(k_init.dtype)
-    ks_max = bounds[:, 3].astype(k_init.dtype)
+    Qs_min = bounds[:, 2].astype(Q_init.dtype)
+    Qs_max = bounds[:, 3].astype(Q_init.dtype)
+    ks_min = jnp.pi * fs_min / Qs_min
+    ks_max = jnp.pi * fs_max / Qs_max
 
-    log_k_init = jnp.log(k_init)
+    log_Q_init = jnp.log(Q_init)
 
-    init_strategy = init_to_value(values={"fs": f_init, "log_ks": log_k_init})
+    init_strategy = init_to_value(values={"fs": f_init, "log_Qs": log_Q_init})
 
     if rng_key_value is None:
         rng_key_value = random.randint(1, 10_000)
@@ -204,12 +191,12 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
 
     kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=5)
     mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
-    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
+    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy",))
 
     warmup_samples = mcmc.get_samples(group_by_chain=True)
     warmup_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
 
-    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, k_min=ks_min, k_max=ks_max, extra_fields=("potential_energy",))
+    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy",))
 
     sample_samples = mcmc.get_samples(group_by_chain=True)
     sample_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
@@ -223,9 +210,9 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
     chain_index, draw_index = jnp.unravel_index(best_flat_index, potential_energy.shape)
 
     best_fs = samples["fs"][chain_index, draw_index]
-    best_ks = samples["ks"][chain_index, draw_index]
+    best_Qs = jnp.exp(samples["log_Qs"][chain_index, draw_index])
 
-    signals = jnp.stack((best_fs, best_ks), axis=-1)
+    signals = jnp.stack((best_fs, best_Qs), axis=-1)
     return signals
 
 # Orchestrators ---------------------------------------------------------------------------
@@ -238,13 +225,13 @@ def _run_grid_search(args):
         d=d,
         f_min=task.f_min,
         f_max=task.f_max,
-        k_min=task.k_min,
-        k_max=task.k_max,
+        Q_min=task.Q_min,
+        Q_max=task.Q_max,
         f_points=task.f_points,
-        k_points=task.k_points,
+        Q_points=task.Q_points,
     )
 
-def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points, k_points, cores):
+def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores):
     f_margin = 1e-6 * (f_max - f_min)
     full_f_space = np.linspace(f_min + f_margin, f_max - f_margin, f_points)
 
@@ -262,10 +249,10 @@ def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points
             GridSearchTask(
                 f_min=float(full_f_space[start]),
                 f_max=float(full_f_space[stop - 1]),
-                k_min=k_min,
-                k_max=k_max,
+                Q_min=Q_min,
+                Q_max=Q_max,
                 f_points=stop - start,
-                k_points=k_points,  # Do not divide this
+                Q_points=Q_points,  # Do not divide this
             )
         )
 
@@ -284,22 +271,22 @@ def grid_search_orchestrator(signals, t, d, f_min, f_max, k_min, k_max, f_points
         [surface[0] for surface in surfaces],
         axis=0,
     )
-    k_space = surfaces[0][1]
+    Q_space = surfaces[0][1]
 
     probability_surface = (
         f_space,
-        k_space,
+        Q_space,
         log_prob_space,
     )
 
     plot_probability_surface(f"Probability Surface {len(signals)}", path / "diagnostic" / "probability_surface" / f"probability_surface_{len(signals)}.png", probability_surface)
 
-    f_space, k_space, log_prob_space = probability_surface
+    f_space, Q_space, log_prob_space = probability_surface
     best_index = jnp.unravel_index(jnp.argmax(log_prob_space), log_prob_space.shape)
 
-    f_index, k_index = best_index
+    f_index, Q_index = best_index
     f_space[f_index]
-    signal = (f_space[f_index], k_space[k_index])
+    signal = (f_space[f_index], Q_space[Q_index])
 
     return signal
 
@@ -321,18 +308,15 @@ def _nuts_worker(args):
 
     return optimized_signals, bounds
 
-def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, cores):
+def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
     if not checkpoints:
         return []
 
-    if cores < 1:
-        raise ValueError("cores must be at least 1")
-
     n_checkpoints = len(checkpoints)
-    n_workers = min(cores, n_checkpoints)
-    cores_per_worker = max(1, cores // n_checkpoints)
+    n_workers = min(devices, n_checkpoints)
+    devices_per_worker = max(1, devices // n_checkpoints)
 
-    tasks = [(checkpoint, t, d, B, warmup, sample, cores_per_worker, index) for index, checkpoint in enumerate(checkpoints)]
+    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index) for index, checkpoint in enumerate(checkpoints)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -343,7 +327,8 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, cores):
 # Evaluation (critical) -------------------------------------------------------------------
 
 def get_mean_sq_proj(t, d, B, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -373,8 +358,9 @@ def get_mean_sq_proj(t, d, B, signals):
 
     return mean_sq_proj
 
-def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, ratio_gamma=1e2, ratio_sigma=1e2):
-    fs, ks = unpack_signals(signals)
+def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max, ratio_delta=1e2, ratio_gamma=1e2, ratio_sigma=1e2):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -402,12 +388,20 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     h = H @ d
 
     # TODO: think about the scaling closely.
-    omega_scale = 2 * jnp.pi * (f_max - f_min) / 2
-    k_scale = (k_max - k_min) / 2
+    omega_center = jnp.pi * (f_max + f_min)
+    omega_halfwidth = jnp.pi * (f_max - f_min)
 
+    log_Q_min = jnp.log(Q_min)
+    log_Q_max = jnp.log(Q_max)
+    log_Q_center = 0.5 * (log_Q_max + log_Q_min)
+    log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
+
+    x_omega = (omegas - omega_center) / omega_halfwidth
+    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
+    
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / r) * jnp.sum((omegas / omega_scale) ** 2 + (ks / k_scale) ** 2)
+    mean_sq_param = (1 / r) * jnp.sum(x_omega ** 2 + x_log_Q ** 2)
 
     log_R_delta = jnp.log(ratio_delta)
     log_R_gamma = jnp.log(ratio_gamma)
@@ -449,7 +443,8 @@ def get_glob_ll(t, d, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, rati
     return glob_ll
 
 def get_condition_number(t, d, B, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -479,7 +474,8 @@ def get_condition_number(t, d, B, signals):
     return k2
 
 def get_model(t, d, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = 2.0 * jnp.pi * fs
     arg = omegas[:, None] * t[None, :]
@@ -498,7 +494,8 @@ def get_model(t, d, signals):
 # Evaluation (minor) ----------------------------------------------------------------------
 
 def get_noise_variance(t, d, B, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -530,7 +527,8 @@ def get_noise_variance(t, d, B, signals):
     return noise_variance
 
 def get_snr(t, d, B, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -564,7 +562,8 @@ def get_snr(t, d, B, signals):
     return snr
 
 def get_phasor(t, d, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
     
     omegas = 2.0 * jnp.pi * fs
     arg = omegas[:, None] * t[None, :]
@@ -596,7 +595,8 @@ def get_phasor(t, d, signals):
     return amplitudes, phases
 
 def get_uncertainties(t, d, B, signals):
-    fs, ks = unpack_signals(signals)
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
@@ -639,14 +639,15 @@ def get_uncertainties(t, d, B, signals):
 
     variances = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1))
     fs_unc = variances[::2]
-    ks_unc = variances[1::2]
+    Qs_unc = variances[1::2]
 
-    return fs_unc, ks_unc
+    return fs_unc, Qs_unc
 
 # Evaluation (all) ------------------------------------------------------------------------
 
-def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2, ratio_gamma=1e2, ratio_sigma=1e2):
-    fs, ks = unpack_signals(signals)
+def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, ratio_delta=1e2, ratio_gamma=1e2, ratio_sigma=1e2):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
 
@@ -688,10 +689,20 @@ def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2
     ratio = sum_sq_proj / sum_sq_data
     log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
 
-    omega_scale = 2 * jnp.pi * (f_max - f_min) / 2
-    k_scale = (k_max - k_min) / 2
+    omega_center = jnp.pi * (f_max + f_min)
+    omega_halfwidth = jnp.pi * (f_max - f_min)
 
-    mean_sq_param = (1 / r) * jnp.sum((omegas / omega_scale) ** 2 + (ks / k_scale) ** 2)
+    log_Q_min = jnp.log(Q_min)
+    log_Q_max = jnp.log(Q_max)
+    log_Q_center = 0.5 * (log_Q_max + log_Q_min)
+    log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
+
+    x_omega = (omegas - omega_center) / omega_halfwidth
+    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
+    
+    mean_sq_data = (1 / N) * jnp.sum(d ** 2)
+    mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
+    mean_sq_param = (1 / r) * jnp.sum(x_omega ** 2 + x_log_Q ** 2)
 
     log_R_delta = jnp.log(ratio_delta)
     log_R_gamma = jnp.log(ratio_gamma)
@@ -706,10 +717,11 @@ def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2
     b = 0.5 * (b + b.T)
 
     b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
+    covariance = noise_variance * ((b_eigenvectors / b_eigenvalues[None, :]) @ b_eigenvectors.T)
 
     unc = jnp.sqrt(noise_variance * jnp.sum(b_eigenvectors ** 2 / b_eigenvalues[None, :], axis=1))
     fs_unc = unc[::2]
-    ks_unc = unc[1::2]
+    Qs_unc = unc[1::2]
 
     amplitudes = jnp.sqrt(
         (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[:len(signals)] ** 2
@@ -748,7 +760,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max, ratio_delta=1e2
     log_jacobian_factor = -0.5 * jnp.sum(jnp.log(jnp.abs(b_eigenvalues)))
     glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
 
-    return log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases
+    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
 
 # Plotting --------------------------------------------------------------------------------
 
@@ -771,30 +783,30 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
             float(k2),
         ])
 
-def save_signal_diagnostics(path, iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases):
+def save_signal_diagnostics(path, iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases):
     diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / f"signals_iteration_{iteration + 1}.csv"
 
     with csv_path.open("w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["Frequency", "Frequency Uncertainty", "Decay Rate", "Decay Rate Uncertainty", "Amplitude", "Phase"])
-        writer.writerows(zip(fs, fs_unc, ks, ks_unc, amplitudes, phases))
+        writer.writerow(["Frequency", "Frequency Uncertainty", "Quality Factor", "Quality Factor Uncertainty", "Amplitude", "Phase"])
+        writer.writerows(zip(fs, fs_unc, Qs, Qs_unc, amplitudes, phases))
 
 def plot_probability_surface(title, path, probability_surface):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    f_space, k_space, log_prob_space = probability_surface
+    f_space, Q_space, log_prob_space = probability_surface
     log_prob_space = log_prob_space.T
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    heatmap = ax.pcolormesh(f_space, k_space, log_prob_space, shading="auto", cmap="Grays")
+    heatmap = ax.pcolormesh(f_space, Q_space, log_prob_space, shading="auto", cmap="Grays")
 
     ax.set_yscale("log")
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Decay Rate")
+    ax.set_ylabel("Quality Factor (Q)")
     ax.set_title(title)
 
     colorbar = fig.colorbar(heatmap, ax=ax)
@@ -806,29 +818,27 @@ def plot_probability_surface(title, path, probability_surface):
 
     return
 
-def plot_signal_space(title, path, fs, ks, fs_unc, ks_unc):
+def plot_signal_space(title, path, fs, Qs, fs_unc, Qs_unc):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fs = np.asarray(fs)
-    ks = np.asarray(ks)
+    Qs = np.asarray(Qs)
     fs_unc = np.asarray(fs_unc)
-    ks_unc = np.asarray(ks_unc)
-
-    Q = np.pi * fs / ks
-    Q_unc = np.sqrt((np.pi * fs_unc / ks) ** 2 + (np.pi * fs * ks_unc / ks**2) ** 2)
+    Qs_unc = np.asarray(Qs_unc)
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    ax.scatter(fs, Q, color="red", s=15, zorder=3, label="Signals")
+    ax.scatter(fs, Qs, color="red", s=15, zorder=3, label="Signals")
 
     x_min, x_max = ax.get_xlim()
     y_min, y_max = ax.get_ylim()
-    for f, q, f_unc, q_unc in zip(fs, Q, fs_unc, Q_unc):
+    for f, q, f_unc, q_unc in zip(fs, Qs, fs_unc, Qs_unc):
         for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
             ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
             ax.add_patch(ellipse)
 
+    ax.set_yscale("log")
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Quality Factor (Q)")
     ax.set_title(title)
@@ -858,7 +868,7 @@ def plot_time_series(title, path, t, d, signals=None):
     ax.set_title(title)
 
     if signals is not None:
-        model = get_model(t, d, signals, domain="time")
+        model = get_model(t, d, signals)
 
         ax.plot(t, model, color="red", label="Model", alpha=0.6)
         ax.plot(t, d-model, color="blue", label="Residual", alpha=0.2)
@@ -869,9 +879,55 @@ def plot_time_series(title, path, t, d, signals=None):
 
     return
 
-def plot_covariance(title, path, t, d, signals):
+# TODO: Inspect covariance plotting
+def plot_covariance(title, path, signals, covariance):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    return
+    signals = np.asarray(signals)
+    if signals.ndim == 1:
+        signals = signals.reshape(1, 2)
+
+    covariance = np.asarray(covariance, dtype=float)
+    n_signals = signals.shape[0]
+    n_parameters = 2 * n_signals
+
+    order = np.concatenate((np.arange(0, n_parameters, 2), np.arange(1, n_parameters, 2)))
+    covariance = covariance[np.ix_(order, order)]
+
+    labels = [f"f{index + 1}" for index in range(n_signals)] + [f"Q{index + 1}" for index in range(n_signals)]
+    std = np.sqrt(np.diag(covariance))
+    denominator = np.outer(std, std)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correlation = np.divide(covariance, denominator, out=np.full(covariance.shape, np.nan, dtype=float), where=np.isfinite(denominator) & (denominator > 0))
+
+    finite_covariance = covariance[np.isfinite(covariance)]
+    cov_limit = np.max(np.abs(finite_covariance)) if finite_covariance.size else 0.0
+    if cov_limit == 0:
+        cov_limit = 1.0
+
+    cmap = plt.get_cmap("coolwarm").copy()
+    cmap.set_bad("lightgray")
+
+    fig, (ax_cov, ax_corr) = plt.subplots(1, 2, figsize=(12, 8))
+
+    cov_image = ax_cov.imshow(np.ma.masked_invalid(covariance), cmap=cmap, vmin=-cov_limit, vmax=cov_limit, interpolation="nearest")
+    ax_cov.set_title("Covariance")
+    fig.colorbar(cov_image, ax=ax_cov, label="Covariance")
+
+    corr_image = ax_corr.imshow(np.ma.masked_invalid(correlation), cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
+    ax_corr.set_title("Correlation")
+    fig.colorbar(corr_image, ax=ax_corr, label="Correlation")
+
+    for ax in (ax_cov, ax_corr):
+        ax.set_xticks(np.arange(n_parameters), labels=labels, rotation=45, ha="right")
+        ax.set_yticks(np.arange(n_parameters), labels=labels)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
 
 def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
     path = Path(path)
@@ -889,7 +945,8 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
     ax.set_title(title)
 
     if signals is not None:
-        fs, ks = unpack_signals(signals)
+        fs, Qs = unpack_signals(signals)
+        ks = jnp.pi * fs / Qs
         amplitudes, phases = get_phasor(t, d, signals)
 
         model_p = get_model_fourier(f, fs, ks, amplitudes, phases)
@@ -933,9 +990,9 @@ def unpack_signals(signals, sort=True):
         signals = signals[jnp.argsort(signals[:, 0])]
 
     fs = signals[:, 0]
-    ks = signals[:, 1]
+    Qs = signals[:, 1]
 
-    return fs, ks
+    return fs, Qs
 
 def get_fft(t, d, f_min, f_max):
     dt = np.mean(np.diff(t))
@@ -959,26 +1016,26 @@ def get_model_fourier(f, fs, ks, amplitudes, phases):
 
     return model_p
 
-def get_bounds(signals, f_min, f_max, k_min, k_max, f_fraction=1 / 8, log_k_fraction=1 / 8):
-    fs, ks = unpack_signals(signals)
+def get_bounds(signals, f_min, f_max, Q_min, Q_max, f_fraction=1 / 8, log_Q_fraction=1 / 8):
+    fs, Qs = unpack_signals(signals)
 
     frequency_halfwidth = (f_max - f_min) / (2 * f_fraction)
 
-    log_k_space_min = jnp.log(k_min)
-    log_k_space_max = jnp.log(k_max)
-    log_k_halfwidth = (log_k_space_max - log_k_space_min) / (2 * log_k_fraction)
+    log_Q_space_min = jnp.log(Q_min)
+    log_Q_space_max = jnp.log(Q_max)
+    log_Q_halfwidth = (log_Q_space_max - log_Q_space_min) / (2 * log_Q_fraction)
 
     frequency_min = jnp.maximum(fs - frequency_halfwidth, f_min)
     frequency_max = jnp.minimum(fs + frequency_halfwidth, f_max)
 
-    log_ks = jnp.log(ks)
-    log_k_min = jnp.maximum(log_ks - log_k_halfwidth, log_k_space_min)
-    log_k_max = jnp.minimum(log_ks + log_k_halfwidth, log_k_space_max)
+    log_Qs = jnp.log(Qs)
+    log_Q_min = jnp.maximum(log_Qs - log_Q_halfwidth, log_Q_space_min)
+    log_Q_max = jnp.minimum(log_Qs + log_Q_halfwidth, log_Q_space_max)
 
-    decay_rate_min = jnp.exp(log_k_min)
-    decay_rate_max = jnp.exp(log_k_max)
+    quality_factor_min = jnp.exp(log_Q_min)
+    quality_factor_max = jnp.exp(log_Q_max)
 
-    return jnp.stack((frequency_min, frequency_max, decay_rate_min, decay_rate_max), axis=-1)
+    return jnp.stack((frequency_min, frequency_max, quality_factor_min, quality_factor_max), axis=-1)
 
 def get_shift(x, y):
     a, b, c = np.polyfit(x, y, 2)
@@ -988,7 +1045,7 @@ def get_shift(x, y):
 
 # Run -------------------------------------------------------------------------------------
 
-def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, k_min, k_max, f_points, k_points, f_frac, log_k_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
+def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
     numpyro.set_host_device_count(devices)
 
     t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max)
@@ -1014,10 +1071,10 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
             residual = d - model
 
         grid_start = perf_counter()
-        signal = grid_search_orchestrator(signals, t, residual, f_min, f_max, k_min, k_max, f_points, k_points, cores)
+        signal = grid_search_orchestrator(path, signals, t, residual, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores)
         grid_elapsed = perf_counter() - grid_start
 
-        signal_bounds = get_bounds(signal, f_min, f_max, k_min, k_max, f_frac, log_k_frac)
+        signal_bounds = get_bounds(signal, f_min, f_max, Q_min, Q_max, f_frac, log_Q_frac)
 
         signal = jnp.asarray(signal).reshape(1, 2)
         signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
@@ -1033,26 +1090,30 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
         if diagnostics == "full":
             checkpoints[iteration] = (signals, bounds)
 
-            log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
             if len(signals) % signal_step == 0:
                 thumbprints.append((len(signals), glob_ll))
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-            save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+            save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+            plot_time_series("Time Series", path / "diagnostic" / f"time_series_{len(signals)}.png", t, d, signals)
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
-            plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
+            plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+            plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
         else:
             checkpoints[iteration] = (signals, bounds)
 
             if len(signals) % signal_step == 0:
-                log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
                 thumbprints.append((len(signals), glob_ll))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-                save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+                save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+                plot_time_series("Time Series", path / "diagnostic" / f"time_series_{len(signals)}.png", t, d, signals)
                 plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
-                plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
+                plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+                plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
@@ -1098,17 +1159,24 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
         for count, checkpoint in zip(candidates, candidate_refits):
             refined_checkpoints[count] = checkpoint
-            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, k_min, k_max)
-            glob_lls[count] = float(statistics[1])
+            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max)
+
+            log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
+            glob_lls[count] = float(glob_ll)
+
+            save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, k2)
 
     best_count = max(glob_lls, key=glob_lls.get)
     signals, bounds = refined_checkpoints[best_count]
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, ks, fs_unc, ks_unc, amplitudes, phases = get_statistics(t, d, B, signals, f_min, f_max, k_min, k_max)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
-    save_signal_diagnostics(path / "result", iteration, fs, ks, fs_unc, ks_unc, amplitudes, phases)
+    save_signal_diagnostics(path / "result", iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
-    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, ks, fs_unc, ks_unc)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+
     final_elapsed = perf_counter() - final_start
 
     print(f"Final stage completed in {final_elapsed:.2f} seconds")
@@ -1118,7 +1186,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
 
 if __name__ == "__main__":
-    name = "dracula_01-05mHz_1109_1"
+    name = "dracula_tohoku_ANMO_01-05mHz_1109_1"
     total_iterations = 6
     f_min_total = 0.00028
     f_max_total = 0.00500
@@ -1137,18 +1205,18 @@ if __name__ == "__main__":
             channel="LHZ", 
             location="00", 
             stream_index=0, 
-            start_time="2025-07-30T04:24:52", 
-            end_time="2025-08-10T17:24:52", 
+            start_time="2011-03-11T19:46:24", 
+            end_time="2011-03-25T19:46:24", 
 
             f_min=f_min, 
             f_max=f_max, 
-            k_min=4.4e-7, 
-            k_max=1.3e-4, 
+            Q_min=100,
+            Q_max=5000,
 
             f_points=2000, 
-            k_points=100, 
+            Q_points=100, 
             f_frac=100, 
-            log_k_frac=3, 
+            log_Q_frac=3, 
             depth=50, 
 
             warmup=200, 
