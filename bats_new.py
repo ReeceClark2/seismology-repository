@@ -74,11 +74,11 @@ def get_observed_data(network, station, channel, location, stream_index, start_t
     trace.detrend("spline", order=3, dspline=1728)
     trace.remove_response(inventory=inventory, output="ACC")
 
-    trace.decimate(5, no_filter=True)
-    trace.decimate(5, no_filter=True)
-    trace.decimate(3, no_filter=True)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(5, no_filter=False)
+    trace.decimate(2, no_filter=False)
 
-    trace.filter("bandpass", freqmin=f_min, freqmax=f_max, corners=2)
+    trace.filter("bandpass", freqmin=f_min, freqmax=f_max, corners=4, zerophase=True)
 
     delta = float(trace.stats.delta)
     sample_count = len(trace)
@@ -111,8 +111,6 @@ def get_log_prob(t, d, B, signals):
     # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
-    g = 0.5 * (g + g.T)
-    # g = g + 1e-8 * jnp.eye(g.shape[0], dtype=g.dtype)
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
@@ -168,7 +166,6 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
  
 def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
     f_init, Q_init = unpack_signals(signals, sort=False)
-    k_init = jnp.pi * f_init / Q_init
 
     bounds = jnp.asarray(bounds).reshape(-1, 4)
 
@@ -176,8 +173,6 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
     fs_max = bounds[:, 1].astype(f_init.dtype)
     Qs_min = bounds[:, 2].astype(Q_init.dtype)
     Qs_max = bounds[:, 3].astype(Q_init.dtype)
-    ks_min = jnp.pi * fs_min / Qs_min
-    ks_max = jnp.pi * fs_max / Qs_max
 
     log_Q_init = jnp.log(Q_init)
 
@@ -783,10 +778,10 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
             float(k2),
         ])
 
-def save_signal_diagnostics(path, iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases):
+def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases):
     diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
-    csv_path = diagnostic_path / f"signals_iteration_{iteration + 1}.csv"
+    csv_path = diagnostic_path / f"signals_iteration_{len(fs)}.csv"
 
     with csv_path.open("w", newline="") as file:
         writer = csv.writer(file)
@@ -929,7 +924,7 @@ def plot_covariance(title, path, signals, covariance):
     fig.savefig(path, dpi=300)
     plt.close(fig)
 
-def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
+def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init=None, band_edges=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -961,6 +956,14 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None):
         ax.set_ylim(ymin, ymax)
 
         ax.legend()
+
+    if edges_init is not None:
+        for edge in edges_init:
+            ax.axvline(edge, color="red", linestyle="--")
+
+    if band_edges is not None:
+        for edge in band_edges:
+            ax.axvline(edge, color="blue", linestyle="--")
 
     fig.tight_layout()
     fig.savefig(path, dpi=300)
@@ -1043,11 +1046,37 @@ def get_shift(x, y):
 
     return x_shift
 
+def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, subbands):
+    bandwidth = (f_max - f_min) / subbands
+    edges = np.empty(subbands + 1)
+    edges_init = np.empty(subbands + 1)
+    edges[0] = f_min
+    edges[-1] = f_max
+    edges_init[0] = f_min
+    edges_init[-1] = f_max
+
+    for i in range(subbands - 1):
+        f_edge_init = f_min + (i + 1) * bandwidth
+        half_width = bandwidth / 8
+
+        f_space, Q_space, log_prob_space = grid_search(t, d, f_edge_init - half_width, f_edge_init + half_width, Q_min, Q_max, f_points, Q_points)
+
+        shifted = log_prob_space - np.min(log_prob_space)
+        max_shifted = np.max(shifted)
+        normalized = shifted / max_shifted if max_shifted > 0 else np.zeros_like(shifted)
+
+        weight = 1 + ((f_space - f_edge_init) / half_width) ** 2
+        weighted = normalized + ((f_space - f_edge_init) / half_width) ** 2
+
+        best_f_idx = np.unravel_index(np.argmin(weighted), weighted.shape)[0]
+        edges[i + 1] = f_space[best_f_idx]
+        edges_init[i + 1] = f_edge_init
+
+    return edges_init, edges
+
 # Run -------------------------------------------------------------------------------------
 
-def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
-    numpyro.set_host_device_count(devices)
-
+def colony(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
     t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max)
     B = f_max - f_min
 
@@ -1096,7 +1125,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
                 thumbprints.append((len(signals), glob_ll))
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-            save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+            save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
             plot_time_series("Time Series", path / "diagnostic" / f"time_series_{len(signals)}.png", t, d, signals)
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
             plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
@@ -1109,7 +1138,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
                 thumbprints.append((len(signals), glob_ll))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-                save_signal_diagnostics(path / "diagnostic" / "tables", iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+                save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
                 plot_time_series("Time Series", path / "diagnostic" / f"time_series_{len(signals)}.png", t, d, signals)
                 plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
                 plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
@@ -1171,7 +1200,7 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
 
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
-    save_signal_diagnostics(path / "result", iteration, fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
     plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
@@ -1180,52 +1209,75 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     final_elapsed = perf_counter() - final_start
 
     print(f"Final stage completed in {final_elapsed:.2f} seconds")
+    print(f"Colony completed in {perf_counter() - start_time:.2f} seconds")
+
+    return signals
+
+def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
+    start_time = perf_counter()
+    t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max)
+    B = f_max - f_min
+
+    edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores, subbands)
+    plot_fourier_space("Fouier Space", path, t, d, f_min, f_max, edges_init=edges_init, band_edges=band_edges)
+
+    numpyro.set_host_device_count(devices)
+
+    signals = []
+    bounds = []
+
+    for ind, _ in enumerate(band_edges[:-1]):
+        colony_path = path / f"{round(1000 * band_edges[ind], 2)}r{round(1000 * band_edges[ind], 2)}mHz_{ind}r{subbands}"
+        subband_signals, subband_bounds = colony(network, station, channel, location, stream_index, start_time, end_time, band_edges[ind], band_edges[ind + 1], Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, colony_path)
+        signals.append(subband_signals)
+        bounds.append(subband_bounds)
+
+    signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+
+    save_iteration_diagnostics(path / "result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
     return
 
-
 if __name__ == "__main__":
-    name = "dracula_tohoku_ANMO_01-05mHz_1109_1"
-    total_iterations = 6
-    f_min_total = 0.00028
-    f_max_total = 0.00500
-    bandwidth = (f_max_total - f_min_total) / total_iterations
+    name = "dracula_tohoku_ANMO_01r05mHz_1110_1"
+    path = Path.cwd() / name
+    path.mkdir(parents=True, exist_ok=True)
 
-    for i in range(total_iterations):
-        print(f"Starting iteration {i}...")
-        iteration = i + 1
-        f_min = f_min_total + i * bandwidth
-        f_max = f_min_total + (i + 1) * bandwidth
-        path = Path.cwd() / name / f"dracula_{round(1e3 * f_min, 1)}r{round(1e3 * f_max, 1)}_{iteration}r{total_iterations}"
-        path.mkdir(parents=True, exist_ok=True)
+    run(network="IU", 
+        station="ANMO", 
+        channel="LHZ", 
+        location="00", 
+        stream_index=0, 
+        start_time="2011-03-11T19:46:24", 
+        end_time="2011-03-31T19:46:24", 
 
-        run(network="IU", 
-            station="ANMO", 
-            channel="LHZ", 
-            location="00", 
-            stream_index=0, 
-            start_time="2011-03-11T19:46:24", 
-            end_time="2011-03-25T19:46:24", 
+        f_min=0.00028, 
+        f_max=0.00500, 
+        Q_min=100,
+        Q_max=5000,
 
-            f_min=f_min, 
-            f_max=f_max, 
-            Q_min=100,
-            Q_max=5000,
+        f_points=2000, 
+        Q_points=100, 
+        f_frac=100, 
+        log_Q_frac=3, 
+        depth=30, 
 
-            f_points=2000, 
-            Q_points=100, 
-            f_frac=100, 
-            log_Q_frac=3, 
-            depth=50, 
+        warmup=200, 
+        sample=400, 
 
-            warmup=200, 
-            sample=400, 
+        devices=7, 
+        cores=56, 
+        diagnostics="partial", 
+        signal_step=10, 
+        subbands=10,
 
-            devices=7, 
-            cores=56, 
-            diagnostics="partial", 
-            signal_step=10, 
-
-            path=path
-        )
+        path=path
+    )
