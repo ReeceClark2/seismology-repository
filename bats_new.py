@@ -320,6 +320,35 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
 
     return optimized_checkpoints
 
+def _colony_worker(args):
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path = args
+    n_subbands = len(band_edges) - 1
+    f_min = float(band_edges[ind])
+    f_max = float(band_edges[ind + 1])
+    colony_path = path / f"{round(1000 * f_min, 2)}r{round(1000 * f_max, 2)}mHz_{ind + 1}r{n_subbands}"
+
+    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path)
+
+    return ind, np.asarray(signals), np.asarray(bounds)
+
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step):
+    n_subbands = len(band_edges) - 1
+    n_workers = min(devices, n_subbands)
+    devices_per_colony = devices // n_workers
+    cores_per_colony = cores // n_workers
+
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path) for ind in range(n_subbands)]
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        results = list(executor.map(_colony_worker, tasks))
+
+    results.sort(key=lambda result: result[0])
+    signals = jnp.concatenate([jnp.asarray(result[1]).reshape(-1, 2) for result in results], axis=0)
+    bounds = jnp.concatenate([jnp.asarray(result[2]).reshape(-1, 4) for result in results], axis=0)
+
+    return signals, bounds
+
 # Evaluation (critical) -------------------------------------------------------------------
 
 def get_mean_sq_proj(t, d, B, signals):
@@ -1137,7 +1166,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_f
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
             save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
-            plot_time_series("Time Series", path / "diagnostic" / f"time_series_{len(signals)}.png", t, d, signals)
+            plot_time_series("Time Series", path / "diagnostic" / "time_series" /f"time_series_{len(signals)}.png", t, d, signals)
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
             plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
             plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
@@ -1222,7 +1251,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_f
     print(f"Final stage completed in {final_elapsed:.2f} seconds")
     print(f"Colony completed in {perf_counter() - start_time:.2f} seconds")
 
-    return signals
+    return signals, bounds
 
 def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
     start_time = perf_counter()
@@ -1236,14 +1265,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals = []
-    bounds = []
-
-    for ind, _ in enumerate(band_edges[:-1]):
-        colony_path = path / f"{round(1000 * band_edges[ind], 2)}r{round(1000 * band_edges[ind + 1], 2)}mHz_{ind + 1}r{subbands}"
-        subband_signals, subband_bounds = colony(t_raw, d_raw, band_edges[ind], band_edges[ind + 1], Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, colony_path)
-        signals.append(subband_signals)
-        bounds.append(subband_bounds)
+    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step)
 
     signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
@@ -1253,7 +1275,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
-    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
@@ -1288,11 +1310,11 @@ if __name__ == "__main__":
         warmup=200, 
         sample=400, 
 
-        devices=7, 
-        cores=56, 
+        devices=12, 
+        cores=73, 
         diagnostics="partial", 
         signal_step=10, 
-        subbands=10,
+        subbands=12,
 
         path=path
     )
