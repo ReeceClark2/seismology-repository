@@ -321,23 +321,23 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
     return optimized_checkpoints
 
 def _colony_worker(args):
-    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path = args
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path = args
     n_subbands = len(band_edges) - 1
     f_min = float(band_edges[ind])
     f_max = float(band_edges[ind + 1])
     colony_path = path / f"{round(1000 * f_min, 2)}r{round(1000 * f_max, 2)}mHz_{ind + 1}r{n_subbands}"
 
-    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path)
+    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path)
 
     return ind, np.asarray(signals), np.asarray(bounds)
 
-def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step):
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step):
     n_subbands = len(band_edges) - 1
     n_workers = min(devices, n_subbands)
     devices_per_colony = devices // n_workers
     cores_per_colony = cores // n_workers
 
-    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path) for ind in range(n_subbands)]
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path) for ind in range(n_subbands)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -883,20 +883,29 @@ def plot_time_series(title, path, t, d, signals=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(12, 8))
-
-    ax.plot(t, d, color="black", label="Data")
-    ax.set_xlim(t[0], t[-1])
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Intensity")
-    ax.set_title(title)
-
     if signals is not None:
+        fig, (ax, ax_resid) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+
         model = get_model(t, d, signals)
 
-        ax.plot(t, model, color="red", label="Model", alpha=0.6)
-        ax.plot(t, d-model, color="blue", label="Residual", alpha=0.2)
+        ax.plot(t, d, color="black", label="Data")
+        ax.plot(t, model, color="red", label="Model", alpha=0.7)
+        ax.set_ylabel("Intensity")
+        ax.legend()
+
+        ax_resid.plot(t, d - model, color="blue", linewidth=0.9, label="Residual")
+        ax_resid.axhline(0, color="gray", linewidth=0.8)
+        ax_resid.set_ylabel("Residual")
+        ax_resid.set_xlabel("Time (s)")
+    else:
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        ax.plot(t, d, color="black", label="Data")
+        ax.set_ylabel("Intensity")
+        ax.set_xlabel("Time (s)")
+
+    ax.set_xlim(t[0], t[-1])
+    ax.set_title(title)
 
     fig.tight_layout()
     fig.savefig(path, dpi=300)
@@ -1049,21 +1058,18 @@ def get_model_fourier(f, fs, ks, amplitudes, phases):
 
     return model_p
 
-def get_bounds(signals, f_min, f_max, Q_min, Q_max, f_fraction=1 / 8, log_Q_fraction=1 / 8):
+def get_bounds(signals, f_min, f_max, Q_min, Q_max, f_margin=1 / 8, log_Q_margin=1 / 8):
     fs, Qs = unpack_signals(signals)
-
-    frequency_halfwidth = (f_max - f_min) / (2 * f_fraction)
 
     log_Q_space_min = jnp.log(Q_min)
     log_Q_space_max = jnp.log(Q_max)
-    log_Q_halfwidth = (log_Q_space_max - log_Q_space_min) / (2 * log_Q_fraction)
 
-    frequency_min = jnp.maximum(fs - frequency_halfwidth, f_min)
-    frequency_max = jnp.minimum(fs + frequency_halfwidth, f_max)
+    frequency_min = jnp.maximum(fs - f_margin, f_min)
+    frequency_max = jnp.minimum(fs + f_margin, f_max)
 
     log_Qs = jnp.log(Qs)
-    log_Q_min = jnp.maximum(log_Qs - log_Q_halfwidth, log_Q_space_min)
-    log_Q_max = jnp.minimum(log_Qs + log_Q_halfwidth, log_Q_space_max)
+    log_Q_min = jnp.maximum(log_Qs - log_Q_margin, log_Q_space_min)
+    log_Q_max = jnp.minimum(log_Qs + log_Q_margin, log_Q_space_max)
 
     quality_factor_min = jnp.exp(log_Q_min)
     quality_factor_max = jnp.exp(log_Q_max)
@@ -1087,7 +1093,7 @@ def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, s
 
     for i in range(subbands - 1):
         f_edge_init = f_min + (i + 1) * bandwidth
-        half_width = bandwidth / 8
+        half_width = bandwidth / 4
 
         f_space, Q_space, log_prob_space = grid_search(t, d, f_edge_init - half_width, f_edge_init + half_width, Q_min, Q_max, f_points, Q_points)
 
@@ -1111,12 +1117,13 @@ def load_data(type, event, network, station):
     return data[:, 0], data[:, 1]
 
 def filter_data(t, d, f_min, f_max, order=8):
-    sos = butter(order, [f_min, f_max], btype="bandpass", output="sos")
+    fs = 1 / np.mean(np.diff(t))
+    sos = butter(order, [f_min, f_max], btype="bandpass", fs=fs, output="sos")
     return t, sosfiltfilt(sos, d)
 
 # Run -------------------------------------------------------------------------------------
 
-def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
     t, d = filter_data(t, d, f_min, f_max)
     B = f_max - f_min
 
@@ -1143,7 +1150,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_f
         signal = grid_search_orchestrator(path, signals, t, residual, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores)
         grid_elapsed = perf_counter() - grid_start
 
-        signal_bounds = get_bounds(signal, f_min, f_max, Q_min, Q_max, f_frac, log_Q_frac)
+        signal_bounds = get_bounds(signal, f_min, f_max, Q_min, Q_max, f_margin, log_Q_margin)
 
         signal = jnp.asarray(signal).reshape(1, 2)
         signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
@@ -1179,7 +1186,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_f
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
                 save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
-                plot_time_series("Time Series", path / "diagnostic" / f"time_series_{len(signals)}.png", t, d, signals)
+                plot_time_series("Time Series", path / "diagnostic" / "time_series" / f"time_series_{len(signals)}.png", t, d, signals)
                 plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
                 plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
                 plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
@@ -1253,19 +1260,19 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_f
 
     return signals, bounds
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
     start_time = perf_counter()
     t_raw, d_raw = load_data(type, event, network, station)
     t, d = filter_data(t_raw, d_raw, f_min, f_max)
     B = f_max - f_min
 
-    edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, subbands)
+    edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, 100, 100, subbands)
     plot_fourier_space("Fourier Space", path / "fourier_space.png", t, d, f_min, f_max, edges_init=edges_init, band_edges=band_edges)
     plot_time_series("Time Series", path / "time_series.png", t, d)
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step)
+    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step)
 
     signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
@@ -1287,8 +1294,8 @@ if __name__ == "__main__":
     network = "IU"
     station = "ANMO"
 
-    name = f"dracula_{event}_{network}_{station}"
-    path = Path.cwd() / f"{type}" / name
+    name = f"dracula_{type}_{event}_{network}_{station}"
+    path = Path.cwd() / name
     path.mkdir(parents=True, exist_ok=True)
 
     run(type=type,
@@ -1303,15 +1310,15 @@ if __name__ == "__main__":
 
         f_points=2000, 
         Q_points=100, 
-        f_frac=100, 
-        log_Q_frac=3, 
+        f_margin=0.00005, 
+        log_Q_margin=1, 
         depth=30, 
 
         warmup=200, 
         sample=400, 
 
         devices=12, 
-        cores=73, 
+        cores=36, 
         diagnostics="partial", 
         signal_step=10, 
         subbands=12,
