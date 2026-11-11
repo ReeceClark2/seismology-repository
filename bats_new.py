@@ -15,6 +15,7 @@ os.environ["MPLBACKEND"] = "Agg"
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
+from scipy.signal import butter, sosfiltfilt
 import matplotlib
 from matplotlib.patches import Ellipse
 
@@ -1065,19 +1066,29 @@ def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, s
         max_shifted = np.max(shifted)
         normalized = shifted / max_shifted if max_shifted > 0 else np.zeros_like(shifted)
 
-        weight = 1 + ((f_space - f_edge_init) / half_width) ** 2
-        weighted = normalized + ((f_space - f_edge_init) / half_width) ** 2
+        penalty = ((f_space - f_edge_init) / half_width) ** 2
+        weighted = normalized + penalty[:, None]
 
-        best_f_idx = np.unravel_index(np.argmin(weighted), weighted.shape)[0]
+        frequency_scores = np.min(weighted, axis=1)
+        best_f_idx = np.argmin(frequency_scores)
         edges[i + 1] = f_space[best_f_idx]
         edges_init[i + 1] = f_edge_init
 
     return edges_init, edges
 
+def load_data(type, event, network, station):
+    path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
+    data = np.loadtxt(path)
+    return data[:, 0], data[:, 1]
+
+def filter_data(t, d, f_min, f_max, order=8):
+    sos = butter(order, [f_min, f_max], btype="bandpass", output="sos")
+    return t, sosfiltfilt(sos, d)
+
 # Run -------------------------------------------------------------------------------------
 
-def colony(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
-    t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max)
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
+    t, d = filter_data(t, d, f_min, f_max)
     B = f_max - f_min
 
     initial_plot(path, t, d, f_min, f_max)
@@ -1213,13 +1224,15 @@ def colony(network, station, channel, location, stream_index, start_time, end_ti
 
     return signals
 
-def run(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
     start_time = perf_counter()
-    t, d = get_observed_data(network, station, channel, location, stream_index, start_time, end_time, f_min, f_max)
+    t_raw, d_raw = load_data(type, event, network, station)
+    t, d = filter_data(t_raw, d_raw, f_min, f_max)
     B = f_max - f_min
 
-    edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores, subbands)
-    plot_fourier_space("Fouier Space", path, t, d, f_min, f_max, edges_init=edges_init, band_edges=band_edges)
+    edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, subbands)
+    plot_fourier_space("Fourier Space", path / "fourier_space.png", t, d, f_min, f_max, edges_init=edges_init, band_edges=band_edges)
+    plot_time_series("Time Series", path / "time_series.png", t, d)
 
     numpyro.set_host_device_count(devices)
 
@@ -1227,8 +1240,8 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     bounds = []
 
     for ind, _ in enumerate(band_edges[:-1]):
-        colony_path = path / f"{round(1000 * band_edges[ind], 2)}r{round(1000 * band_edges[ind], 2)}mHz_{ind}r{subbands}"
-        subband_signals, subband_bounds = colony(network, station, channel, location, stream_index, start_time, end_time, band_edges[ind], band_edges[ind + 1], Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, colony_path)
+        colony_path = path / f"{round(1000 * band_edges[ind], 2)}r{round(1000 * band_edges[ind + 1], 2)}mHz_{ind + 1}r{subbands}"
+        subband_signals, subband_bounds = colony(t_raw, d_raw, band_edges[ind], band_edges[ind + 1], Q_min, Q_max, f_points, Q_points, f_frac, log_Q_frac, depth, warmup, sample, devices, cores, diagnostics, signal_step, colony_path)
         signals.append(subband_signals)
         bounds.append(subband_bounds)
 
@@ -1247,17 +1260,19 @@ def run(network, station, channel, location, stream_index, start_time, end_time,
     return
 
 if __name__ == "__main__":
-    name = "dracula_tohoku_ANMO_01r05mHz_1110_1"
-    path = Path.cwd() / name
+    type = "observed"
+    event = "kamchatka"
+    network = "IU"
+    station = "ANMO"
+
+    name = f"dracula_{event}_{network}_{station}"
+    path = Path.cwd() / f"{type}" / name
     path.mkdir(parents=True, exist_ok=True)
 
-    run(network="IU", 
-        station="ANMO", 
-        channel="LHZ", 
-        location="00", 
-        stream_index=0, 
-        start_time="2011-03-11T19:46:24", 
-        end_time="2011-03-31T19:46:24", 
+    run(type=type,
+        event=event,
+        network=network, 
+        station=station,
 
         f_min=0.00028, 
         f_max=0.00500, 
