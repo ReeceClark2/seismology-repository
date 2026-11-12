@@ -333,27 +333,33 @@ def get_mean_sq_proj(t, d, B, signals):
 def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
     s = fs.shape[0]
-    N = int(2 * t[-1] * (f_max - f_min))
+    N_eff = 2.0 * (t[-1] - t[0]) * (f_max - f_min)
+    m = 2 * s
 
     if s == 0:
-        return -0.5 * N * jnp.log(jnp.sum(d ** 2) / N)
+        residual_sq = jnp.sum(d ** 2)
+        full_rank = True
+        in_bounds = True
+    else:
+        ks = jnp.pi * fs / Qs
+        arg = (2.0 * jnp.pi * fs)[:, None] * t[None, :]
+        decay = jnp.exp(-ks[:, None] * t[None, :])
+        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
 
-    ks = jnp.pi * fs / Qs
-    arg = (2.0 * jnp.pi * fs)[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
+        U, R = jnp.linalg.qr(G, mode="reduced")
+        residual = d - U @ (U.T @ d)
+        residual_sq = jnp.sum(residual ** 2)
 
-    U, R = jnp.linalg.qr(G, mode="reduced")
-    residual = d - U @ (U.T @ d)
-    residual_sq = jnp.sum(residual ** 2)
+        diagonal = jnp.abs(jnp.diag(R))
+        tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
+        full_rank = jnp.all(diagonal > tolerance)
+        in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
 
-    diagonal = jnp.abs(jnp.diag(R))
-    tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
-    full_rank = jnp.all(diagonal > tolerance)
-    in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
-    valid = full_rank & in_bounds & (N > 2 * s) & (residual_sq > 0)
+    noise_variance = residual_sq / (N_eff - m - 2.0)
+    log_likelihood = -0.5 * (N_eff * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
+    score = log_likelihood - 2.0 * s * jnp.log(N_eff)
 
-    score = -0.5 * N * jnp.log(residual_sq / N) - 2.0 * s * jnp.log(N)
+    valid = (N_eff > m + 2.0) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
     return jnp.where(valid, score, -jnp.inf)
 
 def get_condition_number(t, d, B, signals):
@@ -635,7 +641,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     glob_N = int(2 * t[-1] * (f_max - f_min))
 
     if n_signals == 0:
-        glob_ll = -0.5 * glob_N * jnp.log(jnp.sum(d ** 2) / glob_N)
+        glob_ll = -0.5 * N * jnp.log(jnp.sum(d ** 2) / N)
     else:
         G_glob = G.T
 
@@ -647,9 +653,9 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         tolerance = jnp.finfo(G_glob.dtype).eps * max(G_glob.shape) * jnp.max(diagonal)
         full_rank = jnp.all(diagonal > tolerance)
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
-        valid = full_rank & in_bounds & (glob_N > 2 * n_signals) & (residual_sq > 0)
+        valid = full_rank & in_bounds & (N > 2 * n_signals) & (residual_sq > 0)
 
-        score = -0.5 * glob_N * jnp.log(residual_sq / glob_N) - 2.0 * n_signals * jnp.log(glob_N)
+        score = -0.5 * N * jnp.log(residual_sq / N) - 2.0 * n_signals * jnp.log(N)
         glob_ll = jnp.where(valid, score, -jnp.inf)
 
     return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
@@ -1122,10 +1128,12 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     signals, bounds = refined_checkpoints[best_count]
 
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    model = get_model(t, d, signals)
 
     save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
     plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
     plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
 
@@ -1150,13 +1158,15 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step)
 
-    signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
+    # signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    model = get_model(t, d, signals)
 
     save_iteration_diagnostics(path / "result", signals, noise_variance, snr, log_prob, glob_ll, k2)
     save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
     plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
     plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
 
