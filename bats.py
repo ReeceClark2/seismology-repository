@@ -1,45 +1,313 @@
-# Internal Python libraries
+import csv
+import multiprocessing as mp
+import os
 import random
-from typing import Any
-import sys
+from time import perf_counter
+from datetime import datetime
+from datetime import timedelta
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
 
-# External libraries
+# Configure Matplotlib before importing pyplot.
+os.environ["MPLBACKEND"] = "Agg"
+
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
+from jax.scipy.linalg import cho_factor, cho_solve
+from scipy.signal import butter, sosfiltfilt
+import matplotlib
+from matplotlib.patches import Ellipse
+
+matplotlib.use("Agg", force=True)
+
+import matplotlib.pyplot as plt
 import numpy as np
 import numpyro
-import numpyro.distributions as dist
 from jax.flatten_util import ravel_pytree
 from numpyro.infer import MCMC, NUTS, init_to_value
-import rcrpy
-from scipy.optimize import Bounds
-from scipy.optimize import minimize as scipy_minimize
-
-# Repository files
-import utils
-
+from obspy.clients.fdsn import Client
+from obspy.core import UTCDateTime
 
 jax.config.update("jax_enable_x64", True)
 
 
-def get_log_prob(
-        t: jax.Array, 
-        d: jax.Array,
-        signal_space,
-        signals
-    ):
-    '''
-    Bretthorst Eq. 3.17
-    '''
+# Dataclasses ----------------------------------------------------------------------------
+
+@dataclass
+class GridSearchTask:
+    f_min: float
+    f_max: float
+    Q_min: float
+    Q_max: float
+    f_points: int
+    Q_points: int
+
+# Signal Update --------------------------------------------------------------------------
+
+def get_log_prob(t, d, B, signals):
+    fs, Qs = unpack_signals(signals)
+    n = t.shape[0]
+    s = fs.shape[0]
+    dt = t[1] - t[0]
+    z = -jnp.pi * fs / Qs + 2j * jnp.pi * fs
+
+    def geometric_sum(u):
+        q = u * dt
+        q = jnp.real(q) + 1j * (jnp.imag(q) - 2 * jnp.pi * jnp.round(jnp.imag(q) / (2 * jnp.pi)))
+        denominator = jnp.where(q == 0, 1, jnp.expm1(q))
+        series = jnp.where(q == 0, n, jnp.expm1(n * q) / denominator)
+        return jnp.exp(u * t[0]) * series
+
+    A = geometric_sum(z[:, None] + z[None, :])
+    C = geometric_sum(z[:, None] + jnp.conj(z[None, :]))
+
+    cc = 0.5 * jnp.real(A + C)
+    cs = 0.5 * jnp.imag(A - C)
+    ss = 0.5 * jnp.real(C - A)
+    g = jnp.block([[cc, cs], [cs.T, ss]])
+
+    v = jnp.exp(z[:, None] * t[None, :]) @ d
+    b = jnp.concatenate((jnp.real(v), jnp.imag(v)))
+    projected_sq = b @ cho_solve(cho_factor(g), b)
+
+    ratio = projected_sq / jnp.sum(d ** 2)
+    N = int(2 * t[-1] * B)
+    return 0.5 * (2 * s - N) * jnp.log1p(-ratio)
+
+def grid_search(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, batch_size=512):
+    f_space = jnp.linspace(f_min, f_max, f_points)
+    B = f_max - f_min
+
+    Q_margin = 1e-6 * (Q_max - Q_min)
+    Q_space = jnp.geomspace(Q_min + Q_margin, Q_max - Q_margin, Q_points)
+
+    f_grid, Q_grid = jnp.meshgrid(f_space, Q_space, indexing="ij")
+    signal_grid = jnp.stack([f_grid.ravel(), Q_grid.ravel()], axis=-1)
+
+    evaluate_batch = jax.jit(
+        jax.vmap(lambda signal: get_log_prob(t, d, B, signal))
+    )
+
+    results = []
     
-    fs, ks = utils.unpack_signals(signals)
+    for start in range(0, signal_grid.shape[0], batch_size):
+        batch = signal_grid[start:start + batch_size]
+        results.append(evaluate_batch(batch))
+
+    log_probs = jnp.concatenate(results)
+    log_prob_space = log_probs.reshape(f_space.size, Q_space.size)
+
+    probability_surface = (f_space, Q_space, log_prob_space)
+    
+    return probability_surface
+
+def objective(t, d, B, f_min, f_max, Q_min, Q_max):
+    fs = numpyro.sample("fs", numpyro.distributions.Uniform(f_min, f_max).to_event(1))
+    log_Qs = numpyro.sample("log_Qs", numpyro.distributions.Uniform(jnp.log(Q_min), jnp.log(Q_max)).to_event(1))
+
+    Qs = numpyro.deterministic("Qs", jnp.exp(log_Qs))
+    signals = jnp.stack((fs, Qs), axis=-1)
+
+    numpyro.factor("surface", get_log_prob(t, d, B, signals))
+ 
+def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
+    f_init, Q_init = unpack_signals(signals, sort=False)
+
+    bounds = jnp.asarray(bounds).reshape(-1, 4)
+
+    fs_min = bounds[:, 0].astype(f_init.dtype)
+    fs_max = bounds[:, 1].astype(f_init.dtype)
+    Qs_min = bounds[:, 2].astype(Q_init.dtype)
+    Qs_max = bounds[:, 3].astype(Q_init.dtype)
+
+    log_Q_init = jnp.log(Q_init)
+
+    init_strategy = init_to_value(values={"fs": f_init, "log_Qs": log_Q_init})
+
+    if rng_key_value is None:
+        rng_key_value = random.randint(1, 10_000)
+
+    rng_key = jax.random.PRNGKey(int(rng_key_value))
+    warmup_key, sample_key = jax.random.split(rng_key)
+
+    kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=5)
+    mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
+    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy",))
+
+    warmup_samples = mcmc.get_samples(group_by_chain=True)
+    warmup_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+
+    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy",))
+
+    sample_samples = mcmc.get_samples(group_by_chain=True)
+    sample_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+
+    samples = {name: jnp.concatenate([warmup_samples[name], sample_samples[name]], axis=1) for name in sample_samples}
+    extra_fields = {name: jnp.concatenate([warmup_extra_fields[name], sample_extra_fields[name]], axis=1) for name in sample_extra_fields}
+
+    potential_energy = extra_fields["potential_energy"]
+
+    best_flat_index = jnp.argmin(potential_energy.ravel())
+    chain_index, draw_index = jnp.unravel_index(best_flat_index, potential_energy.shape)
+
+    best_fs = samples["fs"][chain_index, draw_index]
+    best_Qs = jnp.exp(samples["log_Qs"][chain_index, draw_index])
+
+    signals = jnp.stack((best_fs, best_Qs), axis=-1)
+    return signals
+
+# Orchestrators ---------------------------------------------------------------------------
+
+def _run_grid_search(args):
+    t, d, task = args
+
+    return grid_search(
+        t=t,
+        d=d,
+        f_min=task.f_min,
+        f_max=task.f_max,
+        Q_min=task.Q_min,
+        Q_max=task.Q_max,
+        f_points=task.f_points,
+        Q_points=task.Q_points,
+    )
+
+def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores):
+    f_margin = 1e-6 * (f_max - f_min)
+    full_f_space = np.linspace(f_min + f_margin, f_max - f_margin, f_points)
+
+    boundaries = np.linspace(
+        0, f_points, cores + 1, dtype=int
+    )
+
+    tasks = []
+
+    for i in range(cores):
+        start = boundaries[i]
+        stop = boundaries[i + 1]
+
+        tasks.append(
+            GridSearchTask(
+                f_min=float(full_f_space[start]),
+                f_max=float(full_f_space[stop - 1]),
+                Q_min=Q_min,
+                Q_max=Q_max,
+                f_points=stop - start,
+                Q_points=Q_points,  # Do not divide this
+            )
+        )
+
+    args = [(t, d, task) for task in tasks]
+
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=cores, mp_context=ctx) as executor:
+        surfaces = list(executor.map(_run_grid_search, args))
+
+    log_prob_space = jnp.concatenate(
+        [surface[2] for surface in surfaces],
+        axis=0,
+    )
+    f_space = jnp.concatenate(
+        [surface[0] for surface in surfaces],
+        axis=0,
+    )
+    Q_space = surfaces[0][1]
+
+    probability_surface = (
+        f_space,
+        Q_space,
+        log_prob_space,
+    )
+
+    plot_probability_surface(f"Probability Surface {len(signals)}", path / "diagnostic" / "probability_surface" / f"probability_surface_{len(signals)}.png", probability_surface)
+
+    f_space, Q_space, log_prob_space = probability_surface
+    best_index = jnp.unravel_index(jnp.argmax(log_prob_space), log_prob_space.shape)
+
+    f_index, Q_index = best_index
+    f_space[f_index]
+    signal = (f_space[f_index], Q_space[Q_index])
+
+    return signal
+
+def _nuts_worker(args):
+    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed = args
+    signals, bounds = checkpoint
+
+    optimized_signals = nuts(
+        t=t,
+        d=d,
+        B=B,
+        signals=signals,
+        bounds=bounds,
+        warmup=warmup,
+        sample=sample,
+        chains=cores_per_worker,
+        rng_key_value=seed,
+    )
+
+    return optimized_signals, bounds
+
+def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
+    if not checkpoints:
+        return []
+
+    n_checkpoints = len(checkpoints)
+    n_workers = min(devices, n_checkpoints)
+    devices_per_worker = max(1, devices // n_checkpoints)
+
+    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index) for index, checkpoint in enumerate(checkpoints)]
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        optimized_checkpoints = list(executor.map(_nuts_worker, tasks))
+
+    return optimized_checkpoints
+
+def _colony_worker(args):
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path = args
+    n_subbands = len(band_edges) - 1
+    f_min = float(band_edges[ind])
+    f_max = float(band_edges[ind + 1])
+    colony_path = path / f"{round(1000 * f_min, 2)}r{round(1000 * f_max, 2)}mHz_{ind + 1}r{n_subbands}"
+
+    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path)
+
+    return ind, np.asarray(signals), np.asarray(bounds)
+
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step):
+    n_subbands = len(band_edges) - 1
+    n_workers = min(devices, n_subbands)
+    devices_per_colony = devices // n_workers
+    cores_per_colony = cores // n_workers
+
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path) for ind in range(n_subbands)]
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        results = list(executor.map(_colony_worker, tasks))
+
+    results.sort(key=lambda result: result[0])
+    signals = jnp.concatenate([jnp.asarray(result[1]).reshape(-1, 2) for result in results], axis=0)
+    bounds = jnp.concatenate([jnp.asarray(result[2]).reshape(-1, 4) for result in results], axis=0)
+
+    return signals, bounds
+
+# Evaluation (critical) -------------------------------------------------------------------
+
+def get_mean_sq_proj(t, d, B, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -47,6 +315,7 @@ def get_log_prob(
     # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
+    g = 0.5 * (g + g.T)
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
@@ -57,232 +326,63 @@ def get_log_prob(
     # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
+    mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
 
-    ratio = sum_sq_proj / sum_sq_data
+    return mean_sq_proj
 
-    return 0.5 * (m - N) * jnp.log1p(-ratio)
-
-def get_gram(
-        t: jax.Array, 
-        d: jax.Array,
-        signals
-    ):
-    '''
-    Bretthorst Eq. 3.4
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
-
-    omegas = 2.0 * jnp.pi * fs
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
-    G = jnp.vstack((
-        jnp.cos(arg) * decay,
-        jnp.sin(arg) * decay,
-    ))
-
-    g = G @ G.T
-    g = 0.5 * (g + g.T)
-
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    return g, eigenvalues, eigenvectors
-
-@jax.jit
-def get_model(
-        t: jax.Array, 
-        d: jax.Array,
-        signals
-    ):
-    '''
-    Bretthorst Eq. 3.5 and Eq. 3.13
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
-
-    omegas = 2.0 * jnp.pi * fs
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
-    G = jnp.vstack((
-        jnp.cos(arg) * decay,
-        jnp.sin(arg) * decay,
-    ))
-
-    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
-
-    return G.T @ coefficients
-
-def get_noise_variance(
-        t: jax.Array, 
-        d: jax.Array, 
-        signal_space,
-        signals
-    ):
-    '''
-    Bretthorst Eq. 4.7
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
+def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1, ratio_gamma=1e5, ratio_sigma=1e2):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    B = f_max - f_min
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
 
     # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
-
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
-    h = H @ d
-
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
-
-    return (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
-
-def get_snr(
-        t: jax.Array, 
-        d: jax.Array, 
-        signal_space,
-        signals
-    ):
-    '''
-    Bretthorst Eq. 4.8
-    '''
-    
-    fs, ks = utils.unpack_signals(signals)
-
-    omegas = fs * 2.0 * jnp.pi
-    
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
-
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
-
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
-    h = H @ d
-
-    sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
-
-    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
-
-    return ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
-
-def get_mean_sq_proj(
-        t: jax.Array, 
-        d: jax.Array, 
-        signal_space,
-        signals
-    ) -> jax.Array:
-    '''
-    Bretthorst Eq. 3.15
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
-
-    omegas = fs * 2.0 * jnp.pi
-    
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
-
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
-
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
-    h = H @ d
-
-    return jnp.mean(h ** 2)
-
-def get_glob_ll(
-        t: jax.Array, 
-        d: jax.Array, 
-        signals,
-        signal_space,
-        ratio_delta=1e2,
-        ratio_gamma=1e2,
-        ratio_sigma=1e2
-    ) -> jax.Array:
-    '''
-    Bretthorst Eq. 5.9
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
-    omegas = fs * 2.0 * jnp.pi
-    
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
-
-    if N <= m + r:
-        return -jnp.inf
-
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
+    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
+    # Bretthorst Eq. 3.5: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
-    omega_scale = 2 * jnp.pi * (signal_space.f_max - signal_space.f_min) / 2
-    k_scale = (signal_space.k_max - signal_space.k_min) / 2
+    # TODO: think about the scaling closely.
+    omega_center = jnp.pi * (f_max + f_min)
+    omega_halfwidth = jnp.pi * (f_max - f_min)
 
+    log_Q_min = jnp.log(Q_min)
+    log_Q_max = jnp.log(Q_max)
+    log_Q_center = 0.5 * (log_Q_max + log_Q_min)
+    log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
+
+    x_omega = (omegas - omega_center) / omega_halfwidth
+    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
+    
     mean_sq_data = (1 / N) * jnp.sum(d ** 2)
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / r) * jnp.sum((omegas / omega_scale) ** 2 + (ks / k_scale) ** 2)
+    mean_sq_param = (1 / r) * jnp.sum(x_omega ** 2 + x_log_Q ** 2)
 
-    # TODO: Fix the variance integration bounds.
     log_R_delta = jnp.log(ratio_delta)
     log_R_gamma = jnp.log(ratio_gamma)
     log_R_sigma = jnp.log(ratio_sigma)
 
     theta, unravel = ravel_pytree(signals)
-
+    
     def objective(theta):
-        return get_mean_sq_proj(t, d, signal_space, unravel(theta))
+        return get_mean_sq_proj(t, d, B, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
@@ -311,23 +411,132 @@ def get_glob_ll(
         )
     )
 
-    jax.debug.print("Terms: {} {} {} {}", delta_term, sigma_term, gamma_term, log_jacobian_factor)
-    jax.debug.print("Stats: {} {} {} {}", N, jsp.gammaln((N - m - r) / 2), ((m + r - N) / 2), np.log(((N * mean_sq_data) - (m * mean_sq_proj)) / 2))
-    sys.stdout.flush()
-    sys.stderr.flush()
-    return delta_term + gamma_term + sigma_term + log_jacobian_factor
+    glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
+    return glob_ll
 
-def get_phasor_parameters(
-        t: jax.Array, 
-        d: jax.Array, 
-        signals
-    ):
-    '''
-    Definition of model functions
-    '''
+def get_condition_number(t, d, B, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
-    fs, ks = utils.unpack_signals(signals)
+    omegas = fs * 2.0 * jnp.pi
+    
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    N = int(2 * t[-1] * B)
 
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+    g = 0.5 * (g + g.T)
+
+    norms = jnp.sqrt(jnp.diag(g))
+    g = g / jnp.outer(norms, norms)
+
+    eigenvalues = jnp.linalg.eigvalsh(g)
+
+    max_eigenvalue = jnp.max(eigenvalues)
+    min_eigenvalue = jnp.maximum(jnp.min(eigenvalues), jnp.finfo(eigenvalues.dtype).eps * max_eigenvalue)
+
+    # Gram eigenvalues are squared singular values.
+    k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
+    return k2
+
+def get_model(t, d, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
+
+    omegas = 2.0 * jnp.pi * fs
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    G = jnp.vstack((
+        jnp.cos(arg) * decay,
+        jnp.sin(arg) * decay,
+    ))
+
+    coefficients = jnp.linalg.lstsq(G.T, d, rcond=None)[0]
+
+    model =  G.T @ coefficients
+    return model
+
+# Evaluation (minor) ----------------------------------------------------------------------
+
+def get_noise_variance(t, d, B, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
+
+    omegas = fs * 2.0 * jnp.pi
+    
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    N = int(2 * t[-1] * B)
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+
+    # Bretthorst Eq. 3.6: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    return noise_variance
+
+def get_snr(t, d, B, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
+
+    omegas = fs * 2.0 * jnp.pi
+    
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    N = int(2 * t[-1] * B)
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    # Build the non-orthogonal model matrix G and its Gram matrix
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+
+    # Eigendecomposition for orthogonalization
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+
+    # Bretthorst Eq. 3.6: orthonormal functions H
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    
+    # Bretthorst Eq. 3.13: projection amplitudes h
+    h = H @ d
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+
+    snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
+    return snr
+
+def get_phasor(t, d, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
+    
     omegas = 2.0 * jnp.pi * fs
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -355,57 +564,18 @@ def get_phasor_parameters(
 
     amplitudes = jnp.sqrt(cosine_coefficients**2 + sine_coefficients**2)
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
-
     return amplitudes, phases
 
-
-def get_cov_mat(t, d, signal_space, signals):
-    '''
-    Return covariance matrix for parameters.
-    '''
-    fs, ks = utils.unpack_signals(signals)
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
-
-    theta, unravel = ravel_pytree(signals)
-    
-    def objective(theta):
-        return get_mean_sq_proj(t, d, unravel(theta))
-
-    b = (-m / 2) * jax.hessian(objective)(theta)
-    b = 0.5 * (b + b.T)
-
-    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
-
-    information_inverse = (
-        eigenvectors
-        @ jnp.diag(1.0 / eigenvalues)
-        @ eigenvectors.T
-    )
-
-    # Use the same projection calculations as get_noise_variance.
-    noise_variance = get_noise_variance(t, d, signals)
-
-    return noise_variance * information_inverse
-
-def get_uncertainties(
-        t: jax.Array, 
-        d: jax.Array, 
-        signal_space,
-        signals
-    ) -> jax.Array:
-    '''
-    Bretthorst Eq. 4.13
-    '''
-
-    fs, ks = utils.unpack_signals(signals)
+def get_uncertainties(t, d, B, signals):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
 
     omegas = fs * 2.0 * jnp.pi
     
-    r = len(signals) * 2
-    m = len(signals) * 2
-    N = d.shape[0] * (2 * (signal_space.f_max - signal_space.f_min) * (t[1] - t[0]))
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    N = int(2 * t[-1] * B)
 
     arg = omegas[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
@@ -413,617 +583,695 @@ def get_uncertainties(
     # Build the non-orthogonal model matrix G and its Gram matrix
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
+    g = 0.5 * (g + g.T)
 
     # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
 
-    # Bretthorst Eq. 3.6: orthonormal functions H
+    # Bretthorst Eq. 3.5: orthonormal functions H
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     
     # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
-    theta, unravel = ravel_pytree(signals)
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
 
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+
+    theta, unravel = ravel_pytree(signals)
+    
     def objective(theta):
-        return get_mean_sq_proj(t, d, signal_space, unravel(theta))
+        return get_mean_sq_proj(t, d, B, unravel(theta))
 
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(b)
 
-    sum_sq_data = jnp.sum(d**2)
-    sum_sq_proj = jnp.sum(h**2)
+    variances = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1))
+    fs_unc = variances[::2]
+    Qs_unc = variances[1::2]
 
-    noise_variance = (
-        sum_sq_data - sum_sq_proj
-    ) / (N - m - 2)
+    return fs_unc, Qs_unc
 
-    variance_per_parameter = noise_variance * jnp.sum(
-        eigenvectors**2 / eigenvalues[None, :],
-        axis=1,
+# Evaluation (all) ------------------------------------------------------------------------
+
+def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1, ratio_gamma=1e5, ratio_sigma=1e2):
+    fs, Qs = unpack_signals(signals)
+    ks = jnp.pi * fs / Qs
+
+    omegas = fs * 2.0 * jnp.pi
+
+    n_signals = fs.shape[0]
+    r = n_signals * 2
+    m = n_signals * 2
+    N = int(2 * t[-1] * B)
+
+    arg = omegas[:, None] * t[None, :]
+    decay = jnp.exp(-ks[:, None] * t[None, :])
+
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+    g = G @ G.T
+    g = 0.5 * (g + g.T)
+
+    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+
+    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
+    h = H @ d
+
+    sum_sq_data = jnp.sum(d ** 2)
+    sum_sq_proj = jnp.sum(h ** 2)
+
+    mean_sq_data = (1 / N) * sum_sq_data
+    mean_sq_proj = (1 / m) * sum_sq_proj
+
+    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+
+    snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
+
+    g_norms = jnp.sqrt(jnp.diag(g))
+    g_normalized = g / jnp.outer(g_norms, g_norms)
+    g_eigenvalues = jnp.linalg.eigvalsh(g_normalized)
+
+    max_eigenvalue = jnp.max(g_eigenvalues)
+    min_eigenvalue = jnp.maximum(jnp.min(g_eigenvalues), jnp.finfo(g_eigenvalues.dtype).eps * max_eigenvalue)
+    k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
+
+    ratio = sum_sq_proj / sum_sq_data
+    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
+
+    omega_center = jnp.pi * (f_max + f_min)
+    omega_halfwidth = jnp.pi * (f_max - f_min)
+
+    log_Q_min = jnp.log(Q_min)
+    log_Q_max = jnp.log(Q_max)
+    log_Q_center = 0.5 * (log_Q_max + log_Q_min)
+    log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
+
+    x_omega = (omegas - omega_center) / omega_halfwidth
+    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
+    
+    mean_sq_data = (1 / N) * jnp.sum(d ** 2)
+    mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
+    mean_sq_param = (1 / r) * jnp.sum(x_omega ** 2 + x_log_Q ** 2)
+
+    log_R_delta = jnp.log(ratio_delta)
+    log_R_gamma = jnp.log(ratio_gamma)
+    log_R_sigma = jnp.log(ratio_sigma)
+
+    theta, unravel = ravel_pytree(signals)
+
+    def objective(theta):
+        return get_mean_sq_proj(t, d, B, unravel(theta))
+
+    b = (-m / 2) * jax.hessian(objective)(theta)
+    b = 0.5 * (b + b.T)
+
+    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
+    covariance = noise_variance * ((b_eigenvectors / b_eigenvalues[None, :]) @ b_eigenvectors.T)
+
+    unc = jnp.sqrt(noise_variance * jnp.sum(b_eigenvectors ** 2 / b_eigenvalues[None, :], axis=1))
+    fs_unc = unc[::2]
+    Qs_unc = unc[1::2]
+
+    amplitudes = jnp.sqrt(
+        (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[:len(signals)] ** 2
+        + (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[len(signals):] ** 2
     )
 
-    signals_uncertainties_flat = jnp.sqrt(
-        jnp.maximum(variance_per_parameter, 0.0)
+    beta = eigenvectors @ (h / jnp.sqrt(eigenvalues))
+    cosine_coefficients = beta[:len(signals)]
+    sine_coefficients = beta[len(signals):]
+    amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
+    phases = jnp.atan2(cosine_coefficients, sine_coefficients)
+
+    delta_term = (
+        jsp.gammaln(m / 2)
+        - jnp.log(2)
+        - jnp.log(log_R_delta)
+        + (-m / 2) * jnp.log(m * mean_sq_proj / 2.0)
     )
 
-    signals_uncertainties = unravel(signals_uncertainties_flat)
+    gamma_term = (
+        jsp.gammaln(r / 2)
+        - jnp.log(2)
+        - jnp.log(log_R_gamma)
+        + (-r / 2) * jnp.log((r * mean_sq_param) / 2)
+    )
 
-    return signals_uncertainties
+    sigma_term = (
+        jsp.gammaln((N - m - r) / 2)
+        - jnp.log(2)
+        - jnp.log(log_R_sigma)
+        + ((m + r - N) / 2) * jnp.log(
+            ((N * mean_sq_data) - (m * mean_sq_proj)) / 2
+        )
+    )
 
-def reconcile(
-        t,
-        d,
-        signal_space,
-        signals,
-        signals_bounds,
-        k2_threshold=10,
-        nuts_args=None,
-    ):
-    '''
-    Procedure for removing degenerate signals.
-    1) Identify smallest eigenvalue (most dependent / smallest amplitude signal).
-    2) Evaluate signals for largest contribution to dependent direction.
-    3) Remove most impactful signal to probability.
-    '''
+    log_jacobian_factor = -0.5 * jnp.sum(jnp.log(jnp.abs(b_eigenvalues)))
+    glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
 
+    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
+
+# Plotting --------------------------------------------------------------------------------
+
+def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
+    diagnostic_path = Path(path)
+    diagnostic_path.mkdir(parents=True, exist_ok=True)
+    csv_path = diagnostic_path / "iteration_diagnostics.csv"
+    write_header = not csv_path.exists()
+
+    with csv_path.open("a", newline="") as file:
+        writer = csv.writer(file)
+        if write_header:
+            writer.writerow(["Signals", "Noise Variance", "SNR", "Probability", "Global Likelihood", "2-norm"])
+        writer.writerow([
+            len(signals),
+            float(noise_variance),
+            float(snr),
+            float(log_prob),
+            float(glob_ll),
+            float(k2),
+        ])
+
+def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases):
+    diagnostic_path = Path(path)
+    diagnostic_path.mkdir(parents=True, exist_ok=True)
+    csv_path = diagnostic_path / f"signals_iteration_{len(fs)}.csv"
+
+    with csv_path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Frequency", "Frequency Uncertainty", "Quality Factor", "Quality Factor Uncertainty", "Amplitude", "Phase"])
+        writer.writerows(zip(fs, fs_unc, Qs, Qs_unc, amplitudes, phases))
+
+def plot_probability_surface(title, path, probability_surface):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    f_space, Q_space, log_prob_space = probability_surface
+    log_prob_space = log_prob_space.T
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    heatmap = ax.pcolormesh(f_space, Q_space, log_prob_space, shading="auto", cmap="Grays")
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Quality Factor (Q)")
+    ax.set_title(title)
+
+    colorbar = fig.colorbar(heatmap, ax=ax)
+    colorbar.set_label("Log Probability")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+    return
+
+def plot_signal_space(title, path, fs, Qs, fs_unc, Qs_unc):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fs = np.asarray(fs)
+    Qs = np.asarray(Qs)
+    fs_unc = np.asarray(fs_unc)
+    Qs_unc = np.asarray(Qs_unc)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    ax.scatter(fs, Qs, color="red", s=15, zorder=3, label="Signals")
+
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    for f, q, f_unc, q_unc in zip(fs, Qs, fs_unc, Qs_unc):
+        for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
+            ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
+            ax.add_patch(ellipse)
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Quality Factor (Q)")
+    ax.set_title(title)
+
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+    return
+
+def plot_time_series(title, path, t, d, signals=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if signals is not None:
+        fig, (ax, ax_resid) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+
+        model = get_model(t, d, signals)
+
+        ax.plot(t, d, color="black", label="Data")
+        ax.plot(t, model, color="red", label="Model", alpha=0.7)
+        ax.set_ylabel("Intensity")
+        ax.legend()
+
+        ax_resid.plot(t, d - model, color="blue", linewidth=0.9, label="Residual")
+        ax_resid.axhline(0, color="gray", linewidth=0.8)
+        ax_resid.set_ylabel("Residual")
+        ax_resid.set_xlabel("Time (s)")
+    else:
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        ax.plot(t, d, color="black", label="Data")
+        ax.set_ylabel("Intensity")
+        ax.set_xlabel("Time (s)")
+
+    ax.set_xlim(t[0], t[-1])
+    ax.set_title(title)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+    return
+
+# TODO: Inspect covariance plotting
+def plot_covariance(title, path, signals, covariance):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    signals = np.asarray(signals)
+    if signals.ndim == 1:
+        signals = signals.reshape(1, 2)
+
+    covariance = np.asarray(covariance, dtype=float)
+    n_signals = signals.shape[0]
+    n_parameters = 2 * n_signals
+
+    order = np.concatenate((np.arange(0, n_parameters, 2), np.arange(1, n_parameters, 2)))
+    covariance = covariance[np.ix_(order, order)]
+
+    labels = [f"f{index + 1}" for index in range(n_signals)] + [f"Q{index + 1}" for index in range(n_signals)]
+    std = np.sqrt(np.diag(covariance))
+    denominator = np.outer(std, std)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correlation = np.divide(covariance, denominator, out=np.full(covariance.shape, np.nan, dtype=float), where=np.isfinite(denominator) & (denominator > 0))
+
+    finite_covariance = covariance[np.isfinite(covariance)]
+    cov_limit = np.max(np.abs(finite_covariance)) if finite_covariance.size else 0.0
+    if cov_limit == 0:
+        cov_limit = 1.0
+
+    cmap = plt.get_cmap("coolwarm").copy()
+    cmap.set_bad("lightgray")
+
+    fig, (ax_cov, ax_corr) = plt.subplots(1, 2, figsize=(12, 8))
+
+    cov_image = ax_cov.imshow(np.ma.masked_invalid(covariance), cmap=cmap, vmin=-cov_limit, vmax=cov_limit, interpolation="nearest")
+    ax_cov.set_title("Covariance")
+    fig.colorbar(cov_image, ax=ax_cov, label="Covariance")
+
+    corr_image = ax_corr.imshow(np.ma.masked_invalid(correlation), cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
+    ax_corr.set_title("Correlation")
+    fig.colorbar(corr_image, ax=ax_corr, label="Correlation")
+
+    for ax in (ax_cov, ax_corr):
+        ax.set_xticks(np.arange(n_parameters), labels=labels, rotation=45, ha="right")
+        ax.set_yticks(np.arange(n_parameters), labels=labels)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init=None, band_edges=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    f, p = get_fft(t, d, f_min, f_max)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    ax.plot(f, abs(p), color="black", label="Data", linewidth=0.9)
+    ax.set_xlim(f[0], f[-1])
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title(title)
+
+    if signals is not None:
+        fs, Qs = unpack_signals(signals)
+        ks = jnp.pi * fs / Qs
+        amplitudes, phases = get_phasor(t, d, signals)
+
+        model_p = get_model_fourier(f, fs, ks, amplitudes, phases)
+        ax.plot(f, abs(model_p), color="red", alpha=0.8, label="Model", linewidth=0.9)
+        ax.plot(f, abs(p) - abs(model_p), color="blue", alpha=0.6, label="Residual", linewidth=0.9)
+
+        ymin, ymax = ax.get_ylim()
+        ymin_val = -jnp.abs(jnp.min(jnp.abs(p) - jnp.abs(model_p))) * 100
+        ymax_val = jnp.abs(jnp.max(jnp.abs(p) - jnp.abs(model_p))) * 100
+
+        ax.vlines(fs, ymin_val, ymax_val, color="red", linestyle="--", alpha=0.15, linewidth=0.4)
+        ax.set_ylim(ymin, ymax)
+
+        ax.legend()
+
+    if edges_init is not None:
+        for edge in edges_init:
+            ax.axvline(edge, color="red", linestyle="--")
+
+    if band_edges is not None:
+        for edge in band_edges:
+            ax.axvline(edge, color="blue", linestyle="--")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+    return
+
+def initial_plot(path, t, d, f_min, f_max):
+    plot_time_series("Time Series", path / "time_series.png", t, d)
+    plot_fourier_space("Fourier Space", path / "fourier_space.png", t, d, f_min, f_max)
+    
+    return
+
+# Utilities -------------------------------------------------------------------------------
+
+def unpack_signals(signals, sort=True):
     signals = jnp.asarray(signals)
-    signals_bounds = jnp.asarray(signals_bounds)
 
-    while len(signals) > 1:
-        gram, _, _ = get_gram(t, d, signals)
+    if signals.ndim == 1:
+        if signals.shape[0] != 2:
+            raise ValueError(
+                f"A single signal must have shape (2,), got {signals.shape}"
+            )
+        signals = signals[None, :]
 
-        norms = jnp.sqrt(jnp.diag(gram))
-        normalized_gram = gram / jnp.outer(norms, norms)
+    if sort is True:
+        signals = signals[jnp.argsort(signals[:, 0])]
 
-        eigenvalues, eigenvectors = jnp.linalg.eigh(normalized_gram)
+    fs = signals[:, 0]
+    Qs = signals[:, 1]
 
-        max_eigenvalue = jnp.max(eigenvalues)
-        min_eigenvalue = jnp.maximum(jnp.min(eigenvalues), jnp.finfo(eigenvalues.dtype).eps * max_eigenvalue)
+    return fs, Qs
 
-        # Gram eigenvalues are squared singular values.
-        k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
+def get_fft(t, d, f_min, f_max):
+    dt = np.mean(np.diff(t))
+    f = np.fft.rfftfreq(len(d), dt)
+    p = dt * np.abs(np.fft.rfft(d))
+    mask = (f >= f_min) & (f <= f_max)
 
-        if k2 <= k2_threshold:
+    return f[mask], p[mask]
+
+def get_decay_sine_fourier(f, frequency, decay_rate, amplitude, phase):
+    positive_term = jnp.exp(1j * phase) / (decay_rate + 1j * 2 * jnp.pi * (f - frequency))
+    negative_term = jnp.exp(-1j * phase) / (decay_rate + 1j * 2 * jnp.pi * (f + frequency))
+
+    return amplitude * (positive_term - negative_term) / (2j)
+
+def get_model_fourier(f, fs, ks, amplitudes, phases):
+    model_p = jnp.zeros_like(f, dtype=jnp.complex128)
+
+    for frequency, decay_rate, amplitude, phase in zip(fs, ks, amplitudes, phases):
+        model_p = model_p + get_decay_sine_fourier(f, frequency, decay_rate, amplitude, phase)
+
+    return model_p
+
+def get_bounds(signals, f_min, f_max, Q_min, Q_max, f_margin=1 / 8, log_Q_margin=1 / 8):
+    fs, Qs = unpack_signals(signals)
+
+    log_Q_space_min = jnp.log(Q_min)
+    log_Q_space_max = jnp.log(Q_max)
+
+    frequency_min = jnp.maximum(fs - f_margin, f_min)
+    frequency_max = jnp.minimum(fs + f_margin, f_max)
+
+    log_Qs = jnp.log(Qs)
+    log_Q_min = jnp.maximum(log_Qs - log_Q_margin, log_Q_space_min)
+    log_Q_max = jnp.minimum(log_Qs + log_Q_margin, log_Q_space_max)
+
+    quality_factor_min = jnp.exp(log_Q_min)
+    quality_factor_max = jnp.exp(log_Q_max)
+
+    return jnp.stack((frequency_min, frequency_max, quality_factor_min, quality_factor_max), axis=-1)
+
+def get_shift(x, y):
+    a, b, c = np.polyfit(x, y, 2)
+    x_shift = -b / (2 * a)
+
+    return x_shift
+
+def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, subbands):
+    bandwidth = (f_max - f_min) / subbands
+    edges = np.empty(subbands + 1)
+    edges_init = np.empty(subbands + 1)
+    edges[0] = f_min
+    edges[-1] = f_max
+    edges_init[0] = f_min
+    edges_init[-1] = f_max
+
+    for i in range(subbands - 1):
+        f_edge_init = f_min + (i + 1) * bandwidth
+        half_width = bandwidth / 4
+
+        f_space, Q_space, log_prob_space = grid_search(t, d, f_edge_init - half_width, f_edge_init + half_width, Q_min, Q_max, f_points, Q_points)
+
+        shifted = log_prob_space - np.min(log_prob_space)
+        max_shifted = np.max(shifted)
+        normalized = shifted / max_shifted if max_shifted > 0 else np.zeros_like(shifted)
+
+        penalty = ((f_space - f_edge_init) / half_width) ** 2
+        weighted = normalized + penalty[:, None]
+
+        frequency_scores = np.min(weighted, axis=1)
+        best_f_idx = np.argmin(frequency_scores)
+        edges[i + 1] = f_space[best_f_idx]
+        edges_init[i + 1] = f_edge_init
+
+    return edges_init, edges
+
+def load_data(type, event, network, station):
+    path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
+    data = np.loadtxt(path)
+    return data[:, 0], data[:, 1]
+
+def filter_data(t, d, f_min, f_max, order=8):
+    fs = 1 / np.mean(np.diff(t))
+    sos = butter(order, [f_min, f_max], btype="bandpass", fs=fs, output="sos")
+    return t, sosfiltfilt(sos, d)
+
+# Run -------------------------------------------------------------------------------------
+
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
+    t, d = filter_data(t, d, f_min, f_max)
+    B = f_max - f_min
+
+    initial_plot(path, t, d, f_min, f_max)
+
+    residual = d
+
+    thumbprints = []
+    checkpoints = [None] * depth
+    signals = jnp.empty((0, 2))
+    bounds = jnp.empty((0, 4))
+
+    start_time = perf_counter()
+    print("Starting...")
+
+    for iteration in range(depth):
+        iteration_start = perf_counter()
+
+        if len(signals) > 0:
+            model = get_model(t, d, signals)
+            residual = d - model
+
+        grid_start = perf_counter()
+        signal = grid_search_orchestrator(path, signals, t, residual, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores)
+        grid_elapsed = perf_counter() - grid_start
+
+        signal_bounds = get_bounds(signal, f_min, f_max, Q_min, Q_max, f_margin, log_Q_margin)
+
+        signal = jnp.asarray(signal).reshape(1, 2)
+        signal_bounds = jnp.asarray(signal_bounds).reshape(1, 4)
+
+        signals = jnp.concatenate([signals, signal], axis=0)
+        bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
+
+        nuts_start = perf_counter()
+        if len(signals) % signal_step == 0:
+            signals = nuts(t, d, B, signals, bounds, warmup, sample, devices)
+        nuts_elapsed = perf_counter() - nuts_start
+
+        if diagnostics == "full":
+            checkpoints[iteration] = (signals, bounds)
+
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+
+            if len(signals) % signal_step == 0:
+                thumbprints.append((len(signals), glob_ll))
+
+            save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+            save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+            plot_time_series("Time Series", path / "diagnostic" / "time_series" /f"time_series_{len(signals)}.png", t, d, signals)
+            plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+            plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+            plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+        else:
+            checkpoints[iteration] = (signals, bounds)
+
+            if len(signals) % signal_step == 0:
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+                thumbprints.append((len(signals), glob_ll))
+
+                save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+                save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+                plot_time_series("Time Series", path / "diagnostic" / "time_series" / f"time_series_{len(signals)}.png", t, d, signals)
+                plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+                plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+                plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+
+        iteration_elapsed = perf_counter() - iteration_start
+        total_elapsed = perf_counter() - start_time
+
+        print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
+
+    final_start = perf_counter()
+    checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
+    checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
+
+    thumbprints = np.asarray(thumbprints, dtype=float)
+
+    glob_lls = {int(count): float(score) for count, score in thumbprints if np.isfinite(score) and int(count) in checkpoint_by_count}
+    refined_checkpoints = {count: checkpoint_by_count[count] for count in glob_lls}
+
+    while True:
+        best_count = max(glob_lls, key=glob_lls.get)
+        measured_counts = sorted(glob_lls)
+
+        left_counts = [count for count in measured_counts if count < best_count]
+        right_counts = [count for count in measured_counts if count > best_count]
+
+        left_limit = left_counts[-1] if left_counts else 1
+        right_limit = right_counts[0] if right_counts else depth
+
+        candidates = []
+
+        if best_count - left_limit > 1:
+            candidate = (left_limit + best_count) // 2
+            if candidate not in glob_lls:
+                candidates.append(candidate)
+
+        if right_limit - best_count > 1:
+            candidate = (best_count + right_limit) // 2
+            if candidate not in glob_lls:
+                candidates.append(candidate)
+
+        candidates = sorted(set(candidates))
+        if not candidates:
             break
 
-        eigenvector = eigenvectors[:, jnp.argmin(eigenvalues)]
-        m = len(signals)
+        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices)
 
-        cosine_components = eigenvector[:m]
-        sine_components = eigenvector[m:]
+        for count, checkpoint in zip(candidates, candidate_refits):
+            refined_checkpoints[count] = checkpoint
+            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max)
 
-        signal_strength = jnp.sqrt(
-            cosine_components ** 2 + sine_components ** 2
-        )
+            log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
+            glob_lls[count] = float(glob_ll)
 
-        candidate_indices = jnp.argsort(signal_strength)[-4:]
+            save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, k2)
 
-        candidate_scores = []
+    best_count = max(glob_lls, key=glob_lls.get)
+    signals, bounds = refined_checkpoints[best_count]
 
-        for candidate_index in candidate_indices:
-            candidate_index = int(candidate_index)
-            candidate_signals = jnp.delete(signals, candidate_index, axis=0)
-            score = get_log_prob(t, d, candidate_signals)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
-            candidate_scores.append((score, candidate_index))
+    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
 
-        _, signal_index = max(
-            candidate_scores,
-            key=lambda result: float(result[0])
-        )
+    final_elapsed = perf_counter() - final_start
 
-        f, k = signals[signal_index]
-        print(
-            f"Removed signal with frequency {round(f, 8)} Hz and decay rate {round(k, 8)}. "
-            f"Condition number: {round(k2, 5)}."
-        )
+    print(f"Final stage completed in {final_elapsed:.2f} seconds")
+    print(f"Colony completed in {perf_counter() - start_time:.2f} seconds")
 
-        signals = jnp.delete(signals, signal_index, axis=0)
-        signals_bounds = jnp.delete(signals_bounds, signal_index, axis=0)
+    return signals, bounds
 
-        if nuts_args is not None:
-            signals = nuts(
-                t, 
-                d, 
-                signal_space, 
-                signals, 
-                signals_bounds,
-                nuts_args.nuts_kwargs, 
-                nuts_args.mcmc_kwargs,
-                nuts_args.run_kwargs, 
-                nuts_args.seed
-            )
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
+    start_time = perf_counter()
+    t_raw, d_raw = load_data(type, event, network, station)
+    t, d = filter_data(t_raw, d_raw, f_min, f_max)
+    B = f_max - f_min
 
-    return signals, signals_bounds
+    edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, 100, 100, subbands)
+    plot_fourier_space("Fourier Space", path / "fourier_space.png", t, d, f_min, f_max, edges_init=edges_init, band_edges=band_edges)
+    plot_time_series("Time Series", path / "time_series.png", t, d)
 
-def grid_search(
-        t, 
-        d, 
-        signal_space,
-        f_points, 
-        k_points,  
-        return_probability_surface=False, 
-        batch_size=256
-    ):
-    '''
-    Procedure for identifying candidate signal with a grid search.
-    1) Create grid across chosen parameter set of frequencies and decay rates.
-    2) Evaluate probability across the grid.
-    3) Return signal with highest probability.
-    '''
+    numpyro.set_host_device_count(devices)
 
-    f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
+    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step)
 
-    f_space = jnp.linspace(f_min, f_max, f_points)
-    k_space = jnp.geomspace(k_min, k_max, k_points)
+    signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
-    f_delta = f_space[1] - f_space[0]
+    save_iteration_diagnostics(path / "result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
 
-    f_grid, k_grid = jnp.meshgrid(
-        f_space,
-        k_space,
-        indexing="ij",
+    print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
+
+    return
+
+if __name__ == "__main__":
+    import tomllib
+    from pathlib import Path
+
+    with open("config.toml", "rb") as f:
+        config = tomllib.load(f)
+
+    name = (f"dracula_{config['type']}_{config['event']}_{config['network']}_{config['station']}")
+    path = Path.cwd() / name
+    path.mkdir(parents=True, exist_ok=True)
+
+    run(
+        type=config["type"],
+        event=config["event"],
+        network=config["network"],
+        station=config["station"],
+
+        f_min=config["f_min"],
+        f_max=config["f_max"],
+        Q_min=config["Q_min"],
+        Q_max=config["Q_max"],
+        f_points=config["f_points"],
+        Q_points=config["Q_points"],
+
+        f_margin=config["f_margin"],
+        log_Q_margin=config["log_Q_margin"],
+
+        depth=config["depth"],
+        warmup=config["warmup"],
+        sample=config["sample"],
+
+        devices=config["devices"],
+        cores=config["cores"],
+
+        diagnostics=config["diagnostics"],
+        signal_step=config["signal_step"],
+        subbands=config["subbands"],
+
+        path=path,
     )
-
-    rng_key_value = random.randint(1, 10_000)
-    key = jax.random.key(rng_key_value)
-
-    f_jitter = jax.random.uniform(
-        key,
-        shape=(f_points, k_points),
-        minval=-f_delta / 2,
-        maxval=f_delta / 2,
-    )
-
-    f_grid = jnp.clip(f_grid + f_jitter, f_min, f_max)
-
-    signal_grid = jnp.stack(
-        [f_grid.ravel(), k_grid.ravel()],
-        axis=-1,
-    )
-
-    evaluate_batch = jax.jit(
-        jax.vmap(lambda signal: get_log_prob(t, d, signal_space, signal))
-    )
-
-    results = []
-
-    for start in range(0, signal_grid.shape[0], batch_size):
-        batch = signal_grid[start:start + batch_size]
-        results.append(evaluate_batch(batch))
-
-    log_probs = jnp.concatenate(results)
-
-    log_prob_space = log_probs.reshape(
-        f_space.size,
-        k_space.size,
-    )
-
-    signal = utils.get_best_signal(
-        (f_space, k_space, log_prob_space)
-    )
-
-    if return_probability_surface:
-        return signal, (f_space, k_space, log_prob_space)
-
-    return signal
-
-
-# EXPERIMENTAL
-def bretthorst_filter(
-        t, 
-        d, 
-        signal_space,
-        f_points, 
-        k_points,
-        batch_size=256
-    ):
-    '''
-    Procedure for identifying candidate signal with a grid search.
-    1) Create grid across chosen parameter set of frequencies and decay rates.
-    2) Evaluate probability across the grid.
-    3) Return signal with highest probability.
-    '''
-
-    f_min, f_max, k_min, k_max = signal_space.f_min, signal_space.f_max, signal_space.k_min, signal_space.k_max
-
-    f_space = jnp.linspace(f_min, f_max, f_points)
-    k_space = jnp.geomspace(k_min, k_max, k_points)
-
-    f_delta = f_space[1] - f_space[0]
-
-    f_grid, k_grid = jnp.meshgrid(
-        f_space,
-        k_space,
-        indexing="ij",
-    )
-
-    rng_key_value = random.randint(1, 10_000)
-    key = jax.random.key(rng_key_value)
-
-    f_jitter = jax.random.uniform(
-        key,
-        shape=(f_points, k_points),
-        minval=-f_delta / 2,
-        maxval=f_delta / 2,
-    )
-
-    f_grid = jnp.clip(f_grid + f_jitter, f_min, f_max)
-
-    signal_grid = jnp.stack(
-        [f_grid.ravel(), k_grid.ravel()],
-        axis=-1,
-    )
-
-    evaluate_batch = jax.jit(
-        jax.vmap(lambda signal: get_model(t, d, signal))
-    )
-
-    model = jnp.zeros_like(evaluate_batch(signal_grid[:1])[0])
-
-    for start in range(0, signal_grid.shape[0], batch_size):
-        batch = signal_grid[start:start + batch_size]
-        batch_models = evaluate_batch(batch)
-        model = model + jnp.sum(batch_models, axis=0)
-
-    return model
-
-
-
-def bats_model(
-    t: jax.Array,
-    d: jax.Array,
-    signal_space: jax.Array,
-    f_min: jax.Array,
-    f_max: jax.Array,
-    k_min: jax.Array,
-    k_max: jax.Array,
-) -> None:
-    '''
-    Identify sampling space and method for NUTS.
-    '''
-
-    f_min = jnp.atleast_1d(jnp.asarray(f_min))
-    f_max = jnp.broadcast_to(
-        jnp.asarray(f_max, dtype=f_min.dtype),
-        f_min.shape,
-    )
-
-    k_min = jnp.atleast_1d(jnp.asarray(k_min))
-    k_max = jnp.broadcast_to(
-        jnp.asarray(k_max, dtype=k_min.dtype),
-        k_min.shape,
-    )
-
-    log_k_min = jnp.log(k_min)
-    log_k_max = jnp.log(k_max)
-
-    fs = numpyro.sample(
-        "fs",
-        dist.Uniform(f_min, f_max).to_event(1),
-    )
-
-    log_ks = numpyro.sample(
-        "log_ks",
-        dist.Uniform(log_k_min, log_k_max).to_event(1),
-    )
-
-    ks = numpyro.deterministic(
-        "ks",
-        jnp.exp(log_ks),
-    )
-
-    signals = jnp.stack(
-        (fs, ks),
-        axis=-1,
-    )
-
-    numpyro.factor(
-        "surface",
-        get_log_prob(t, d, signal_space, signals),
-    )
-
-def nuts(
-    t,
-    d,
-    signal_space,
-    signals,
-    signals_bounds,
-    nuts_kwargs,
-    mcmc_kwargs,
-    run_kwargs,
-    rng_key_value,
-):
-    '''
-    Run NUTS for chosen signals.
-    '''
-    f_init, k_init = utils.unpack_signals(signals)
-
-    f_init = jnp.atleast_1d(jnp.asarray(f_init))
-    k_init = jnp.atleast_1d(jnp.asarray(k_init))
-
-    bounds = jnp.asarray(signals_bounds)
-
-    if bounds.ndim != 2 or bounds.shape != (f_init.size, 4):
-        raise ValueError(
-            "signals_bounds must have shape (n_signals, 4), with entries "
-            "(f_min, f_max, k_min, k_max)"
-        )
-
-    fs_min = bounds[:, 0].astype(f_init.dtype)
-    fs_max = bounds[:, 1].astype(f_init.dtype)
-    ks_min = bounds[:, 2].astype(k_init.dtype)
-    ks_max = bounds[:, 3].astype(k_init.dtype)
-
-    if bool(jnp.any(fs_min >= fs_max)):
-        raise ValueError(
-            f"Empty frequency intervals: low={fs_min}, high={fs_max}"
-        )
-
-    if bool(jnp.any(ks_min <= 0)):
-        raise ValueError(
-            f"Decay-rate lower bounds must be positive: {ks_min}"
-        )
-
-    if bool(jnp.any(ks_min >= ks_max)):
-        raise ValueError(
-            f"Empty decay-rate intervals: low={ks_min}, high={ks_max}"
-        )
-
-    # The persistent representation is physical k. Convert to log(k)
-    # only for the NUTS sampling distribution.
-    log_k_init = jnp.log(k_init)
-    log_ks_min = jnp.log(ks_min)
-    log_ks_max = jnp.log(ks_max)
-
-    f_width = fs_max - fs_min
-    log_k_width = log_ks_max - log_ks_min
-
-    f_eps = 1e-6 * jnp.maximum(f_width, 1.0)
-    log_k_eps = 1e-6 * jnp.maximum(log_k_width, 1.0)
-
-    f_init_safe = jnp.clip(
-        f_init,
-        fs_min + f_eps,
-        fs_max - f_eps,
-    )
-
-    log_k_init_safe = jnp.clip(
-        log_k_init,
-        log_ks_min + log_k_eps,
-        log_ks_max - log_k_eps,
-    )
-
-    signals_init = jnp.stack(
-        (f_init_safe, jnp.exp(log_k_init_safe)),
-        axis=-1,
-    )
-
-    surface_value = get_log_prob(t, d, signal_space, signals_init)
-
-    if not bool(jnp.isfinite(surface_value)):
-        raise ValueError(
-            f"Initial surface log probability is not finite: "
-            f"{surface_value}"
-        )
-
-    init_strategy = init_to_value(
-        values={
-            "fs": f_init_safe,
-            "log_ks": log_k_init_safe,
-        }
-    )
-
-    nuts_config = {
-        "init_strategy": init_strategy,
-    }
-    nuts_config.update(nuts_kwargs)
-
-    if rng_key_value is None:
-        rng_key_value = random.randint(1, 10_000)
-    else:
-        rng_key_value = rng_key_value + len(signals)
-
-    kernel = NUTS(
-        bats_model,
-        **nuts_config,
-    )
-
-    mcmc = MCMC(
-        kernel,
-        **mcmc_kwargs,
-    )
-
-    mcmc.run(
-        jax.random.PRNGKey(int(rng_key_value)),
-        t=t,
-        d=d,
-        signal_space=signal_space,
-        f_min=fs_min,
-        f_max=fs_max,
-        k_min=ks_min,
-        k_max=ks_max,
-        extra_fields=("potential_energy",),
-        **run_kwargs,
-    )
-
-    samples = mcmc.get_samples(group_by_chain=True)
-    extra_fields = mcmc.get_extra_fields(group_by_chain=True)
-
-    potential_energy = extra_fields["potential_energy"]
-
-    best_flat_index = jnp.argmin(potential_energy.ravel())
-    chain_index, draw_index = jnp.unravel_index(
-        best_flat_index,
-        potential_energy.shape,
-    )
-
-    best_fs = samples["fs"][chain_index, draw_index]
-    best_ks = samples["ks"][chain_index, draw_index]
-
-    return jnp.stack(
-        (best_fs, best_ks),
-        axis=-1,
-    )
-
-def minimize(
-        t,
-        d,
-        signal_space,
-        signals,
-        maxiter=2_000,
-    ):
-    '''
-    Experimental minimization function to improve grid search / NUTS results.
-    '''
-
-    signals = jnp.asarray(signals)
-
-    f_min = float(signal_space.f_min)
-    f_max = float(signal_space.f_max)
-    k_min = float(signal_space.k_min)
-    k_max = float(signal_space.k_max)
-
-    if not f_max > f_min:
-        raise ValueError(f"Expected f_max > f_min, got {f_min=} and {f_max=}")
-
-    if not k_max > k_min:
-        raise ValueError(f"Expected k_max > k_min, got {k_min=} and {k_max=}")
-
-    original_shape = signals.shape
-
-    # Physical parameters:
-    # [f_0, k_0, f_1, k_1, ...]
-    x0_physical = np.asarray(signals, dtype=np.float64).reshape(-1)
-
-    if len(x0_physical) % 2 != 0:
-        raise ValueError(
-            "Expected an even number of parameters arranged as "
-            "[frequency, decay_rate, ...]"
-        )
-
-    lower = np.tile(
-        np.asarray([f_min, k_min], dtype=np.float64),
-        len(x0_physical) // 2,
-    )
-    upper = np.tile(
-        np.asarray([f_max, k_max], dtype=np.float64),
-        len(x0_physical) // 2,
-    )
-
-    widths = upper - lower
-
-    if np.any(x0_physical < lower) or np.any(x0_physical > upper):
-        raise ValueError(
-            "Initial parameters are outside the specified bounds.\n"
-            f"x0={x0_physical}\n"
-            f"lower={lower}\n"
-            f"upper={upper}"
-        )
-
-    # Normalize physical parameters to [0, 1].
-    x0_normalized = (x0_physical - lower) / widths
-
-    lower_jax = jnp.asarray(lower)
-    widths_jax = jnp.asarray(widths)
-
-    def normalized_to_physical(x_normalized):
-        return lower_jax + widths_jax * x_normalized
-
-    def objective_normalized(x_normalized):
-        x_physical = normalized_to_physical(x_normalized)
-        signals_current = x_physical.reshape(original_shape)
-
-        # This is the objective being minimized.
-        return -get_log_prob(t, d, signal_space, signals_current)
-
-    # Compute value, gradient, and exact Hessian with JAX.
-    objective_derivatives = jax.jit(
-        jax.value_and_grad(objective_normalized)
-    )
-    hessian_normalized = jax.jit(
-        jax.hessian(objective_normalized)
-    )
-
-    def objective_and_gradient(x_normalized):
-        x_normalized = np.asarray(x_normalized, dtype=np.float64)
-
-        value, gradient = objective_derivatives(
-            jnp.asarray(x_normalized)
-        )
-
-        value = float(value)
-        gradient = np.asarray(gradient, dtype=np.float64).reshape(-1)
-
-        if not np.isfinite(value):
-            raise FloatingPointError(
-                f"Non-finite objective at normalized parameters "
-                f"{x_normalized}"
-            )
-
-        if not np.all(np.isfinite(gradient)):
-            raise FloatingPointError(
-                f"Non-finite gradient at normalized parameters "
-                f"{x_normalized}"
-            )
-
-        return value, gradient
-
-    def hessian_callback(x_normalized):
-        x_normalized = np.asarray(x_normalized, dtype=np.float64)
-
-        hessian = np.asarray(
-            hessian_normalized(jnp.asarray(x_normalized)),
-            dtype=np.float64,
-        )
-
-        if not np.all(np.isfinite(hessian)):
-            raise FloatingPointError(
-                f"Non-finite Hessian at normalized parameters "
-                f"{x_normalized}"
-            )
-
-        # Numerical roundoff can make an analytically symmetric Hessian
-        # slightly nonsymmetric.
-        return 0.5 * (hessian + hessian.T)
-
-    # Every normalized parameter has bounds [0, 1].
-    bounds = Bounds(
-        lb=np.zeros_like(x0_normalized),
-        ub=np.ones_like(x0_normalized),
-    )
-
-    result = scipy_minimize(
-        objective_and_gradient,
-        x0_normalized,
-        method="trust-constr",
-        jac=True,
-        hess=hessian_callback,
-        bounds=bounds,
-        options={
-            "maxiter": maxiter,
-            "gtol": 1e-8,
-            "xtol": 1e-12,
-            "verbose": 0,
-        },
-    )
-
-    if not np.all(np.isfinite(result.x)):
-        raise FloatingPointError(
-            "trust-constr returned non-finite normalized parameters"
-        )
-
-    result_physical = lower + result.x * widths
-
-    if not np.all(np.isfinite(result_physical)):
-        raise FloatingPointError(
-            "trust-constr returned non-finite physical parameters"
-        )
-
-    if not result.success:
-        print(f"trust-constr warning: {result.message}")
-
-    return jnp.asarray(result_physical).reshape(original_shape)

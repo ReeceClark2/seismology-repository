@@ -7,6 +7,9 @@ diagnostics_*/
 bats_inspect.py
 config.toml
 window_test.py
+*.csv
+*.png
+compare.py
 
 Filtering/
 dracula_*/
