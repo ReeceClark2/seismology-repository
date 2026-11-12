@@ -835,47 +835,54 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init
     path.parent.mkdir(parents=True, exist_ok=True)
 
     f, p = get_fft(t, d, f_min, f_max)
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-
-    ax.plot(f, abs(p), color="black", label="Data", linewidth=0.9)
-    ax.set_xlim(f[0], f[-1])
-
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Amplitude")
-    ax.set_title(title)
+    outputs = [(path, None)]
 
     if signals is not None:
+        model = get_model(t, d, signals)
         fs, Qs = unpack_signals(signals)
         ks = jnp.pi * fs / Qs
         amplitudes, phases = get_phasor(t, d, signals)
 
-        model_p = get_model_fourier(f, fs, ks, amplitudes, phases)
-        ax.plot(f, abs(model_p), color="red", alpha=0.8, label="Model", linewidth=0.9)
-        ax.plot(f, abs(p) - abs(model_p), color="blue", alpha=0.6, label="Residual", linewidth=0.9)
+        lorentzian_p = get_model_fourier(f, fs, ks, amplitudes, phases)
+        _, fft_p = get_fft(t, model, f_min, f_max)
 
-        ymin, ymax = ax.get_ylim()
-        ymin_val = -jnp.abs(jnp.min(jnp.abs(p) - jnp.abs(model_p))) * 100
-        ymax_val = jnp.abs(jnp.max(jnp.abs(p) - jnp.abs(model_p))) * 100
+        outputs = [
+            (path.with_name(f"fourier_space_{len(signals)}_lorentzian{path.suffix}"), lorentzian_p),
+            (path.with_name(f"fourier_space_{len(signals)}_fft{path.suffix}"), fft_p),
+        ]
 
-        ax.vlines(fs, ymin_val, ymax_val, color="red", linestyle="--", alpha=0.15, linewidth=0.4)
-        ax.set_ylim(ymin, ymax)
+    for output_path, model_p in outputs:
+        fig, ax = plt.subplots(figsize=(12, 8))
 
-        ax.legend()
+        ax.plot(f, abs(p), color="black", label="Data", linewidth=0.9)
+        ax.set_xlim(f[0], f[-1])
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Amplitude")
+        ax.set_title(title)
 
-    if edges_init is not None:
-        for edge in edges_init:
-            ax.axvline(edge, color="red", linestyle="--")
+        if model_p is not None:
+            ax.plot(f, abs(model_p), color="red", alpha=0.8, label="Model", linewidth=0.9)
+            residual = abs(p) - abs(model_p)
+            ax.plot(f, residual, color="blue", alpha=0.6, label="Residual", linewidth=0.9)
 
-    if band_edges is not None:
-        for edge in band_edges:
-            ax.axvline(edge, color="blue", linestyle="--")
+            ymin, ymax = ax.get_ylim()
+            ymin_val = -jnp.abs(jnp.min(residual)) * 100
+            ymax_val = jnp.abs(jnp.max(residual)) * 100
+            ax.vlines(fs, ymin_val, ymax_val, color="red", linestyle="--", alpha=0.15, linewidth=0.4)
+            ax.set_ylim(ymin, ymax)
+            ax.legend()
 
-    fig.tight_layout()
-    fig.savefig(path, dpi=300)
-    plt.close(fig)
+        if edges_init is not None:
+            for edge in edges_init:
+                ax.axvline(edge, color="red", linestyle="--")
 
-    return
+        if band_edges is not None:
+            for edge in band_edges:
+                ax.axvline(edge, color="blue", linestyle="--")
+
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=300)
+        plt.close(fig)
 
 def initial_plot(path, t, d, f_min, f_max):
     plot_time_series("Time Series", path / "time_series.png", t, d)
@@ -1120,7 +1127,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
-    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
 
     final_elapsed = perf_counter() - final_start
 

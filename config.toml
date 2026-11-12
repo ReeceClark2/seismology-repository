@@ -1,12 +1,12 @@
 type = "observed"
 event = "kamchatka"
-network = "IU"
-station = "ANMO"
+network = "II"
+station = "BFO"
 
 f_min = 0.00028
 f_max = 0.00500
 Q_min = 100
-Q_max = 5000
+Q_max = 5200
 
 f_points = 4000
 Q_points = 100
