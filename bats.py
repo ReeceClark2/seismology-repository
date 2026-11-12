@@ -1,34 +1,34 @@
+# Standard library
 import csv
 import multiprocessing as mp
 import os
 import random
-from time import perf_counter
-from datetime import datetime
-from datetime import timedelta
+import shutil
+import tomllib
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 # Configure Matplotlib before importing pyplot.
 os.environ["MPLBACKEND"] = "Agg"
 
+# Third-party
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
-from jax.scipy.linalg import cho_factor, cho_solve
-from scipy.signal import butter, sosfiltfilt
 import matplotlib
-from matplotlib.patches import Ellipse
-
-matplotlib.use("Agg", force=True)
-
-import matplotlib.pyplot as plt
 import numpy as np
 import numpyro
 from jax.flatten_util import ravel_pytree
+from jax.scipy.linalg import cho_factor, cho_solve
+from matplotlib.patches import Ellipse
 from numpyro.infer import MCMC, NUTS, init_to_value
-from obspy.clients.fdsn import Client
-from obspy.core import UTCDateTime
+from scipy.signal import butter, sosfiltfilt
+
+matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt
 
 jax.config.update("jax_enable_x64", True)
 
@@ -1236,15 +1236,17 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     return
 
 if __name__ == "__main__":
-    import tomllib
-    from pathlib import Path
+    config_file = Path("config.toml")
 
-    with open("config.toml", "rb") as f:
+    with config_file.open("rb") as f:
         config = tomllib.load(f)
 
-    name = (f"dracula_{config['type']}_{config['event']}_{config['network']}_{config['station']}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = (f"dracula_{config['type']}_{config['event']}_{config['network']}_{config['station']}_{timestamp}")
     path = Path.cwd() / name
     path.mkdir(parents=True, exist_ok=True)
+
+    shutil.copyfile(config_file, path / "config.txt")
 
     run(
         type=config["type"],
@@ -1275,3 +1277,4 @@ if __name__ == "__main__":
 
         path=path,
     )
+    

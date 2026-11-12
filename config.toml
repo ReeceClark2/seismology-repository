@@ -8,17 +8,17 @@ f_max = 0.00500
 Q_min = 100
 Q_max = 5000
 
-f_points = 2000
+f_points = 4000
 Q_points = 100
-f_margin = 0.00005
-log_Q_margin = 1
-depth = 30
+f_margin = 0.00008
+log_Q_margin = 2
+depth = 70
 
-warmup = 200
-sample = 400
+warmup = 500
+sample = 1_000
 
 devices = 12
-cores = 36
-diagnostics = "partial"
+cores = 96
+diagnostics = "full"
 signal_step = 10
-subbands = 12
+subbands = 6
