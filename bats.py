@@ -330,89 +330,31 @@ def get_mean_sq_proj(t, d, B, signals):
 
     return mean_sq_proj
 
-def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1, ratio_gamma=1e5, ratio_sigma=1e2):
+def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
+    s = fs.shape[0]
+    N = int(2 * t[-1] * (f_max - f_min))
+
+    if s == 0:
+        return -0.5 * N * jnp.log(jnp.sum(d ** 2) / N)
+
     ks = jnp.pi * fs / Qs
-
-    omegas = fs * 2.0 * jnp.pi
-    
-    n_signals = fs.shape[0]
-    r = n_signals * 2
-    m = n_signals * 2
-    B = f_max - f_min
-    N = int(2 * t[-1] * B)
-
-    arg = omegas[:, None] * t[None, :]
+    arg = (2.0 * jnp.pi * fs)[:, None] * t[None, :]
     decay = jnp.exp(-ks[:, None] * t[None, :])
+    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
 
-    # Build the non-orthogonal model matrix G and its Gram matrix
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
-    g = 0.5 * (g + g.T)
+    U, R = jnp.linalg.qr(G, mode="reduced")
+    residual = d - U @ (U.T @ d)
+    residual_sq = jnp.sum(residual ** 2)
 
-    # Eigendecomposition for orthogonalization
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+    diagonal = jnp.abs(jnp.diag(R))
+    tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
+    full_rank = jnp.all(diagonal > tolerance)
+    in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
+    valid = full_rank & in_bounds & (N > 2 * s) & (residual_sq > 0)
 
-    # Bretthorst Eq. 3.5: orthonormal functions H
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
-    h = H @ d
-
-    # TODO: think about the scaling closely.
-    omega_center = jnp.pi * (f_max + f_min)
-    omega_halfwidth = jnp.pi * (f_max - f_min)
-
-    log_Q_min = jnp.log(Q_min)
-    log_Q_max = jnp.log(Q_max)
-    log_Q_center = 0.5 * (log_Q_max + log_Q_min)
-    log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
-
-    x_omega = (omegas - omega_center) / omega_halfwidth
-    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
-    
-    mean_sq_data = (1 / N) * jnp.sum(d ** 2)
-    mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / r) * jnp.sum(x_omega ** 2 + x_log_Q ** 2)
-
-    log_R_delta = jnp.log(ratio_delta)
-    log_R_gamma = jnp.log(ratio_gamma)
-    log_R_sigma = jnp.log(ratio_sigma)
-
-    theta, unravel = ravel_pytree(signals)
-    
-    def objective(theta):
-        return get_mean_sq_proj(t, d, B, unravel(theta))
-
-    b = (-m / 2) * jax.hessian(objective)(theta)
-    b = 0.5 * (b + b.T)
-
-    eigenvalues = jnp.linalg.eigvalsh(b)
-
-    log_jacobian_factor = -0.5 * jnp.sum(jnp.log(abs(eigenvalues)))
-
-    delta_term = (
-        jsp.gammaln(m / 2)
-        - jnp.log(2) - jnp.log(log_R_delta)
-        + (-m / 2) * jnp.log(m * mean_sq_proj / 2.0)
-    )
-
-    gamma_term = (
-        jsp.gammaln(r / 2)
-        - jnp.log(2) - jnp.log(log_R_gamma)
-        + (-r / 2) * jnp.log((r * mean_sq_param) / 2)
-    )
-
-    sigma_term = (
-        jsp.gammaln((N - m - r) / 2)
-        - jnp.log(2) - jnp.log(log_R_sigma)
-        + ((m + r - N) / 2) * jnp.log(
-            ((N * mean_sq_data) - (m * mean_sq_proj)) / 2
-        )
-    )
-
-    glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
-    return glob_ll
+    score = -0.5 * N * jnp.log(residual_sq / N) - 2.0 * s * jnp.log(N)
+    return jnp.where(valid, score, -jnp.inf)
 
 def get_condition_number(t, d, B, signals):
     fs, Qs = unpack_signals(signals)
@@ -617,7 +559,7 @@ def get_uncertainties(t, d, B, signals):
 
 # Evaluation (all) ------------------------------------------------------------------------
 
-def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1, ratio_gamma=1e5, ratio_sigma=1e2):
+def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
     ks = jnp.pi * fs / Qs
 
@@ -642,9 +584,6 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
-
-    mean_sq_data = (1 / N) * sum_sq_data
-    mean_sq_proj = (1 / m) * sum_sq_proj
 
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
 
@@ -671,14 +610,6 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1
 
     x_omega = (omegas - omega_center) / omega_halfwidth
     x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
-    
-    mean_sq_data = (1 / N) * jnp.sum(d ** 2)
-    mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
-    mean_sq_param = (1 / r) * jnp.sum(x_omega ** 2 + x_log_Q ** 2)
-
-    log_R_delta = jnp.log(ratio_delta)
-    log_R_gamma = jnp.log(ratio_gamma)
-    log_R_sigma = jnp.log(ratio_sigma)
 
     theta, unravel = ravel_pytree(signals)
 
@@ -695,42 +626,31 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, ratio_delta=5e1
     fs_unc = unc[::2]
     Qs_unc = unc[1::2]
 
-    amplitudes = jnp.sqrt(
-        (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[:len(signals)] ** 2
-        + (eigenvectors @ (h / jnp.sqrt(eigenvalues)))[len(signals):] ** 2
-    )
-
     beta = eigenvectors @ (h / jnp.sqrt(eigenvalues))
     cosine_coefficients = beta[:len(signals)]
     sine_coefficients = beta[len(signals):]
     amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
 
-    delta_term = (
-        jsp.gammaln(m / 2)
-        - jnp.log(2)
-        - jnp.log(log_R_delta)
-        + (-m / 2) * jnp.log(m * mean_sq_proj / 2.0)
-    )
+    glob_N = int(2 * t[-1] * (f_max - f_min))
 
-    gamma_term = (
-        jsp.gammaln(r / 2)
-        - jnp.log(2)
-        - jnp.log(log_R_gamma)
-        + (-r / 2) * jnp.log((r * mean_sq_param) / 2)
-    )
+    if n_signals == 0:
+        glob_ll = -0.5 * glob_N * jnp.log(jnp.sum(d ** 2) / glob_N)
+    else:
+        G_glob = G.T
 
-    sigma_term = (
-        jsp.gammaln((N - m - r) / 2)
-        - jnp.log(2)
-        - jnp.log(log_R_sigma)
-        + ((m + r - N) / 2) * jnp.log(
-            ((N * mean_sq_data) - (m * mean_sq_proj)) / 2
-        )
-    )
+        U, R = jnp.linalg.qr(G_glob, mode="reduced")
+        residual = d - U @ (U.T @ d)
+        residual_sq = jnp.sum(residual ** 2)
 
-    log_jacobian_factor = -0.5 * jnp.sum(jnp.log(jnp.abs(b_eigenvalues)))
-    glob_ll = delta_term + gamma_term + sigma_term + log_jacobian_factor
+        diagonal = jnp.abs(jnp.diag(R))
+        tolerance = jnp.finfo(G_glob.dtype).eps * max(G_glob.shape) * jnp.max(diagonal)
+        full_rank = jnp.all(diagonal > tolerance)
+        in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
+        valid = full_rank & in_bounds & (glob_N > 2 * n_signals) & (residual_sq > 0)
+
+        score = -0.5 * glob_N * jnp.log(residual_sq / glob_N) - 2.0 * n_signals * jnp.log(glob_N)
+        glob_ll = jnp.where(valid, score, -jnp.inf)
 
     return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
 
@@ -1049,7 +969,7 @@ def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, s
         normalized = shifted / max_shifted if max_shifted > 0 else np.zeros_like(shifted)
 
         penalty = ((f_space - f_edge_init) / half_width) ** 2
-        weighted = normalized + penalty[:, None]
+        weighted = normalized # + penalty[:, None]
 
         frequency_scores = np.min(weighted, axis=1)
         best_f_idx = np.argmin(frequency_scores)
@@ -1066,7 +986,9 @@ def load_data(type, event, network, station):
 def filter_data(t, d, f_min, f_max, order=8):
     fs = 1 / np.mean(np.diff(t))
     sos = butter(order, [f_min, f_max], btype="bandpass", fs=fs, output="sos")
-    return t, sosfiltfilt(sos, d)
+    filtered_d = sosfiltfilt(sos, d)
+    trim = int(5 * 3600 * fs)
+    return t[trim:-trim], filtered_d[trim:-trim]
 
 # Run -------------------------------------------------------------------------------------
 
