@@ -336,7 +336,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
     m = 2 * s
 
     if s == 0:
-        residual_sq = jnp.sum(((N / len(d)) * d) ** 2)
+        residual_sq = (N / len(d)) * jnp.sum(d ** 2)
         full_rank = True
         in_bounds = True
     else:
@@ -346,8 +346,8 @@ def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
         G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
 
         U, R = jnp.linalg.qr(G, mode="reduced")
-        residual = (N / len(d)) * (d - U @ (U.T @ d))
-        residual_sq = jnp.sum(residual ** 2)
+        residual = d - U @ (U.T @ d)
+        residual_sq = (N / len(d)) * jnp.sum(residual ** 2)
 
         diagonal = jnp.abs(jnp.diag(R))
         tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
@@ -637,7 +637,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
 
     if n_signals == 0:
-        residual_sq = jnp.sum(((N / len(d)) * d) ** 2)
+        residual_sq = (N / len(d)) * jnp.sum(d ** 2)
         full_rank = True
         in_bounds = True
     else:
@@ -647,8 +647,8 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
 
         U, R = jnp.linalg.qr(G, mode="reduced")
-        residual = (N / len(d)) * (d - U @ (U.T @ d))
-        residual_sq = jnp.sum(residual ** 2)
+        residual = d - U @ (U.T @ d)
+        residual_sq = (N / len(d)) * jnp.sum(residual ** 2)
 
         diagonal = jnp.abs(jnp.diag(R))
         tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
