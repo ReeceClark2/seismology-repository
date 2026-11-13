@@ -228,7 +228,6 @@ def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_
     best_index = jnp.unravel_index(jnp.argmax(log_prob_space), log_prob_space.shape)
 
     f_index, Q_index = best_index
-    f_space[f_index]
     signal = (f_space[f_index], Q_space[Q_index])
 
     return signal
@@ -337,7 +336,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
     m = 2 * s
 
     if s == 0:
-        residual_sq = jnp.sum(d ** 2)
+        residual_sq = jnp.sum(((N / len(d)) * d) ** 2)
         full_rank = True
         in_bounds = True
     else:
@@ -347,7 +346,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
         G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
 
         U, R = jnp.linalg.qr(G, mode="reduced")
-        residual = d - U @ (U.T @ d)
+        residual = (N / len(d)) * (d - U @ (U.T @ d))
         residual_sq = jnp.sum(residual ** 2)
 
         diagonal = jnp.abs(jnp.diag(R))
@@ -592,7 +591,6 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     sum_sq_proj = jnp.sum(h ** 2)
 
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
-
     snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
 
     g_norms = jnp.sqrt(jnp.diag(g))
@@ -639,23 +637,29 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
 
     if n_signals == 0:
-        glob_ll = -0.5 * N * jnp.log(jnp.sum(d ** 2) / N)
+        residual_sq = jnp.sum(((N / len(d)) * d) ** 2)
+        full_rank = True
+        in_bounds = True
     else:
-        G_glob = G.T
+        ks = jnp.pi * fs / Qs
+        arg = (2.0 * jnp.pi * fs)[:, None] * t[None, :]
+        decay = jnp.exp(-ks[:, None] * t[None, :])
+        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
 
-        U, R = jnp.linalg.qr(G_glob, mode="reduced")
-        residual = d - U @ (U.T @ d)
+        U, R = jnp.linalg.qr(G, mode="reduced")
+        residual = (N / len(d)) * (d - U @ (U.T @ d))
         residual_sq = jnp.sum(residual ** 2)
 
         diagonal = jnp.abs(jnp.diag(R))
-        tolerance = jnp.finfo(G_glob.dtype).eps * max(G_glob.shape) * jnp.max(diagonal)
+        tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
         full_rank = jnp.all(diagonal > tolerance)
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
-        valid = full_rank & in_bounds & (N > 2 * n_signals) & (residual_sq > 0)
-        
-        score = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance) - 2.0 * n_signals * jnp.log(N)
 
-        glob_ll = jnp.where(valid, score, -jnp.inf)
+    noise_variance = residual_sq / (N - m - 2.0)
+    log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
+    score = log_likelihood - 2.0 * n_signals * jnp.log(N)
+    valid = (N > m + 2.0) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
+    glob_ll = jnp.where(valid, score, -jnp.inf)
 
     return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
 
