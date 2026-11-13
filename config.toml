@@ -1,7 +1,7 @@
-type = "observed"
-event = "kamchatka"
-network = "II"
-station = "BFO"
+type = "synthetic"
+event = "tohoku"
+network = "IU"
+station = "ANMO"
 
 f_min = 0.00028
 f_max = 0.00500

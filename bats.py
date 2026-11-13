@@ -333,7 +333,7 @@ def get_mean_sq_proj(t, d, B, signals):
 def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
     s = fs.shape[0]
-    N_eff = 2.0 * (t[-1] - t[0]) * (f_max - f_min)
+    N = int(2 * t[-1] * (f_max - f_min))
     m = 2 * s
 
     if s == 0:
@@ -355,11 +355,11 @@ def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
         full_rank = jnp.all(diagonal > tolerance)
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
 
-    noise_variance = residual_sq / (N_eff - m - 2.0)
-    log_likelihood = -0.5 * (N_eff * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
-    score = log_likelihood - 2.0 * s * jnp.log(N_eff)
+    noise_variance = residual_sq / (N - m - 2.0)
+    log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
+    score = log_likelihood - 2.0 * s * jnp.log(N)
 
-    valid = (N_eff > m + 2.0) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
+    valid = (N > m + 2.0) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
     return jnp.where(valid, score, -jnp.inf)
 
 def get_condition_number(t, d, B, signals):
@@ -638,8 +638,6 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
     phases = jnp.atan2(cosine_coefficients, sine_coefficients)
 
-    glob_N = int(2 * t[-1] * (f_max - f_min))
-
     if n_signals == 0:
         glob_ll = -0.5 * N * jnp.log(jnp.sum(d ** 2) / N)
     else:
@@ -654,8 +652,9 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         full_rank = jnp.all(diagonal > tolerance)
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
         valid = full_rank & in_bounds & (N > 2 * n_signals) & (residual_sq > 0)
+        
+        score = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance) - 2.0 * n_signals * jnp.log(N)
 
-        score = -0.5 * N * jnp.log(residual_sq / N) - 2.0 * n_signals * jnp.log(N)
         glob_ll = jnp.where(valid, score, -jnp.inf)
 
     return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
@@ -727,22 +726,21 @@ def plot_signal_space(title, path, fs, Qs, fs_unc, Qs_unc):
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    ax.scatter(fs, Qs, color="red", s=15, zorder=3, label="Signals")
+    ax.set_yscale("log")
+    ax.scatter(fs, Qs, color="red", s=10, zorder=3, label="Signals")
 
-    x_min, x_max = ax.get_xlim()
-    y_min, y_max = ax.get_ylim()
+    signal_ylim = ax.get_ylim()
+
     for f, q, f_unc, q_unc in zip(fs, Qs, fs_unc, Qs_unc):
         for sigma, alpha in ((3.0, 0.06), (2.0, 0.12), (1.0, 0.22)):
             ellipse = Ellipse(xy=(f, q), width=2.0 * sigma * f_unc, height=2.0 * sigma * q_unc, facecolor="red", edgecolor="red", alpha=alpha, linewidth=0.8)
             ax.add_patch(ellipse)
 
-    ax.set_yscale("log")
+    ax.set_ylim(signal_ylim)
+
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Quality Factor (Q)")
     ax.set_title(title)
-
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
 
     ax.legend()
 
@@ -992,7 +990,10 @@ def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, s
     return edges_init, edges
 
 def load_data(type, event, network, station):
-    path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
+    if type == "observed":
+        path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
+    elif type == "synthetic":
+        path = Path.cwd() / type / event / f"{network}_{station}_TS.dat"
     data = np.loadtxt(path)
     return data[:, 0], data[:, 1]
 
@@ -1018,6 +1019,9 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
+    glob_ll = get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max)
+    save_iteration_diagnostics(path / "diagnostic" / "tables", signals, jnp.mean(d)/len(d), 0, 0, glob_ll, 0)
+    
     start_time = perf_counter()
     print("Starting...")
 
