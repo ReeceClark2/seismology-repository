@@ -316,14 +316,12 @@ def get_mean_sq_proj(t, d, B, signals):
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.5: orthonormal functions H
+    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
+    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
+    
 
     mean_sq_proj = (1 / m) * jnp.sum(h ** 2)
 
@@ -355,6 +353,7 @@ def get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max):
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
 
     noise_variance = residual_sq / (N - m - 2.0)
+
     log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
     score = log_likelihood - 2.0 * s * jnp.log(N)
 
@@ -430,19 +429,18 @@ def get_noise_variance(t, d, B, signals):
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
 
-    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
+    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
+    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
+    
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
     return noise_variance
 
 def get_snr(t, d, B, signals):
@@ -463,19 +461,17 @@ def get_snr(t, d, B, signals):
     G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
     g = G @ G.T
 
-    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.6: orthonormal functions H
+    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
+    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
 
     snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
     return snr
@@ -494,14 +490,12 @@ def get_phasor(t, d, signals):
     ))
     g = G @ G.T
 
-    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.5: orthonormal functions H
+    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
+    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
+    
 
     beta = eigenvectors @ (h / jnp.sqrt(eigenvalues))
     n_components = fs.shape[0]
@@ -532,19 +526,18 @@ def get_uncertainties(t, d, B, signals):
     g = G @ G.T
     g = 0.5 * (g + g.T)
 
-    # Eigendecomposition for orthogonalization
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
-    # Bretthorst Eq. 3.5: orthonormal functions H
+    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
+    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    
-    # Bretthorst Eq. 3.13: projection amplitudes h
     h = H @ d
+    
 
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
 
     theta, unravel = ravel_pytree(signals)
     
@@ -554,9 +547,12 @@ def get_uncertainties(t, d, B, signals):
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
 
-    eigenvalues, eigenvectors = jnp.linalg.eigh(b)
+    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
+    threshold_b = jnp.finfo(b.dtype).eps ** 0.5 * jnp.max(b_eigenvalues)
+    safe_b_eigenvalues = jnp.where(b_eigenvalues > threshold_b, b_eigenvalues, threshold_b)
+    covariance = noise_variance * ((b_eigenvectors / safe_b_eigenvalues[None, :]) @ b_eigenvectors.T)
+    variances = jnp.sqrt(jnp.diag(covariance))
 
-    variances = jnp.sqrt(noise_variance * jnp.sum(eigenvectors ** 2 / eigenvalues[None, :], axis=1))
     fs_unc = variances[::2]
     Qs_unc = variances[1::2]
 
@@ -583,14 +579,17 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     g = 0.5 * (g + g.T)
 
     eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-
+    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
+    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d
-
+    
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
     noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
+    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
+
     snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
 
     g_norms = jnp.sqrt(jnp.diag(g))
@@ -624,9 +623,11 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     b = 0.5 * (b + b.T)
 
     b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
-    covariance = noise_variance * ((b_eigenvectors / b_eigenvalues[None, :]) @ b_eigenvectors.T)
+    threshold_b = jnp.finfo(b.dtype).eps ** 0.5 * jnp.max(b_eigenvalues)
+    safe_b_eigenvalues = jnp.where(b_eigenvalues > threshold_b, b_eigenvalues, threshold_b)
+    covariance = noise_variance * ((b_eigenvectors / safe_b_eigenvalues[None, :]) @ b_eigenvectors.T)
+    unc = jnp.sqrt(jnp.diag(covariance))
 
-    unc = jnp.sqrt(noise_variance * jnp.sum(b_eigenvectors ** 2 / b_eigenvalues[None, :], axis=1))
     fs_unc = unc[::2]
     Qs_unc = unc[1::2]
 
@@ -656,6 +657,8 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
 
     noise_variance = residual_sq / (N - m - 2.0)
+    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
+
     log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
     score = log_likelihood - 2.0 * n_signals * jnp.log(N)
     valid = (N > m + 2.0) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds

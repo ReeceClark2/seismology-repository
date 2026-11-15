@@ -1,7 +1,7 @@
 type = "synthetic"
 event = "tohoku"
-network = "IU"
-station = "ANMO"
+network = "II"
+station = "BFO"
 
 f_min = 0.00028
 f_max = 0.00500
@@ -10,8 +10,8 @@ Q_max = 5200
 
 f_points = 4000
 Q_points = 100
-f_margin = 0.00008
-log_Q_margin = 2
+f_margin = 0.0002
+log_Q_margin = 5
 depth = 49
 
 warmup = 500
