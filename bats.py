@@ -1179,10 +1179,10 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     df = 1e-4 * (f_max - f_min)
     dlogQ = 1e-4 * jnp.log(Q_max / Q_min)
 
-    bounds = bounds.at[:, 0].set(jnp.maximum(bounds[:, 0] - df, f_min))
-    bounds = bounds.at[:, 1].set(jnp.minimum(bounds[:, 1] + df, f_max))
-    bounds = bounds.at[:, 2].set(jnp.exp(jnp.maximum(jnp.log(bounds[:, 2]) - dlogQ, jnp.log(Q_min))))
-    bounds = bounds.at[:, 3].set(jnp.exp(jnp.minimum(jnp.log(bounds[:, 3]) + dlogQ, jnp.log(Q_max))))
+    bounds = bounds.at[:, 0].set(jnp.maximum(bounds[:, 0] - df, f_min - df))
+    bounds = bounds.at[:, 1].set(jnp.minimum(bounds[:, 1] + df, f_max + df))
+    bounds = bounds.at[:, 2].set(jnp.exp(jnp.maximum(jnp.log(bounds[:, 2]) - dlogQ, jnp.log(Q_min) - dlogQ)))
+    bounds = bounds.at[:, 3].set(jnp.exp(jnp.minimum(jnp.log(bounds[:, 3]) + dlogQ, jnp.log(Q_max) + dlogQ)))
 
     signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
