@@ -583,7 +583,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
     H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
     h = H @ d
-    
+
     sum_sq_data = jnp.sum(d ** 2)
     sum_sq_proj = jnp.sum(h ** 2)
 
@@ -614,10 +614,14 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     x_omega = (omegas - omega_center) / omega_halfwidth
     x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
 
-    theta, unravel = ravel_pytree(signals)
+    theta_fs = fs
+    theta_log_Qs = jnp.log(Qs)
+    theta = jnp.stack([theta_fs, theta_log_Qs], axis=-1).ravel()
 
     def objective(theta):
-        return get_mean_sq_proj(t, d, B, unravel(theta))
+        theta_2d = theta.reshape(-1, 2)
+        signals_t = jnp.stack([theta_2d[:, 0], jnp.exp(theta_2d[:, 1])], axis=-1)
+        return get_mean_sq_proj(t, d, B, signals_t)
 
     b = (-m / 2) * jax.hessian(objective)(theta)
     b = 0.5 * (b + b.T)
@@ -1000,7 +1004,7 @@ def load_data(type, event, network, station):
     if type == "observed":
         path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
     elif type == "synthetic":
-        path = Path.cwd() / type / event / f"{network}_{station}_TS.dat"
+        path = Path.cwd() / type / event / f"{network}_{station}.dat"
     data = np.loadtxt(path)
     return data[:, 0], data[:, 1]
 
@@ -1169,7 +1173,18 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step)
 
-    # signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
+    bounds = jnp.asarray(bounds).reshape(-1, 4)
+    signals = jnp.asarray(signals).reshape(-1, 2)
+
+    df = 1e-4 * (f_max - f_min)
+    dlogQ = 1e-4 * jnp.log(Q_max / Q_min)
+
+    bounds = bounds.at[:, 0].set(jnp.maximum(bounds[:, 0] - df, f_min))
+    bounds = bounds.at[:, 1].set(jnp.minimum(bounds[:, 1] + df, f_max))
+    bounds = bounds.at[:, 2].set(jnp.exp(jnp.maximum(jnp.log(bounds[:, 2]) - dlogQ, jnp.log(Q_min))))
+    bounds = bounds.at[:, 3].set(jnp.exp(jnp.minimum(jnp.log(bounds[:, 3]) + dlogQ, jnp.log(Q_max))))
+
+    signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
@@ -1227,4 +1242,3 @@ if __name__ == "__main__":
 
         path=path,
     )
-    
