@@ -9,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import traceback
 from time import perf_counter
 
 # Configure Matplotlib before importing pyplot.
@@ -1013,12 +1014,14 @@ def filter_data(t, d, f_min, f_max, order=8):
     sos = butter(order, [f_min, f_max], btype="bandpass", fs=fs, output="sos")
     filtered_d = sosfiltfilt(sos, d)
     trim = int(5 * 3600 * fs)
-    return t[trim:-trim], filtered_d[trim:-trim]
+    t_trimmed = t[trim:-trim]
+    return t_trimmed - t_trimmed[0], filtered_d[trim:-trim]
 
 # Run -------------------------------------------------------------------------------------
 
 def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
     t, d = filter_data(t, d, f_min, f_max)
+
     B = f_max - f_min
 
     initial_plot(path, t, d, f_min, f_max)
@@ -1176,25 +1179,66 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     signals = jnp.asarray(signals).reshape(-1, 2)
 
-    df = 1e-4 * (f_max - f_min)
-    dlogQ = 1e-4 * jnp.log(Q_max / Q_min)
-
-    bounds = bounds.at[:, 0].set(jnp.maximum(bounds[:, 0] - df, f_min - df))
-    bounds = bounds.at[:, 1].set(jnp.minimum(bounds[:, 1] + df, f_max + df))
-    bounds = bounds.at[:, 2].set(jnp.exp(jnp.maximum(jnp.log(bounds[:, 2]) - dlogQ, jnp.log(Q_min) - dlogQ)))
-    bounds = bounds.at[:, 3].set(jnp.exp(jnp.minimum(jnp.log(bounds[:, 3]) + dlogQ, jnp.log(Q_max) + dlogQ)))
-
-    signals = nuts(t, d, B, signals, bounds, 50, 100, 1)
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
-    save_iteration_diagnostics(path / "result", signals, noise_variance, snr, log_prob, glob_ll, k2)
-    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
-    plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
-    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
-    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
-    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
-    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
+    save_iteration_diagnostics(path / "marginal_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+    save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(signals)}.png", t, d, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "marginal_result" / f"covariance_{len(signals)}.png", signals, covariance)
+
+    # Force device values to be available before reporting/timing.
+    s = np.asarray(jax.device_get(signals))
+    b = np.asarray(jax.device_get(bounds))
+
+    print(
+        "NUTS inputs:",
+        f"signals shape={s.shape}, bounds shape={b.shape}",
+        f"signals finite={np.isfinite(s).all()}, bounds finite={np.isfinite(b).all()}",
+        flush=True,
+    )
+    print("signals:\n", s, flush=True)
+    print("bounds:\n", b, flush=True)
+
+    if s.ndim == 2 and b.shape == (len(s), 4):
+        lo = b[:, [0, 2]]  # f_lo, Q_lo
+        hi = b[:, [1, 3]]  # f_hi, Q_hi
+        print("bounds ordered:", np.all(lo < hi), flush=True)
+        print("signals within bounds:", np.all((s >= lo) & (s <= hi)), flush=True)
+        print("per-signal in-bounds:\n", (s >= lo) & (s <= hi), flush=True)
+
+    print(f"Starting NUTS at t={perf_counter() - start_time:.2f}s", flush=True)
+    nuts_start = perf_counter()
+    try:
+        nuts_result = nuts(t, d, B, signals, bounds, 50, 100, 1)
+
+        # JAX may dispatch work asynchronously; wait before stopping the timer.
+        nuts_result = jax.tree_util.tree_map(
+            lambda x: x.block_until_ready()
+            if hasattr(x, "block_until_ready") else x,
+            nuts_result,
+        )
+        print(f"NUTS returned in {perf_counter() - nuts_start:.2f}s", flush=True)
+    except Exception:
+        print(f"NUTS failed after {perf_counter() - nuts_start:.2f}s", flush=True)
+        traceback.print_exc()
+        raise
+
+    signals = nuts_result
+
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    model = get_model(t, d, signals)
+
+    save_iteration_diagnostics(path / "joint_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+    save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    plot_time_series("Time Series", path / "joint_result" / f"time_series_{len(signals)}.png", t, d, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
+    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "joint_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "joint_result" / f"covariance_{len(signals)}.png", signals, covariance)
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
