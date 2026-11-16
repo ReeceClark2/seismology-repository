@@ -22,3 +22,6 @@ cores = 36
 diagnostics = "full"
 signal_step = 7
 subbands = 2
+
+min_novelty = 0.1
+prune = True

@@ -23,7 +23,7 @@ import matplotlib
 import numpy as np
 import numpyro
 from jax.flatten_util import ravel_pytree
-from jax.scipy.linalg import cho_factor, cho_solve
+from jax.scipy.linalg import cho_factor, cho_solve, solve_triangular
 from matplotlib.patches import Ellipse
 from numpyro.infer import MCMC, NUTS, init_to_value
 from scipy.signal import butter, sosfiltfilt
@@ -45,14 +45,30 @@ class GridSearchTask:
     f_points: int
     Q_points: int
 
-# Signal Update --------------------------------------------------------------------------
+# Linear algebra helpers -----------------------------------------------------------------
 
-def get_log_prob(t, d, B, signals):
-    fs, Qs = unpack_signals(signals)
-    n = t.shape[0]
-    s = fs.shape[0]
-    dt = t[1] - t[0]
+# Relative ridge added to the unit-diagonal (equilibrated) Gram matrix before Cholesky.
+# Because the residual is recomputed explicitly, this biases the RSS only at second order.
+GRAM_JITTER = 1e-12
+NOVELTY_JITTER = 1e-10
+
+def get_basis(t, fs, Qs):
+    """Complex basis E_j(t) = exp(z_j t), z_j = -pi f_j / Q_j + 2 pi i f_j.
+
+    The real model basis is G = [Re(E); Im(E)], i.e. rows [cos * decay; sin * decay].
+    """
     z = -jnp.pi * fs / Qs + 2j * jnp.pi * fs
+    E = jnp.exp(z[:, None] * t[None, :])
+    return z, E
+
+def get_cross_gram(t, z1, z2):
+    """Analytic inner products between the real bases of z1 and z2 (uniform sampling).
+
+    Returns the (2 s1, 2 s2) block [[cc, cs], [sc, ss]] with rows (cos_1, sin_1) and
+    columns (cos_2, sin_2), computed from geometric sums in O(s1 s2).
+    """
+    n = t.shape[0]
+    dt = t[1] - t[0]
 
     def geometric_sum(u):
         q = u * dt
@@ -61,23 +77,140 @@ def get_log_prob(t, d, B, signals):
         series = jnp.where(q == 0, n, jnp.expm1(n * q) / denominator)
         return jnp.exp(u * t[0]) * series
 
-    A = geometric_sum(z[:, None] + z[None, :])
-    C = geometric_sum(z[:, None] + jnp.conj(z[None, :]))
+    A = geometric_sum(z1[:, None] + z2[None, :])
+    C = geometric_sum(z1[:, None] + jnp.conj(z2[None, :]))
 
     cc = 0.5 * jnp.real(A + C)
     cs = 0.5 * jnp.imag(A - C)
+    sc = 0.5 * jnp.imag(A + C)
     ss = 0.5 * jnp.real(C - A)
-    g = jnp.block([[cc, cs], [cs.T, ss]])
+    return jnp.block([[cc, cs], [sc, ss]])
 
-    v = jnp.exp(z[:, None] * t[None, :]) @ d
-    b = jnp.concatenate((jnp.real(v), jnp.imag(v)))
-    projected_sq = b @ cho_solve(cho_factor(g), b)
+def get_gram(t, z):
+    g = get_cross_gram(t, z, z)
+    return 0.5 * (g + g.T)
 
-    ratio = projected_sq / jnp.sum(d ** 2)
+def get_equilibrated_cholesky(g, jitter=GRAM_JITTER):
+    """Lower Cholesky factor of D^-1 g D^-1 + jitter I, with D = sqrt(diag(g))."""
+    D = jnp.sqrt(jnp.maximum(jnp.diag(g), jnp.finfo(g.dtype).tiny))
+    g_scaled = g / jnp.outer(D, D) + jitter * jnp.eye(g.shape[0], dtype=g.dtype)
+    return jnp.linalg.cholesky(g_scaled), D
+
+def solve_amplitudes(g, b):
+    """Solve g beta = b with Jacobi equilibration and a small relative ridge."""
+    D = jnp.sqrt(jnp.maximum(jnp.diag(g), jnp.finfo(g.dtype).tiny))
+    g_scaled = g / jnp.outer(D, D) + GRAM_JITTER * jnp.eye(g.shape[0], dtype=g.dtype)
+    return cho_solve(cho_factor(g_scaled), b / D) / D
+
+def get_stable_rss(t, d, fs, Qs):
+    """Residual sum of squares computed from an explicit residual vector.
+
+    RSS = ||d - G^T beta||^2 is stationary in beta, so conditioning errors in beta only
+    enter at second order, unlike sum(d^2) - b^T g^-1 b which loses ~kappa * eps * sum(d^2).
+    Cost O(s n + s^3).
+    """
+    z, E = get_basis(t, fs, Qs)
+    G = jnp.concatenate((jnp.real(E), jnp.imag(E)))
+    g = get_gram(t, z)
+    beta = solve_amplitudes(g, G @ d)
+    residual = d - G.T @ beta
+    return jnp.sum(residual ** 2)
+
+def get_bic_fast(t, d, B, signals):
+    """BIC score matching get_glob_ll, using get_stable_rss (no QR, no rank/bounds check)."""
+    fs, Qs = unpack_signals(signals, sort=False)
+    s = fs.shape[0]
+    m = 2 * s
     N = int(2 * t[-1] * B)
-    return 0.5 * (2 * s - N) * jnp.log1p(-ratio)
 
-def grid_search(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, batch_size=512):
+    if N <= m + 2:
+        return -np.inf
+
+    rss = jnp.sum(d ** 2) if s == 0 else get_stable_rss(t, d, fs, Qs)
+    residual_sq = (N / len(d)) * rss
+    noise_variance = residual_sq / (N - m - 2.0)
+
+    if not bool(noise_variance > 0):
+        return -np.inf
+
+    log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
+    return float(log_likelihood - 2.0 * s * jnp.log(N))
+
+def prune_signals(t, d, B, signals, bounds):
+    """Backward elimination: drop the signal whose removal most improves BIC, repeat.
+
+    Remaining signals are not re-optimized after a removal, so each removal score is a
+    lower bound on what a refit would give (the pruning is conservative).
+    Cost per pass O(s (s n + s^3)).
+    """
+    signals = np.asarray(signals).reshape(-1, 2)
+    bounds = np.asarray(bounds).reshape(-1, 4)
+    current = get_bic_fast(t, d, B, signals)
+    removed = []
+
+    while signals.shape[0] > 1:
+        scores = np.array([
+            get_bic_fast(t, d, B, np.delete(signals, j, axis=0))
+            for j in range(signals.shape[0])
+        ])
+        j = int(np.argmax(scores))
+
+        if not scores[j] > current:
+            break
+
+        removed.append(tuple(signals[j]))
+        signals = np.delete(signals, j, axis=0)
+        bounds = np.delete(bounds, j, axis=0)
+        current = scores[j]
+
+    return jnp.asarray(signals), jnp.asarray(bounds), removed
+
+# Signal Update --------------------------------------------------------------------------
+
+def get_log_prob(t, d, B, signals):
+    # Permutation-invariant, so no sorting is needed inside the objective.
+    fs, Qs = unpack_signals(signals, sort=False)
+    m = 2 * fs.shape[0]
+    N = int(2 * t[-1] * B)
+
+    sum_sq_data = jnp.sum(d ** 2)
+    rss = get_stable_rss(t, d, fs, Qs)
+    rss = jnp.maximum(rss, jnp.finfo(d.dtype).eps * sum_sq_data)
+
+    # Bretthorst: [1 - m h^2 / (N d^2)]^((m - N) / 2) = (RSS / sum d^2)^((m - N) / 2)
+    return 0.5 * (m - N) * jnp.log(rss / sum_sq_data)
+
+def get_novelty_function(t, existing):
+    """Return f(signal) = 1 - ||P_existing e||^2 / ||e||^2 for a candidate's (cos, sin) pair.
+
+    Uses analytic cross-Gram entries, so each candidate costs O(s^2) after one
+    O(s^3) factorization. Returns None if there is nothing to compare against, or if the
+    existing Gram matrix cannot be factorized (check disabled for that iteration).
+    """
+    existing = jnp.asarray(existing).reshape(-1, 2)
+
+    if existing.shape[0] == 0:
+        return None
+
+    e_fs, e_Qs = existing[:, 0], existing[:, 1]
+    z_e = -jnp.pi * e_fs / e_Qs + 2j * jnp.pi * e_fs
+    L_e, D_e = get_equilibrated_cholesky(get_gram(t, z_e), NOVELTY_JITTER)
+
+    if not bool(jnp.all(jnp.isfinite(L_e))):
+        print("Warning: existing Gram matrix not factorizable; skipping novelty check.", flush=True)
+        return None
+
+    def novelty(signal):
+        fs_c, Qs_c = unpack_signals(signal, sort=False)
+        z_c = -jnp.pi * fs_c / Qs_c + 2j * jnp.pi * fs_c
+        candidate_norm_sq = jnp.trace(get_gram(t, z_c))
+        X = get_cross_gram(t, z_e, z_c) / D_e[:, None]
+        Y = solve_triangular(L_e, X, lower=True)
+        return 1.0 - jnp.sum(Y ** 2) / candidate_norm_sq
+
+    return novelty
+
+def grid_search(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, batch_size=512, existing=None, min_novelty=0.0):
     f_space = jnp.linspace(f_min, f_max, f_points)
     B = f_max - f_min
 
@@ -91,13 +224,28 @@ def grid_search(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, batch_size
         jax.vmap(lambda signal: get_log_prob(t, d, B, signal))
     )
 
+    novelty_function = None
+    if existing is not None and min_novelty > 0:
+        novelty_function = get_novelty_function(t, existing)
+
+    evaluate_novelty = jax.jit(jax.vmap(novelty_function)) if novelty_function is not None else None
+
     results = []
-    
+    novelties = []
+
     for start in range(0, signal_grid.shape[0], batch_size):
         batch = signal_grid[start:start + batch_size]
         results.append(evaluate_batch(batch))
+        if evaluate_novelty is not None:
+            novelties.append(evaluate_novelty(batch))
 
     log_probs = jnp.concatenate(results)
+
+    # Candidates mostly inside the span of existing signals are not resolvable; mask them.
+    if evaluate_novelty is not None:
+        novelty = jnp.concatenate(novelties)
+        log_probs = jnp.where(novelty >= min_novelty, log_probs, -jnp.inf)
+
     log_prob_space = log_probs.reshape(f_space.size, Q_space.size)
 
     probability_surface = (f_space, Q_space, log_prob_space)
@@ -166,7 +314,7 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
 # Orchestrators ---------------------------------------------------------------------------
 
 def _run_grid_search(args):
-    t, d, task = args
+    t, d, task, existing, min_novelty = args
 
     return grid_search(
         t=t,
@@ -177,9 +325,11 @@ def _run_grid_search(args):
         Q_max=task.Q_max,
         f_points=task.f_points,
         Q_points=task.Q_points,
+        existing=existing,
+        min_novelty=min_novelty,
     )
 
-def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores):
+def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores, min_novelty=0.0):
     f_margin = 1e-6 * (f_max - f_min)
     full_f_space = np.linspace(f_min + f_margin, f_max - f_margin, f_points)
 
@@ -204,7 +354,8 @@ def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_
             )
         )
 
-    args = [(t, d, task) for task in tasks]
+    existing = np.asarray(signals).reshape(-1, 2)
+    args = [(t, d, task, existing, min_novelty) for task in tasks]
 
     ctx = mp.get_context("spawn")
 
@@ -226,6 +377,9 @@ def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_
         Q_space,
         log_prob_space,
     )
+
+    if not bool(jnp.any(jnp.isfinite(log_prob_space))):
+        return None
 
     plot_probability_surface(f"Probability Surface {len(signals)}", path / "diagnostic" / "probability_surface" / f"probability_surface_{len(signals)}.png", probability_surface)
 
@@ -272,23 +426,23 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
     return optimized_checkpoints
 
 def _colony_worker(args):
-    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path = args
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune = args
     n_subbands = len(band_edges) - 1
     f_min = float(band_edges[ind])
     f_max = float(band_edges[ind + 1])
     colony_path = path / f"{round(1000 * f_min, 2)}r{round(1000 * f_max, 2)}mHz_{ind + 1}r{n_subbands}"
 
-    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path)
+    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune)
 
     return ind, np.asarray(signals), np.asarray(bounds)
 
-def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step):
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False):
     n_subbands = len(band_edges) - 1
     n_workers = min(devices, n_subbands)
     devices_per_colony = devices // n_workers
     cores_per_colony = cores // n_workers
 
-    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path) for ind in range(n_subbands)]
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune) for ind in range(n_subbands)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -586,21 +740,12 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         fs_unc = jnp.empty((0,), dtype=d.dtype)
         Qs_unc = jnp.empty((0,), dtype=d.dtype)
         covariance = jnp.empty((0, 0), dtype=d.dtype)
+        vif = jnp.empty((0,), dtype=d.dtype)
     else:
-        ks = jnp.pi * fs / Qs
-        omegas = fs * 2.0 * jnp.pi
-        arg = omegas[:, None] * t[None, :]
-        decay = jnp.exp(-ks[:, None] * t[None, :])
-        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+        z, E = get_basis(t, fs, Qs)
+        G = jnp.concatenate((jnp.real(E), jnp.imag(E)))   # (m, n): [cos * decay; sin * decay]
         g = G @ G.T
         g = 0.5 * (g + g.T)
-
-        eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-        threshold = jnp.sqrt(jnp.finfo(g.dtype).eps) * jnp.maximum(jnp.max(eigenvalues), jnp.finfo(g.dtype).tiny)
-        safe_eigenvalues = jnp.maximum(eigenvalues, threshold)
-        H = (eigenvectors / jnp.sqrt(safe_eigenvalues)).T @ G
-        h = H @ d
-        sum_sq_proj = jnp.sum(h ** 2)
 
         g_norms = jnp.sqrt(jnp.maximum(jnp.diag(g), jnp.finfo(g.dtype).tiny))
         g_normalized = g / jnp.outer(g_norms, g_norms)
@@ -610,50 +755,58 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         min_eigenvalue = jnp.maximum(jnp.min(g_eigenvalues), jnp.finfo(g_eigenvalues.dtype).eps * max_eigenvalue)
         k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
 
+        # Projection via Householder QR (backward stable; no eigendecomposition).
         G_qr = G.T
         U, R = jnp.linalg.qr(G_qr, mode="reduced")
-        residual = d - U @ (U.T @ d)
-        residual_sq = (N / len(d)) * jnp.sum(residual ** 2)
+        Ud = U.T @ d
+        sum_sq_proj = jnp.sum(Ud ** 2)
+        residual = d - U @ Ud
+        rss = jnp.sum(residual ** 2)                    # raw RSS over len(d) samples
+        residual_sq = (N / len(d)) * rss                # effective-N scaling, for BIC only
         diagonal = jnp.abs(jnp.diag(R))
         tolerance = jnp.finfo(G_qr.dtype).eps * max(G_qr.shape) * jnp.max(diagonal)
         full_rank = jnp.all(diagonal > tolerance)
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
 
-        beta = eigenvectors @ (h / jnp.sqrt(safe_eigenvalues))
+        # Amplitudes: G^T beta = U R beta = U U^T d  =>  R beta = U^T d
+        beta = solve_triangular(R, Ud, lower=False)
         cosine_coefficients = beta[:n_signals]
         sine_coefficients = beta[n_signals:]
         amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
         phases = jnp.atan2(cosine_coefficients, sine_coefficients)
 
-        omega_center = jnp.pi * (f_max + f_min)
-        omega_halfwidth = jnp.pi * (f_max - f_min)
-        log_Q_min = jnp.log(Q_min)
-        log_Q_max = jnp.log(Q_max)
-        log_Q_center = 0.5 * (log_Q_max + log_Q_min)
-        log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
+        # Variance inflation factor per basis function: VIF_i = (g^-1)_ii g_ii = ||row_i(R^-1)||^2 g_ii.
+        # Per signal, report the worse of its cos/sin columns. VIF >> 10 means the signal
+        # is largely explained by the others (not resolved).
+        R_inv = solve_triangular(R, jnp.eye(m, dtype=R.dtype), lower=False)
+        vif_basis = jnp.sum(R_inv ** 2, axis=1) * jnp.diag(g)
+        vif = jnp.maximum(vif_basis[:n_signals], vif_basis[n_signals:])
 
-        x_omega = (2.0 * jnp.pi * fs - omega_center) / omega_halfwidth
-        x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
-        theta = jnp.stack((x_omega, x_log_Q), axis=-1).ravel()
+        # Gauss-Newton / variable-projection Fisher matrix for (f, Q), amplitudes profiled out.
+        # Model of signal j: mu_j = Re((a_j - i b_j) exp(z_j t)), so
+        # d mu_j / d theta = Re((a_j - i b_j) t exp(z_j t) dz_j / d theta).
+        dz_df = -jnp.pi / Qs + 2j * jnp.pi
+        dz_dQ = jnp.pi * fs / Qs ** 2
+        weights = (cosine_coefficients - 1j * sine_coefficients)[:, None] * t[None, :] * E
+        dmu_df = jnp.real(weights * dz_df[:, None])
+        dmu_dQ = jnp.real(weights * dz_dQ[:, None])
+        J = jnp.stack((dmu_df, dmu_dQ), axis=1).reshape(m, -1).T   # (n, m), columns [f1, Q1, f2, Q2, ...]
+        J_perp = J - U @ (U.T @ J)                                   # remove the amplitude subspace
+        fisher = J_perp.T @ J_perp
+        fisher = 0.5 * (fisher + fisher.T)
 
-        def objective(theta):
-            theta_2d = theta.reshape(-1, 2)
-            omegas_t = omega_center + omega_halfwidth * theta_2d[:, 0]
-            log_Qs_t = log_Q_center + log_Q_halfwidth * theta_2d[:, 1]
-            signals_t = jnp.stack((omegas_t / (2.0 * jnp.pi), jnp.exp(log_Qs_t)), axis=-1)
-            return get_mean_sq_proj(t, d, B, signals_t)
+        # Invert in Jacobi-scaled coordinates. Fisher is PSD by construction, so a tiny
+        # eigenvalue means a genuinely unidentifiable direction, not an off-mode artefact.
+        fisher_scale = jnp.sqrt(jnp.maximum(jnp.diag(fisher), jnp.finfo(fisher.dtype).tiny))
+        fisher_scaled = fisher / jnp.outer(fisher_scale, fisher_scale)
+        f_eigenvalues, f_eigenvectors = jnp.linalg.eigh(fisher_scaled)
+        f_floor = jnp.finfo(fisher.dtype).eps * jnp.maximum(jnp.max(f_eigenvalues), jnp.finfo(fisher.dtype).tiny)
+        safe_f_eigenvalues = jnp.maximum(f_eigenvalues, f_floor)
+        covariance_scaled = (f_eigenvectors / safe_f_eigenvalues[None, :]) @ f_eigenvectors.T
 
-        curvature = (-m / 2.0) * jax.hessian(objective)(theta)
-        curvature = 0.5 * (curvature + curvature.T)
-        b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(curvature)
-        threshold_b = jnp.sqrt(jnp.finfo(curvature.dtype).eps) * jnp.maximum(jnp.max(jnp.abs(b_eigenvalues)), jnp.finfo(curvature.dtype).tiny)
-        safe_b_eigenvalues = jnp.maximum(b_eigenvalues, threshold_b)
-        covariance_x = (residual_sq / safe_dof) * ((b_eigenvectors / safe_b_eigenvalues[None, :]) @ b_eigenvectors.T)
-
-        f_scale = omega_halfwidth / (2.0 * jnp.pi)
-        jacobian_diagonal = jnp.stack((jnp.full_like(fs, f_scale), Qs * log_Q_halfwidth), axis=-1).ravel()
-        jacobian = jnp.diag(jacobian_diagonal)
-        covariance = jacobian @ covariance_x @ jacobian.T
+        # Posterior-consistent noise level: raw RSS over effective degrees of freedom N = 2BT.
+        posterior_variance = rss / safe_dof
+        covariance = posterior_variance * covariance_scaled / jnp.outer(fisher_scale, fisher_scale)
         unc = jnp.sqrt(jnp.maximum(jnp.diag(covariance), 0.0))
         fs_unc = unc[::2]
         Qs_unc = unc[1::2]
@@ -671,7 +824,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     valid = (N > m + 2) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
     glob_ll = jnp.where(valid, score, -jnp.inf)
 
-    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
+    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif
 
 # Plotting --------------------------------------------------------------------------------
 
@@ -694,22 +847,23 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
             float(k2),
         ])
 
-def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases):
+def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif):
     diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / f"signals_iteration_{len(fs)}.csv"
 
     with csv_path.open("w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["Frequency", "Frequency Uncertainty", "Quality Factor", "Quality Factor Uncertainty", "Amplitude", "Phase"])
-        writer.writerows(zip(fs, fs_unc, Qs, Qs_unc, amplitudes, phases))
+        writer.writerow(["Frequency", "Frequency Uncertainty", "Quality Factor", "Quality Factor Uncertainty", "Amplitude", "Phase", "VIF"])
+        writer.writerows(zip(fs, fs_unc, Qs, Qs_unc, amplitudes, phases, vif))
 
 def plot_probability_surface(title, path, probability_surface):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     f_space, Q_space, log_prob_space = probability_surface
-    log_prob_space = log_prob_space.T
+    # Unresolvable (novelty-masked) candidates are -inf; leave them blank.
+    log_prob_space = np.ma.masked_invalid(np.asarray(log_prob_space).T)
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
@@ -1021,7 +1175,7 @@ def filter_data(t, d, f_min, f_max, order=8):
 
 # Run -------------------------------------------------------------------------------------
 
-def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path):
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False):
     t, d = filter_data(t, d, f_min, f_max)
 
     B = f_max - f_min
@@ -1049,8 +1203,12 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             residual = d - model
 
         grid_start = perf_counter()
-        signal = grid_search_orchestrator(path, signals, t, residual, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores)
+        signal = grid_search_orchestrator(path, signals, t, residual, f_min, f_max, Q_min, Q_max, f_points, Q_points, cores, min_novelty)
         grid_elapsed = perf_counter() - grid_start
+
+        if signal is None:
+            print(f"No resolvable candidate (novelty >= {min_novelty}) left; stopping greedy search at {len(signals)} signals.", flush=True)
+            break
 
         signal_bounds = get_bounds(signal, f_min, f_max, Q_min, Q_max, f_margin, log_Q_margin)
 
@@ -1068,13 +1226,13 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if diagnostics == "full":
             checkpoints[iteration] = (signals, bounds)
 
-            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
             if len(signals) % signal_step == 0:
                 thumbprints.append((len(signals), glob_ll))
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-            save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+            save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
             plot_time_series("Time Series", path / "diagnostic" / "time_series" /f"time_series_{len(signals)}.png", t, d, signals)
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
             plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
@@ -1083,11 +1241,11 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             checkpoints[iteration] = (signals, bounds)
 
             if len(signals) % signal_step == 0:
-                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
                 thumbprints.append((len(signals), glob_ll))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
-                save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+                save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
                 plot_time_series("Time Series", path / "diagnostic" / "time_series" / f"time_series_{len(signals)}.png", t, d, signals)
                 plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
                 plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
@@ -1100,7 +1258,19 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     final_start = perf_counter()
     checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
+
+    if not checkpoints:
+        print("Colony found no resolvable signals.", flush=True)
+        return jnp.empty((0, 2)), jnp.empty((0, 4))
+
     checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
+    last_count = max(checkpoint_by_count)
+
+    # If the greedy search stopped early (or depth is not a multiple of signal_step),
+    # score the last checkpoint so the bisection has a right-hand anchor.
+    if last_count not in {int(count) for count, _ in thumbprints}:
+        last_glob_ll = get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max)[1]
+        thumbprints.append((last_count, last_glob_ll))
 
     thumbprints = np.asarray(thumbprints, dtype=float)
 
@@ -1115,18 +1285,18 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         right_counts = [count for count in measured_counts if count > best_count]
 
         left_limit = left_counts[-1] if left_counts else 1
-        right_limit = right_counts[0] if right_counts else depth
+        right_limit = right_counts[0] if right_counts else last_count
 
         candidates = []
 
         if best_count - left_limit > 1:
             candidate = (left_limit + best_count) // 2
-            if candidate not in glob_lls:
+            if candidate not in glob_lls and candidate in checkpoint_by_count:
                 candidates.append(candidate)
 
         if right_limit - best_count > 1:
             candidate = (best_count + right_limit) // 2
-            if candidate not in glob_lls:
+            if candidate not in glob_lls and candidate in checkpoint_by_count:
                 candidates.append(candidate)
 
         candidates = sorted(set(candidates))
@@ -1147,10 +1317,16 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     best_count = max(glob_lls, key=glob_lls.get)
     signals, bounds = refined_checkpoints[best_count]
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    if prune:
+        signals, bounds, removed = prune_signals(t, d, B, signals, bounds)
+        print(f"Pruning removed {len(removed)} signal(s); {len(signals)} remain.", flush=True)
+        for f_removed, Q_removed in removed:
+            print(f"  removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}", flush=True)
+
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
-    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
     plot_time_series("Time Series", path / "result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
@@ -1164,7 +1340,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     return signals, bounds
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False):
     start_time = perf_counter()
     t_raw, d_raw = load_data(type, event, network, station)
     t, d = filter_data(t_raw, d_raw, f_min, f_max)
@@ -1176,21 +1352,29 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step)
+    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune)
 
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     signals = jnp.asarray(signals).reshape(-1, 2)
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
     save_iteration_diagnostics(path / "marginal_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
-    save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
     plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
     plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "marginal_result" / f"covariance_{len(signals)}.png", signals, covariance)
+
+    # Prune the merged set on the full-band data before the joint fit. This also removes
+    # signals duplicated across neighbouring subbands (a duplicate adds ~nothing to the fit).
+    if prune:
+        signals, bounds, removed = prune_signals(t, d, B, signals, bounds)
+        print(f"Merged-set pruning removed {len(removed)} signal(s); {len(signals)} remain.", flush=True)
+        for f_removed, Q_removed in removed:
+            print(f"  removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}", flush=True)
 
     # Force device values to be available before reporting/timing.
     s = np.asarray(jax.device_get(signals))
@@ -1231,11 +1415,11 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals = nuts_result
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
     save_iteration_diagnostics(path / "joint_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
-    save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases)
+    save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
     plot_time_series("Time Series", path / "joint_result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
@@ -1287,4 +1471,8 @@ if __name__ == "__main__":
         subbands=config["subbands"],
 
         path=path,
+
+        min_novelty=config.get("min_novelty", 0.1),
+        prune=config.get("prune", True),
     )
+    
