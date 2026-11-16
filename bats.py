@@ -646,8 +646,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         curvature = (-m / 2.0) * jax.hessian(objective)(theta)
         curvature = 0.5 * (curvature + curvature.T)
         b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(curvature)
-        threshold_b = jnp.sqrt(jnp.finfo(curvature.dtype).eps) * jnp.maximum(jnp.max(b_eigenvalues), jnp.finfo(curvature.dtype).tiny)
-        curvature_valid = jnp.all(b_eigenvalues > threshold_b)
+        threshold_b = jnp.sqrt(jnp.finfo(curvature.dtype).eps) * jnp.maximum(jnp.max(jnp.abs(b_eigenvalues)), jnp.finfo(curvature.dtype).tiny)
         safe_b_eigenvalues = jnp.maximum(b_eigenvalues, threshold_b)
         covariance_x = (residual_sq / safe_dof) * ((b_eigenvectors / safe_b_eigenvalues[None, :]) @ b_eigenvectors.T)
 
@@ -655,7 +654,6 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
         jacobian_diagonal = jnp.stack((jnp.full_like(fs, f_scale), Qs * log_Q_halfwidth), axis=-1).ravel()
         jacobian = jnp.diag(jacobian_diagonal)
         covariance = jacobian @ covariance_x @ jacobian.T
-        covariance = jnp.where(curvature_valid, covariance, jnp.full_like(covariance, jnp.nan))
         unc = jnp.sqrt(jnp.maximum(jnp.diag(covariance), 0.0))
         fs_unc = unc[::2]
         Qs_unc = unc[1::2]
