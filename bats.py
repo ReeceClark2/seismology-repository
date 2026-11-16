@@ -115,49 +115,53 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
  
 def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
     f_init, Q_init = unpack_signals(signals, sort=False)
-
     bounds = jnp.asarray(bounds).reshape(-1, 4)
-
     fs_min = bounds[:, 0].astype(f_init.dtype)
     fs_max = bounds[:, 1].astype(f_init.dtype)
     Qs_min = bounds[:, 2].astype(Q_init.dtype)
     Qs_max = bounds[:, 3].astype(Q_init.dtype)
-
-    log_Q_init = jnp.log(Q_init)
-
-    init_strategy = init_to_value(values={"fs": f_init, "log_Qs": log_Q_init})
+    init_strategy = init_to_value(values={"fs": f_init, "log_Qs": jnp.log(Q_init)})
 
     if rng_key_value is None:
         rng_key_value = random.randint(1, 10_000)
 
-    rng_key = jax.random.PRNGKey(int(rng_key_value))
-    warmup_key, sample_key = jax.random.split(rng_key)
-
-    kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=5)
+    warmup_key, _ = jax.random.split(jax.random.PRNGKey(int(rng_key_value)))
+    kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=10)
     mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
-    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy",))
+    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max)
+    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy", "diverging"))
 
-    warmup_samples = mcmc.get_samples(group_by_chain=True)
-    warmup_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+    samples = mcmc.get_samples(group_by_chain=True)
+    extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+    fs = samples["fs"]
+    log_Qs = samples["log_Qs"]
 
-    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy",))
+    order = jnp.argsort(fs, axis=-1)
+    fs = jnp.take_along_axis(fs, order, axis=-1)
+    log_Qs = jnp.take_along_axis(log_Qs, order, axis=-1)
+    draws = jnp.stack((fs, log_Qs), axis=-1).reshape(-1, f_init.shape[0], 2)
+    orders = order.reshape(-1, f_init.shape[0])
 
-    sample_samples = mcmc.get_samples(group_by_chain=True)
-    sample_extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+    valid = jnp.isfinite(extra_fields["potential_energy"]) & ~extra_fields["diverging"]
+    valid = valid.reshape(-1)
 
-    samples = {name: jnp.concatenate([warmup_samples[name], sample_samples[name]], axis=1) for name in sample_samples}
-    extra_fields = {name: jnp.concatenate([warmup_extra_fields[name], sample_extra_fields[name]], axis=1) for name in sample_extra_fields}
+    if not bool(jnp.any(valid)):
+        raise ValueError("NUTS produced no finite, non-divergent post-warmup draws.")
 
-    potential_energy = extra_fields["potential_energy"]
+    draws = draws[valid]
+    orders = orders[valid]
+    center = jnp.median(draws, axis=0)
+    scale = jnp.std(draws, axis=0)
+    scale = jnp.where(scale > 0, scale, 1.0)
+    distances = jnp.sum(((draws - center) / scale) ** 2, axis=(1, 2))
+    selected_index = jnp.argmin(distances)
+    selected = draws[selected_index]
+    selected_order = orders[selected_index]
 
-    best_flat_index = jnp.argmin(potential_energy.ravel())
-    chain_index, draw_index = jnp.unravel_index(best_flat_index, potential_energy.shape)
+    returned_signals = jnp.stack((selected[:, 0], jnp.exp(selected[:, 1])), axis=-1)
+    returned_bounds = bounds[selected_order]
 
-    best_fs = samples["fs"][chain_index, draw_index]
-    best_Qs = jnp.exp(samples["log_Qs"][chain_index, draw_index])
-
-    signals = jnp.stack((best_fs, best_Qs), axis=-1)
-    return signals
+    return returned_signals, returned_bounds
 
 # Orchestrators ---------------------------------------------------------------------------
 
@@ -237,7 +241,7 @@ def _nuts_worker(args):
     checkpoint, t, d, B, warmup, sample, cores_per_worker, seed = args
     signals, bounds = checkpoint
 
-    optimized_signals = nuts(
+    optimized_signals, bounds = nuts(
         t=t,
         d=d,
         B=B,
@@ -563,110 +567,110 @@ def get_uncertainties(t, d, B, signals):
 
 def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
-    ks = jnp.pi * fs / Qs
-
-    omegas = fs * 2.0 * jnp.pi
-
     n_signals = fs.shape[0]
-    r = n_signals * 2
-    m = n_signals * 2
+    m = 2 * n_signals
     N = int(2 * t[-1] * B)
-
-    arg = omegas[:, None] * t[None, :]
-    decay = jnp.exp(-ks[:, None] * t[None, :])
-
-    G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
-    g = G @ G.T
-    g = 0.5 * (g + g.T)
-
-    eigenvalues, eigenvectors = jnp.linalg.eigh(g)
-    threshold = jnp.finfo(g.dtype).eps ** 0.5 * jnp.max(eigenvalues)
-    eigenvalues = jnp.where(eigenvalues > threshold, eigenvalues, threshold)
-    H = (eigenvectors / jnp.sqrt(eigenvalues)).T @ G
-    h = H @ d
-
     sum_sq_data = jnp.sum(d ** 2)
-    sum_sq_proj = jnp.sum(h ** 2)
-
-    noise_variance = (1 / (N - m - 2)) * (sum_sq_data - sum_sq_proj)
-    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
-
-    snr = ((m / N) * (1 + ((1 / m) * sum_sq_proj / noise_variance))) ** (1 / 2)
-
-    g_norms = jnp.sqrt(jnp.diag(g))
-    g_normalized = g / jnp.outer(g_norms, g_norms)
-    g_eigenvalues = jnp.linalg.eigvalsh(g_normalized)
-
-    max_eigenvalue = jnp.max(g_eigenvalues)
-    min_eigenvalue = jnp.maximum(jnp.min(g_eigenvalues), jnp.finfo(g_eigenvalues.dtype).eps * max_eigenvalue)
-    k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
-
-    ratio = sum_sq_proj / sum_sq_data
-    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
-
-    omega_center = jnp.pi * (f_max + f_min)
-    omega_halfwidth = jnp.pi * (f_max - f_min)
-
-    log_Q_min = jnp.log(Q_min)
-    log_Q_max = jnp.log(Q_max)
-    log_Q_center = 0.5 * (log_Q_max + log_Q_min)
-    log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
-
-    x_omega = (omegas - omega_center) / omega_halfwidth
-    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
-
-    theta_fs = fs
-    theta_log_Qs = jnp.log(Qs)
-    theta = jnp.stack([theta_fs, theta_log_Qs], axis=-1).ravel()
-
-    def objective(theta):
-        theta_2d = theta.reshape(-1, 2)
-        signals_t = jnp.stack([theta_2d[:, 0], jnp.exp(theta_2d[:, 1])], axis=-1)
-        return get_mean_sq_proj(t, d, B, signals_t)
-
-    b = (-m / 2) * jax.hessian(objective)(theta)
-    b = 0.5 * (b + b.T)
-
-    b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(b)
-    threshold_b = jnp.finfo(b.dtype).eps ** 0.5 * jnp.max(b_eigenvalues)
-    safe_b_eigenvalues = jnp.where(b_eigenvalues > threshold_b, b_eigenvalues, threshold_b)
-    covariance = noise_variance * ((b_eigenvectors / safe_b_eigenvalues[None, :]) @ b_eigenvectors.T)
-    unc = jnp.sqrt(jnp.diag(covariance))
-
-    fs_unc = unc[::2]
-    Qs_unc = unc[1::2]
-
-    beta = eigenvectors @ (h / jnp.sqrt(eigenvalues))
-    cosine_coefficients = beta[:len(signals)]
-    sine_coefficients = beta[len(signals):]
-    amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
-    phases = jnp.atan2(cosine_coefficients, sine_coefficients)
+    safe_sum_sq_data = jnp.maximum(sum_sq_data, jnp.finfo(d.dtype).tiny)
+    dof = N - m - 2
+    safe_dof = jnp.maximum(dof, 1)
 
     if n_signals == 0:
-        residual_sq = (N / len(d)) * jnp.sum(d ** 2)
+        sum_sq_proj = jnp.asarray(0.0, dtype=d.dtype)
+        residual_sq = (N / len(d)) * sum_sq_data
         full_rank = True
         in_bounds = True
+        k2 = jnp.asarray(1.0, dtype=d.dtype)
+        amplitudes = jnp.empty((0,), dtype=d.dtype)
+        phases = jnp.empty((0,), dtype=d.dtype)
+        fs_unc = jnp.empty((0,), dtype=d.dtype)
+        Qs_unc = jnp.empty((0,), dtype=d.dtype)
+        covariance = jnp.empty((0, 0), dtype=d.dtype)
     else:
         ks = jnp.pi * fs / Qs
-        arg = (2.0 * jnp.pi * fs)[:, None] * t[None, :]
+        omegas = fs * 2.0 * jnp.pi
+        arg = omegas[:, None] * t[None, :]
         decay = jnp.exp(-ks[:, None] * t[None, :])
-        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay)).T
+        G = jnp.vstack((jnp.cos(arg) * decay, jnp.sin(arg) * decay))
+        g = G @ G.T
+        g = 0.5 * (g + g.T)
 
-        U, R = jnp.linalg.qr(G, mode="reduced")
+        eigenvalues, eigenvectors = jnp.linalg.eigh(g)
+        threshold = jnp.sqrt(jnp.finfo(g.dtype).eps) * jnp.maximum(jnp.max(eigenvalues), jnp.finfo(g.dtype).tiny)
+        safe_eigenvalues = jnp.maximum(eigenvalues, threshold)
+        H = (eigenvectors / jnp.sqrt(safe_eigenvalues)).T @ G
+        h = H @ d
+        sum_sq_proj = jnp.sum(h ** 2)
+
+        g_norms = jnp.sqrt(jnp.maximum(jnp.diag(g), jnp.finfo(g.dtype).tiny))
+        g_normalized = g / jnp.outer(g_norms, g_norms)
+        g_normalized = 0.5 * (g_normalized + g_normalized.T)
+        g_eigenvalues = jnp.linalg.eigvalsh(g_normalized)
+        max_eigenvalue = jnp.maximum(jnp.max(g_eigenvalues), jnp.finfo(g_eigenvalues.dtype).tiny)
+        min_eigenvalue = jnp.maximum(jnp.min(g_eigenvalues), jnp.finfo(g_eigenvalues.dtype).eps * max_eigenvalue)
+        k2 = jnp.sqrt(max_eigenvalue / min_eigenvalue)
+
+        G_qr = G.T
+        U, R = jnp.linalg.qr(G_qr, mode="reduced")
         residual = d - U @ (U.T @ d)
         residual_sq = (N / len(d)) * jnp.sum(residual ** 2)
-
         diagonal = jnp.abs(jnp.diag(R))
-        tolerance = jnp.finfo(G.dtype).eps * max(G.shape) * jnp.max(diagonal)
+        tolerance = jnp.finfo(G_qr.dtype).eps * max(G_qr.shape) * jnp.max(diagonal)
         full_rank = jnp.all(diagonal > tolerance)
         in_bounds = jnp.all((fs >= f_min) & (fs <= f_max) & (Qs >= Q_min) & (Qs <= Q_max))
 
-    noise_variance = residual_sq / (N - m - 2.0)
-    noise_variance = jnp.maximum(noise_variance, jnp.finfo(h.dtype).eps * sum_sq_data / (N - m - 2))
+        beta = eigenvectors @ (h / jnp.sqrt(safe_eigenvalues))
+        cosine_coefficients = beta[:n_signals]
+        sine_coefficients = beta[n_signals:]
+        amplitudes = jnp.sqrt(cosine_coefficients ** 2 + sine_coefficients ** 2)
+        phases = jnp.atan2(cosine_coefficients, sine_coefficients)
+
+        omega_center = jnp.pi * (f_max + f_min)
+        omega_halfwidth = jnp.pi * (f_max - f_min)
+        log_Q_min = jnp.log(Q_min)
+        log_Q_max = jnp.log(Q_max)
+        log_Q_center = 0.5 * (log_Q_max + log_Q_min)
+        log_Q_halfwidth = 0.5 * (log_Q_max - log_Q_min)
+
+        x_omega = (2.0 * jnp.pi * fs - omega_center) / omega_halfwidth
+        x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
+        theta = jnp.stack((x_omega, x_log_Q), axis=-1).ravel()
+
+        def objective(theta):
+            theta_2d = theta.reshape(-1, 2)
+            omegas_t = omega_center + omega_halfwidth * theta_2d[:, 0]
+            log_Qs_t = log_Q_center + log_Q_halfwidth * theta_2d[:, 1]
+            signals_t = jnp.stack((omegas_t / (2.0 * jnp.pi), jnp.exp(log_Qs_t)), axis=-1)
+            return get_mean_sq_proj(t, d, B, signals_t)
+
+        curvature = (-m / 2.0) * jax.hessian(objective)(theta)
+        curvature = 0.5 * (curvature + curvature.T)
+        b_eigenvalues, b_eigenvectors = jnp.linalg.eigh(curvature)
+        threshold_b = jnp.sqrt(jnp.finfo(curvature.dtype).eps) * jnp.maximum(jnp.max(b_eigenvalues), jnp.finfo(curvature.dtype).tiny)
+        curvature_valid = jnp.all(b_eigenvalues > threshold_b)
+        safe_b_eigenvalues = jnp.maximum(b_eigenvalues, threshold_b)
+        covariance_x = (residual_sq / safe_dof) * ((b_eigenvectors / safe_b_eigenvalues[None, :]) @ b_eigenvectors.T)
+
+        f_scale = omega_halfwidth / (2.0 * jnp.pi)
+        jacobian_diagonal = jnp.stack((jnp.full_like(fs, f_scale), Qs * log_Q_halfwidth), axis=-1).ravel()
+        jacobian = jnp.diag(jacobian_diagonal)
+        covariance = jacobian @ covariance_x @ jacobian.T
+        covariance = jnp.where(curvature_valid, covariance, jnp.full_like(covariance, jnp.nan))
+        unc = jnp.sqrt(jnp.maximum(jnp.diag(covariance), 0.0))
+        fs_unc = unc[::2]
+        Qs_unc = unc[1::2]
+
+    noise_variance = residual_sq / safe_dof
+    noise_floor = jnp.finfo(d.dtype).eps * safe_sum_sq_data / safe_dof
+    noise_variance = jnp.maximum(noise_variance, noise_floor)
+
+    ratio = jnp.clip(sum_sq_proj / safe_sum_sq_data, 0.0, 1.0 - jnp.finfo(d.dtype).eps)
+    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
+    snr = jnp.where(m > 0, jnp.sqrt((m / jnp.maximum(N, 1)) * (1.0 + sum_sq_proj / (m * noise_variance))), 0.0)
 
     log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
-    score = log_likelihood - 2.0 * n_signals * jnp.log(N)
-    valid = (N > m + 2.0) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
+    score = log_likelihood - 2.0 * n_signals * jnp.log(jnp.maximum(N, 1))
+    valid = (N > m + 2) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
     glob_ll = jnp.where(valid, score, -jnp.inf)
 
     return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance
@@ -1060,7 +1064,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
         nuts_start = perf_counter()
         if len(signals) % signal_step == 0:
-            signals = nuts(t, d, B, signals, bounds, warmup, sample, devices)
+            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices)
         nuts_elapsed = perf_counter() - nuts_start
 
         if diagnostics == "full":
@@ -1213,7 +1217,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"Starting NUTS at t={perf_counter() - start_time:.2f}s", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result = nuts(t, d, B, signals, bounds, 50, 100, 1)
+        nuts_result, bounds = nuts(t, d, B, signals, bounds, 50, 100, 1)
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
