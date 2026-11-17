@@ -25,3 +25,8 @@ subbands = 6
 
 min_novelty = 0.1
 prune = true
+
+subband_padding = 0.25
+
+ringing_db = -60.0
+max_trim_hours = 10
