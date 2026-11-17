@@ -25,7 +25,9 @@ import numpyro
 from jax.flatten_util import ravel_pytree
 from jax.scipy.linalg import cho_factor, cho_solve, solve_triangular
 from matplotlib.patches import Ellipse
+from numpyro.diagnostics import effective_sample_size, split_gelman_rubin
 from numpyro.infer import MCMC, NUTS, init_to_value
+from scipy.optimize import minimize
 from scipy.signal import butter, sosfiltfilt
 
 matplotlib.use("Agg", force=True)
@@ -261,7 +263,138 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
 
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
-def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
+MAP_BOUND_TOLERANCE = 1e-3
+MAX_TREE_DEPTH = 10
+
+def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=100, gtol=1e-6):
+    """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
+
+    The NUTS prior is uniform in (f, log Q) on each signal's box, so the MAP in those
+    coordinates is argmax get_log_prob. The box is removed by x = lower + width * sigmoid(u);
+    no Jacobian term is added, so the optimum is the MAP in (f, log Q), not in u.
+
+    Second-order trust-region Newton with exact curvature:
+      - "trust-krylov" (default): exact Hessian-vector products (forward-over-reverse),
+        Lanczos/GLTR subproblem. Handles indefinite curvature away from the mode and needs
+        memory of only a few gradients, independent of the number of parameters.
+      - "trust-exact": dense exact Hessian assembled column by column from HVPs
+        (sequential lax.map, so memory stays bounded). O(2s) HVPs per iteration; better
+        for small s.
+
+    The result is accepted only if it does not lower the log probability.
+    """
+    fs0, Qs0 = unpack_signals(signals, sort=False)
+    bounds = jnp.asarray(bounds).reshape(-1, 4)
+    s = fs0.shape[0]
+
+    lower = jnp.concatenate((bounds[:, 0], jnp.log(bounds[:, 2])))
+    upper = jnp.concatenate((bounds[:, 1], jnp.log(bounds[:, 3])))
+    width = upper - lower
+    x0 = jnp.concatenate((fs0, jnp.log(Qs0)))
+    p0 = jnp.clip((x0 - lower) / width, MAP_BOUND_TOLERANCE, 1.0 - MAP_BOUND_TOLERANCE)
+    u0 = jnp.log(p0) - jnp.log1p(-p0)
+
+    def to_signals(u):
+        x = lower + width * jax.nn.sigmoid(u)
+        return jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1)
+
+    def negative_log_prob(u):
+        return -get_log_prob(t, d, B, to_signals(u))
+
+    gradient = jax.grad(negative_log_prob)
+    value_and_grad = jax.jit(jax.value_and_grad(negative_log_prob))
+
+    def hvp_raw(u, v):
+        return jax.jvp(gradient, (u,), (v,))[1]
+
+    hvp = jax.jit(hvp_raw)
+
+    def fun(u):
+        value, grad = value_and_grad(jnp.asarray(u))
+        value = float(value)
+        if not np.isfinite(value):
+            # Non-finite trial points (e.g. Cholesky failure) are rejected by the trust region.
+            return np.inf, np.zeros_like(u)
+        return value, np.asarray(grad, dtype=np.float64)
+
+    start_value = fun(np.asarray(u0, dtype=np.float64))[0]
+    kwargs = {}
+
+    if method == "trust-exact":
+        eye = jnp.eye(2 * s, dtype=u0.dtype)
+        dense_hessian = jax.jit(lambda u: jax.lax.map(lambda v: hvp_raw(u, v), eye))
+
+        def hess(u):
+            H = np.asarray(dense_hessian(jnp.asarray(u)), dtype=np.float64)
+            return 0.5 * (H + H.T)
+
+        kwargs["hess"] = hess
+    else:
+        kwargs["hessp"] = lambda u, v: np.asarray(hvp(jnp.asarray(u), jnp.asarray(v)), dtype=np.float64)
+
+    try:
+        result = minimize(fun, np.asarray(u0, dtype=np.float64), jac=True, method=method, options={"maxiter": max_iterations, "gtol": gtol}, **kwargs)
+    except Exception as error:
+        print(f"MAP refinement failed ({error}); keeping the starting point.", flush=True)
+        return jnp.stack((fs0, Qs0), axis=-1), {"accepted": False, "improvement": 0.0, "iterations": 0, "message": str(error), "at_bound": 0}
+
+    accepted = bool(np.isfinite(result.fun) and result.fun <= start_value)
+    u_final = jnp.asarray(result.x) if accepted else u0
+    p_final = jax.nn.sigmoid(u_final)
+    near_bound = (p_final < MAP_BOUND_TOLERANCE) | (p_final > 1.0 - MAP_BOUND_TOLERANCE)
+    at_bound = int(jnp.sum(near_bound[:s] | near_bound[s:]))
+
+    info = {
+        "accepted": accepted,
+        "improvement": float(start_value - result.fun) if accepted else 0.0,
+        "iterations": int(result.nit),
+        "message": str(result.message),
+        "at_bound": at_bound,
+    }
+
+    return to_signals(u_final), info
+
+def get_nuts_diagnostics(fs, log_Qs, extra_fields, max_tree_depth=MAX_TREE_DEPTH):
+    """Sampler diagnostics on f-sorted draws, arrays shaped (chains, draws, s).
+
+    Sorting each draw by f is a relabelling that removes most label switching, so per-index
+    ESS and split R-hat are meaningful except where neighbouring signals genuinely swap.
+    """
+    fs = np.asarray(fs)
+    log_Qs = np.asarray(log_Qs)
+    Qs = np.exp(log_Qs)
+    n_chains, n_draws, n_signals = fs.shape
+
+    diverging = np.asarray(extra_fields["diverging"])
+    num_steps = np.asarray(extra_fields["num_steps"])
+    accept_prob = np.asarray(extra_fields["accept_prob"])
+
+    def ess(x):
+        return np.asarray(effective_sample_size(x)) if n_draws >= 2 else np.full(n_signals, np.nan)
+
+    def rhat(x):
+        return np.asarray(split_gelman_rubin(x)) if n_draws >= 4 else np.full(n_signals, np.nan)
+
+    ddof = 1 if n_chains * n_draws > 1 else 0
+
+    return {
+        "chains": n_chains,
+        "draws_per_chain": n_draws,
+        "divergent": int(np.sum(diverging)),
+        "divergent_fraction": float(np.mean(diverging)),
+        "max_tree_depth_fraction": float(np.mean(num_steps >= 2 ** max_tree_depth - 1)),
+        "mean_accept_prob": float(np.mean(accept_prob)),
+        "f_mean": fs.mean(axis=(0, 1)),
+        "f_sd": fs.std(axis=(0, 1), ddof=ddof),
+        "Q_mean": Qs.mean(axis=(0, 1)),
+        "Q_sd": Qs.std(axis=(0, 1), ddof=ddof),
+        "ess_f": ess(fs),
+        "ess_log_Q": ess(log_Qs),
+        "rhat_f": rhat(fs),
+        "rhat_log_Q": rhat(log_Qs),
+    }
+
+def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False):
     f_init, Q_init = unpack_signals(signals, sort=False)
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     fs_min = bounds[:, 0].astype(f_init.dtype)
@@ -274,10 +407,10 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
         rng_key_value = random.randint(1, 10_000)
 
     warmup_key, _ = jax.random.split(jax.random.PRNGKey(int(rng_key_value)))
-    kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=10)
+    kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=MAX_TREE_DEPTH)
     mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
     mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max)
-    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy", "diverging"))
+    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy", "diverging", "accept_prob", "num_steps"))
 
     samples = mcmc.get_samples(group_by_chain=True)
     extra_fields = mcmc.get_extra_fields(group_by_chain=True)
@@ -298,16 +431,33 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None):
 
     draws = draws[valid]
     orders = orders[valid]
-    center = jnp.median(draws, axis=0)
-    scale = jnp.std(draws, axis=0)
-    scale = jnp.where(scale > 0, scale, 1.0)
-    distances = jnp.sum(((draws - center) / scale) ** 2, axis=(1, 2))
-    selected_index = jnp.argmin(distances)
+
+    # Start from the draw with the highest log probability (closest to the mode). The NUTS
+    # potential energy includes the unconstraining Jacobian, so get_log_prob is evaluated
+    # directly; lax.map keeps memory at one evaluation at a time.
+    candidate_signals = jnp.stack((draws[..., 0], jnp.exp(draws[..., 1])), axis=-1)
+    draw_log_probs = jax.lax.map(lambda candidate: get_log_prob(t, d, B, candidate), candidate_signals)
+    draw_log_probs = jnp.where(jnp.isfinite(draw_log_probs), draw_log_probs, -jnp.inf)
+    selected_index = jnp.argmax(draw_log_probs)
     selected = draws[selected_index]
     selected_order = orders[selected_index]
 
     returned_signals = jnp.stack((selected[:, 0], jnp.exp(selected[:, 1])), axis=-1)
     returned_bounds = bounds[selected_order]
+
+    if refine:
+        returned_signals, map_info = map_refine(t, d, B, returned_signals, returned_bounds)
+        print(
+            f"MAP refinement ({len(returned_signals)} signals): accepted={map_info['accepted']}, "
+            f"+{map_info['improvement']:.3f} nats, {map_info['iterations']} iterations, "
+            f"{map_info['at_bound']} signal(s) at a box bound; {map_info['message']}",
+            flush=True,
+        )
+
+    if return_diagnostics:
+        # fs and log_Qs are (chains, draws, s), each draw already sorted by f.
+        diagnostics = get_nuts_diagnostics(fs, log_Qs, extra_fields)
+        return returned_signals, returned_bounds, diagnostics
 
     return returned_signals, returned_bounds
 
@@ -846,6 +996,60 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
             float(glob_ll),
             float(k2),
         ])
+
+def save_nuts_diagnostics(path, diagnostics, fs_unc, Qs_unc):
+    """Write sampler summary and per-signal posterior diagnostics.
+
+    Rows are ordered by posterior-sorted frequency; fs_unc/Qs_unc (Fisher, at the MAP) are
+    also f-sorted, so rows line up unless the MAP reorders neighbouring signals.
+    """
+    diagnostic_path = Path(path)
+    diagnostic_path.mkdir(parents=True, exist_ok=True)
+
+    summary_keys = ["chains", "draws_per_chain", "divergent", "divergent_fraction", "max_tree_depth_fraction", "mean_accept_prob"]
+
+    with (diagnostic_path / "nuts_summary.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Quantity", "Value"])
+        writer.writerows((key, diagnostics[key]) for key in summary_keys)
+
+    fs_unc = np.asarray(fs_unc)
+    Qs_unc = np.asarray(Qs_unc)
+    n_signals = len(diagnostics["f_mean"])
+
+    if fs_unc.shape[0] != n_signals:
+        fs_unc = np.full(n_signals, np.nan)
+        Qs_unc = np.full(n_signals, np.nan)
+
+    with (diagnostic_path / "nuts_signals.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "Posterior Frequency Mean", "Posterior Frequency SD", "Fisher Frequency SD", "ESS Frequency", "R-hat Frequency",
+            "Posterior Q Mean", "Posterior Q SD", "Fisher Q SD", "ESS log Q", "R-hat log Q",
+        ])
+        writer.writerows(zip(
+            diagnostics["f_mean"], diagnostics["f_sd"], fs_unc, diagnostics["ess_f"], diagnostics["rhat_f"],
+            diagnostics["Q_mean"], diagnostics["Q_sd"], Qs_unc, diagnostics["ess_log_Q"], diagnostics["rhat_log_Q"],
+        ))
+
+def print_nuts_diagnostics(diagnostics):
+    total_draws = diagnostics["chains"] * diagnostics["draws_per_chain"]
+    rhat = np.concatenate((diagnostics["rhat_f"], diagnostics["rhat_log_Q"]))
+    ess = np.concatenate((diagnostics["ess_f"], diagnostics["ess_log_Q"]))
+
+    print(
+        "NUTS diagnostics:",
+        f"{diagnostics['chains']} chain(s) x {diagnostics['draws_per_chain']} draws;",
+        f"divergent {diagnostics['divergent']}/{total_draws} ({100 * diagnostics['divergent_fraction']:.1f}%);",
+        f"max tree depth hit {100 * diagnostics['max_tree_depth_fraction']:.1f}%;",
+        f"mean accept prob {diagnostics['mean_accept_prob']:.3f}",
+        flush=True,
+    )
+
+    if np.any(np.isfinite(rhat)):
+        print(f"  split R-hat max {np.nanmax(rhat):.3f}; parameters with R-hat > 1.01: {int(np.sum(rhat > 1.01))}/{rhat.size}", flush=True)
+    if np.any(np.isfinite(ess)):
+        print(f"  ESS min {np.nanmin(ess):.1f}; parameters with ESS < 100: {int(np.sum(ess < 100))}/{ess.size}", flush=True)
 
 def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif):
     diagnostic_path = Path(path)
@@ -1399,7 +1603,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"Starting NUTS at t={perf_counter() - start_time:.2f}s", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result, bounds = nuts(t, d, B, signals, bounds, 50, 100, 1)
+        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, 50, 100, 1, return_diagnostics=True)
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
@@ -1420,6 +1624,8 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     save_iteration_diagnostics(path / "joint_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
     save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
+    save_nuts_diagnostics(path / "joint_result", nuts_diagnostics, fs_unc, Qs_unc)
+    print_nuts_diagnostics(nuts_diagnostics)
     plot_time_series("Time Series", path / "joint_result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
