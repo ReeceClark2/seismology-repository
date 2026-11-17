@@ -461,7 +461,7 @@ def get_nuts_diagnostics(fs, log_Qs, extra_fields, max_tree_depth=MAX_TREE_DEPTH
         "rhat_log_Q": rhat(log_Qs),
     }
 
-def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False):
+def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False, tag=""):
     f_init, Q_init = unpack_signals(signals, sort=False)
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     fs_min = bounds[:, 0].astype(f_init.dtype)
@@ -514,10 +514,11 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
 
     if refine:
         returned_signals, map_info = map_refine(t, d, B, returned_signals, returned_bounds)
+        prefix = f"{tag} " if tag else ""
         print(
-            f"MAP refinement ({len(returned_signals)} signals): accepted={map_info['accepted']}, "
+            f"{prefix}MAP refinement ({len(returned_signals)} signals): accepted={map_info['accepted']}, "
             f"+{map_info['improvement']:.3f} nats, {map_info['iterations']} iterations; {map_info['message']}\n"
-            f"  max |grad| per box width: free {map_info['free_gradient']:.2e}, "
+            f"{prefix}  max |grad| per box width: free {map_info['free_gradient']:.2e}, "
             f"at bound {map_info['bound_gradient']:.2e} ({map_info['at_bound']} signal(s) at a box bound)\n",
             flush=True,
         )
@@ -610,7 +611,7 @@ def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_
     return signal
 
 def _nuts_worker(args):
-    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed = args
+    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed, tag = args
     signals, bounds = checkpoint
 
     optimized_signals, bounds = nuts(
@@ -623,11 +624,12 @@ def _nuts_worker(args):
         sample=sample,
         chains=cores_per_worker,
         rng_key_value=seed,
+        tag=tag,
     )
 
     return optimized_signals, bounds
 
-def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
+def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag=""):
     if not checkpoints:
         return []
 
@@ -635,7 +637,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices):
     n_workers = min(devices, n_checkpoints)
     devices_per_worker = max(1, devices // n_checkpoints)
 
-    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index) for index, checkpoint in enumerate(checkpoints)]
+    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index, tag) for index, checkpoint in enumerate(checkpoints)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -1101,13 +1103,15 @@ def save_nuts_diagnostics(path, diagnostics, fs_unc, Qs_unc):
             diagnostics["Q_mean"], diagnostics["Q_sd"], Qs_unc, diagnostics["ess_log_Q"], diagnostics["rhat_log_Q"],
         ))
 
-def print_nuts_diagnostics(diagnostics):
+def print_nuts_diagnostics(diagnostics, tag=""):
     total_draws = diagnostics["chains"] * diagnostics["draws_per_chain"]
     rhat = np.concatenate((diagnostics["rhat_f"], diagnostics["rhat_log_Q"]))
     ess = np.concatenate((diagnostics["ess_f"], diagnostics["ess_log_Q"]))
 
+    prefix = f"{tag} " if tag else ""
+
     print(
-        "NUTS diagnostics:",
+        f"{prefix}NUTS diagnostics:",
         f"{diagnostics['chains']} chain(s) x {diagnostics['draws_per_chain']} draws;",
         f"divergent {diagnostics['divergent']}/{total_draws} ({100 * diagnostics['divergent_fraction']:.1f}%);",
         f"max tree depth hit {100 * diagnostics['max_tree_depth_fraction']:.1f}%;",
@@ -1116,9 +1120,9 @@ def print_nuts_diagnostics(diagnostics):
     )
 
     if np.any(np.isfinite(rhat)):
-        print(f"  split R-hat max {np.nanmax(rhat):.3f}; parameters with R-hat > 1.01: {int(np.sum(rhat > 1.01))}/{rhat.size}", flush=True)
+        print(f"{prefix}  split R-hat max {np.nanmax(rhat):.3f}; parameters with R-hat > 1.01: {int(np.sum(rhat > 1.01))}/{rhat.size}", flush=True)
     if np.any(np.isfinite(ess)):
-        print(f"  ESS min {np.nanmin(ess):.1f}; parameters with ESS < 100: {int(np.sum(ess < 100))}/{ess.size}", flush=True)
+        print(f"{prefix}  ESS min {np.nanmin(ess):.1f}; parameters with ESS < 100: {int(np.sum(ess < 100))}/{ess.size}", flush=True)
 
     print("", flush=True)
 
@@ -1466,10 +1470,14 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     glob_ll = get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max)
     save_iteration_diagnostics(path / "diagnostic" / "tables", signals, jnp.mean(d)/len(d), 0, 0, glob_ll, 0)
-    
+
+    # The s = 0 score is the first measured point: BIC is assumed unimodal in the signal count,
+    # so the greedy search stops as soon as a refined score falls below the previous one.
+    thumbprints.append((0, float(glob_ll)))
+
     start_time = perf_counter()
     tag = f"[{1000 * f_min:.3f}-{1000 * f_max:.3f} mHz]"
-    print(f"{tag} Starting...\n", flush=True)
+    print(f"{tag} Starting... (global likelihood at 0 signals: {float(glob_ll):.2f})\n", flush=True)
 
     for iteration in range(depth):
         iteration_start = perf_counter()
@@ -1494,9 +1502,11 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         signals = jnp.concatenate([signals, signal], axis=0)
         bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
 
+        refined = len(signals) % signal_step == 0
+
         nuts_start = perf_counter()
-        if len(signals) % signal_step == 0:
-            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices)
+        if refined:
+            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag)
         nuts_elapsed = perf_counter() - nuts_start
 
         if diagnostics == "full":
@@ -1504,8 +1514,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
             log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
-            if len(signals) % signal_step == 0:
-                thumbprints.append((len(signals), glob_ll))
+            if refined:
+                thumbprints.append((len(signals), float(glob_ll)))
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
             save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -1516,9 +1526,9 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         else:
             checkpoints[iteration] = (signals, bounds)
 
-            if len(signals) % signal_step == 0:
+            if refined:
                 log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
-                thumbprints.append((len(signals), glob_ll))
+                thumbprints.append((len(signals), float(glob_ll)))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
                 save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -1530,11 +1540,24 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
 
+        likelihood_line = f"{tag} Global likelihood at {len(signals)} signals: {thumbprints[-1][1]:.2f}\n" if refined else ""
+
         print(
             f"{tag} Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\n"
-            f"{tag} Grid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds\n",
+            f"{tag} Grid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds\n"
+            f"{likelihood_line}",
             flush=True,
         )
+
+        # Early stop: only on a refined score lower than the previous refined score.
+        if refined and thumbprints[-1][1] < thumbprints[-2][1]:
+            (previous_count, previous_score), (current_count, current_score) = thumbprints[-2], thumbprints[-1]
+            print(
+                f"{tag} Global likelihood decreased from {previous_score:.2f} ({previous_count} signals) "
+                f"to {current_score:.2f} ({current_count} signals); stopping greedy search.\n",
+                flush=True,
+            )
+            break
 
     final_start = perf_counter()
     checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
@@ -1545,6 +1568,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
     last_count = max(checkpoint_by_count)
+    checkpoint_by_count[0] = (jnp.empty((0, 2)), jnp.empty((0, 4)))
 
     # If the greedy search stopped early (or depth is not a multiple of signal_step),
     # score the last checkpoint so the bisection has a right-hand anchor.
@@ -1564,7 +1588,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         left_counts = [count for count in measured_counts if count < best_count]
         right_counts = [count for count in measured_counts if count > best_count]
 
-        left_limit = left_counts[-1] if left_counts else 1
+        left_limit = left_counts[-1] if left_counts else 0
         right_limit = right_counts[0] if right_counts else last_count
 
         candidates = []
@@ -1583,7 +1607,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if not candidates:
             break
 
-        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices)
+        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices, tag=tag)
 
         for count, checkpoint in zip(candidates, candidate_refits):
             refined_checkpoints[count] = checkpoint
@@ -1591,11 +1615,17 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
             log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
             glob_lls[count] = float(glob_ll)
+            print(f"{tag} Bisection: global likelihood at {count} signals: {float(glob_ll):.2f}\n", flush=True)
 
             save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, k2)
 
     best_count = max(glob_lls, key=glob_lls.get)
     signals, bounds = refined_checkpoints[best_count]
+    print(f"{tag} Selected {best_count} signals (global likelihood {glob_lls[best_count]:.2f})\n", flush=True)
+
+    if best_count == 0:
+        print(f"{tag} Colony completed in {perf_counter() - start_time:.2f} seconds with 0 signals\n", flush=True)
+        return signals, bounds, get_posterior_variance(t, d, B, signals)
 
     if prune:
         signals, bounds, removed = prune_signals(t, d, B, signals, bounds)
@@ -1666,8 +1696,8 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     within = (s >= lo) & (s <= hi)
 
     print(
-        f"Joint NUTS inputs: {len(s)} signals ({2 * len(s)} parameters), bounds shape={b.shape}\n"
-        f"  finite={finite}, bounds ordered={ordered}, signals within bounds={bool(within.all())}\n",
+        f"[joint] NUTS inputs: {len(s)} signals ({2 * len(s)} parameters), bounds shape={b.shape}\n"
+        f"[joint]   finite={finite}, bounds ordered={ordered}, signals within bounds={bool(within.all())}\n",
         flush=True,
     )
 
@@ -1675,10 +1705,10 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
         print("signals:\n", s, "\nbounds:\n", b, "\nper-signal in-bounds:\n", within, "\n", flush=True)
 
     # The joint run always uses one chain, leaving it as much memory as possible.
-    print(f"Starting joint NUTS at t={perf_counter() - start_time:.2f}s (warmup={warmup}, sample={sample}, chains=1)\n", flush=True)
+    print(f"[joint] Starting NUTS at t={perf_counter() - start_time:.2f}s (warmup={warmup}, sample={sample}, chains=1)\n", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True)
+        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]")
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
@@ -1686,20 +1716,20 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
             if hasattr(x, "block_until_ready") else x,
             nuts_result,
         )
-        print(f"Joint NUTS returned in {perf_counter() - nuts_start:.2f}s\n", flush=True)
+        print(f"[joint] NUTS returned in {perf_counter() - nuts_start:.2f}s\n", flush=True)
     except Exception as error:
         out_of_memory = isinstance(error, MemoryError) or "RESOURCE_EXHAUSTED" in str(error) or "out of memory" in str(error).lower()
 
         if out_of_memory:
             print(
-                f"Joint NUTS ran out of memory after {perf_counter() - nuts_start:.2f}s with {2 * len(s)} parameters.\n"
-                f"Marginal results are saved in {path / 'marginal_result'}; skipping the joint result.\n"
+                f"[joint] NUTS ran out of memory after {perf_counter() - nuts_start:.2f}s with {2 * len(s)} parameters.\n"
+                f"[joint] Marginal results are saved in {path / 'marginal_result'}; skipping the joint result.\n"
                 f"Dracula completed (without joint result) in {perf_counter() - start_time:.2f} seconds",
                 flush=True,
             )
             return
 
-        print(f"Joint NUTS failed after {perf_counter() - nuts_start:.2f}s\n", flush=True)
+        print(f"[joint] NUTS failed after {perf_counter() - nuts_start:.2f}s\n", flush=True)
         traceback.print_exc()
         raise
 
@@ -1714,7 +1744,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, amplitudes, phases, vif)
     save_joint_uncertainties(path / "joint_result", fs, Qs, fs_unc, Qs_unc, signal_scale, subband_index)
     save_nuts_diagnostics(path / "joint_result", nuts_diagnostics, fs_unc, Qs_unc)
-    print_nuts_diagnostics(nuts_diagnostics)
+    print_nuts_diagnostics(nuts_diagnostics, tag="[joint]")
     plot_time_series("Time Series", path / "joint_result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
