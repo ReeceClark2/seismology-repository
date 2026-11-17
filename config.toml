@@ -4,24 +4,24 @@ network = "II"
 station = "BFO"
 
 f_min = 0.00028
-f_max = 0.00200
+f_max = 0.00500
 Q_min = 100
 Q_max = 5200
 
 f_points = 4000
 Q_points = 100
-f_margin = 0.0002
-log_Q_margin = 5
+f_margin = 0.0001
+log_Q_margin = 1.8
 depth = 49
 
 warmup = 500
 sample = 1_000
 
-devices = 6
-cores = 36
+devices = 12
+cores = 96
 diagnostics = "full"
 signal_step = 7
-subbands = 2
+subbands = 6
 
 min_novelty = 0.1
-prune = True
+prune = true

@@ -138,6 +138,59 @@ def get_bic_fast(t, d, B, signals):
     log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
     return float(log_likelihood - 2.0 * s * jnp.log(N))
 
+def get_posterior_variance(t, d, B, signals):
+    """v = RSS / (N - m - 2), the noise scale of the Bretthorst covariance (N = 2BT).
+
+    Proportional to the in-band noise level and independent of bandwidth, so values from
+    different subbands and from the full band are comparable.
+    """
+    fs, Qs = unpack_signals(signals, sort=False)
+    s = fs.shape[0]
+    m = 2 * s
+    N = int(2 * t[-1] * B)
+    rss = jnp.sum(d ** 2) if s == 0 else get_stable_rss(t, d, fs, Qs)
+    return float(rss / max(N - m - 2.0, 1.0))
+
+def get_subband_scaled_covariance(signals, bounds, covariance, band_edges, subband_variances, full_variance):
+    """Rescale a full-band Bretthorst covariance to each signal's subband noise level.
+
+    Sigma_ij(local) = Sigma_ij(joint) * sqrt(v_k(i) v_k(j)) / v_full. Correlations are kept;
+    variances follow the locally-white approximation. Each signal's subband k(i) is found from
+    the centre of its frequency box (boxes are clipped to their colony's subband).
+    Rows follow get_statistics' f-sorted, interleaved [f1, Q1, f2, Q2, ...] order.
+    """
+    signals = np.asarray(signals).reshape(-1, 2)
+    bounds = np.asarray(bounds).reshape(-1, 4)
+    order = np.argsort(signals[:, 0])
+    box_centres = 0.5 * (bounds[order, 0] + bounds[order, 1])
+    edges = np.asarray(band_edges)
+    subband_index = np.clip(np.searchsorted(edges, box_centres, side="right") - 1, 0, len(edges) - 2)
+
+    signal_scale = np.sqrt(np.asarray(subband_variances)[subband_index] / full_variance)
+    parameter_scale = np.repeat(signal_scale, 2)
+    scaled_covariance = np.asarray(covariance) * np.outer(parameter_scale, parameter_scale)
+
+    return jnp.asarray(scaled_covariance), signal_scale, subband_index
+
+def save_joint_uncertainties(path, fs, Qs, fs_unc_full, Qs_unc_full, signal_scale, subband_index):
+    diagnostic_path = Path(path)
+    diagnostic_path.mkdir(parents=True, exist_ok=True)
+
+    with (diagnostic_path / "bretthorst_uncertainties.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "Frequency", "Quality Factor", "Subband",
+            "Frequency Uncertainty (subband sigma)", "Quality Factor Uncertainty (subband sigma)",
+            "Frequency Uncertainty (full-band sigma)", "Quality Factor Uncertainty (full-band sigma)",
+            "Noise Scale Ratio sqrt(v_subband / v_full)",
+        ])
+        writer.writerows(zip(
+            np.asarray(fs), np.asarray(Qs), subband_index + 1,
+            np.asarray(fs_unc_full) * signal_scale, np.asarray(Qs_unc_full) * signal_scale,
+            np.asarray(fs_unc_full), np.asarray(Qs_unc_full),
+            signal_scale,
+        ))
+
 def prune_signals(t, d, B, signals, bounds):
     """Backward elimination: drop the signal whose removal most improves BIC, repeat.
 
@@ -336,13 +389,25 @@ def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1
         result = minimize(fun, np.asarray(u0, dtype=np.float64), jac=True, method=method, options={"maxiter": max_iterations, "gtol": gtol}, **kwargs)
     except Exception as error:
         print(f"MAP refinement failed ({error}); keeping the starting point.", flush=True)
-        return jnp.stack((fs0, Qs0), axis=-1), {"accepted": False, "improvement": 0.0, "iterations": 0, "message": str(error), "at_bound": 0}
+        return jnp.stack((fs0, Qs0), axis=-1), {"accepted": False, "improvement": 0.0, "iterations": 0, "message": str(error), "at_bound": 0, "free_gradient": float("nan"), "bound_gradient": float("nan")}
 
     accepted = bool(np.isfinite(result.fun) and result.fun <= start_value)
     u_final = jnp.asarray(result.x) if accepted else u0
     p_final = jax.nn.sigmoid(u_final)
     near_bound = (p_final < MAP_BOUND_TOLERANCE) | (p_final > 1.0 - MAP_BOUND_TOLERANCE)
-    at_bound = int(jnp.sum(near_bound[:s] | near_bound[s:]))
+    signal_at_bound = near_bound[:s] | near_bound[s:]
+    at_bound = int(jnp.sum(signal_at_bound))
+
+    # Convergence check (one extra gradient): d log p / d(x / box width) in (f, log Q),
+    # so f and log Q are comparable, in nats per box width. Near zero = stationary.
+    def log_prob_x(x):
+        return get_log_prob(t, d, B, jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1))
+
+    x_final = lower + width * p_final
+    scaled_gradient = jnp.abs(jax.grad(log_prob_x)(x_final) * width)
+    signal_gradient = jnp.maximum(scaled_gradient[:s], scaled_gradient[s:])
+    free_gradient = float(jnp.max(jnp.where(signal_at_bound, 0.0, signal_gradient))) if at_bound < s else float("nan")
+    bound_gradient = float(jnp.max(jnp.where(signal_at_bound, signal_gradient, 0.0))) if at_bound > 0 else float("nan")
 
     info = {
         "accepted": accepted,
@@ -350,6 +415,8 @@ def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1
         "iterations": int(result.nit),
         "message": str(result.message),
         "at_bound": at_bound,
+        "free_gradient": free_gradient,
+        "bound_gradient": bound_gradient,
     }
 
     return to_signals(u_final), info
@@ -449,8 +516,9 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
         returned_signals, map_info = map_refine(t, d, B, returned_signals, returned_bounds)
         print(
             f"MAP refinement ({len(returned_signals)} signals): accepted={map_info['accepted']}, "
-            f"+{map_info['improvement']:.3f} nats, {map_info['iterations']} iterations, "
-            f"{map_info['at_bound']} signal(s) at a box bound; {map_info['message']}",
+            f"+{map_info['improvement']:.3f} nats, {map_info['iterations']} iterations; {map_info['message']}\n"
+            f"  max |grad| per box width: free {map_info['free_gradient']:.2e}, "
+            f"at bound {map_info['bound_gradient']:.2e} ({map_info['at_bound']} signal(s) at a box bound)\n",
             flush=True,
         )
 
@@ -582,9 +650,9 @@ def _colony_worker(args):
     f_max = float(band_edges[ind + 1])
     colony_path = path / f"{round(1000 * f_min, 2)}r{round(1000 * f_max, 2)}mHz_{ind + 1}r{n_subbands}"
 
-    signals, bounds = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune)
+    signals, bounds, posterior_variance = colony(t_raw, d_raw, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune)
 
-    return ind, np.asarray(signals), np.asarray(bounds)
+    return ind, np.asarray(signals), np.asarray(bounds), posterior_variance
 
 def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False):
     n_subbands = len(band_edges) - 1
@@ -601,8 +669,9 @@ def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, 
     results.sort(key=lambda result: result[0])
     signals = jnp.concatenate([jnp.asarray(result[1]).reshape(-1, 2) for result in results], axis=0)
     bounds = jnp.concatenate([jnp.asarray(result[2]).reshape(-1, 4) for result in results], axis=0)
+    subband_variances = np.array([result[3] for result in results], dtype=float)
 
-    return signals, bounds
+    return signals, bounds, subband_variances
 
 # Evaluation (critical) -------------------------------------------------------------------
 
@@ -1024,8 +1093,8 @@ def save_nuts_diagnostics(path, diagnostics, fs_unc, Qs_unc):
     with (diagnostic_path / "nuts_signals.csv").open("w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow([
-            "Posterior Frequency Mean", "Posterior Frequency SD", "Fisher Frequency SD", "ESS Frequency", "R-hat Frequency",
-            "Posterior Q Mean", "Posterior Q SD", "Fisher Q SD", "ESS log Q", "R-hat log Q",
+            "Posterior Frequency Mean", "Posterior Frequency SD", "Bretthorst Frequency SD (full-band sigma)", "ESS Frequency", "R-hat Frequency",
+            "Posterior Q Mean", "Posterior Q SD", "Bretthorst Q SD (full-band sigma)", "ESS log Q", "R-hat log Q",
         ])
         writer.writerows(zip(
             diagnostics["f_mean"], diagnostics["f_sd"], fs_unc, diagnostics["ess_f"], diagnostics["rhat_f"],
@@ -1050,6 +1119,8 @@ def print_nuts_diagnostics(diagnostics):
         print(f"  split R-hat max {np.nanmax(rhat):.3f}; parameters with R-hat > 1.01: {int(np.sum(rhat > 1.01))}/{rhat.size}", flush=True)
     if np.any(np.isfinite(ess)):
         print(f"  ESS min {np.nanmin(ess):.1f}; parameters with ESS < 100: {int(np.sum(ess < 100))}/{ess.size}", flush=True)
+
+    print("", flush=True)
 
 def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif):
     diagnostic_path = Path(path)
@@ -1397,7 +1468,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     save_iteration_diagnostics(path / "diagnostic" / "tables", signals, jnp.mean(d)/len(d), 0, 0, glob_ll, 0)
     
     start_time = perf_counter()
-    print("Starting...")
+    tag = f"[{1000 * f_min:.3f}-{1000 * f_max:.3f} mHz]"
+    print(f"{tag} Starting...\n", flush=True)
 
     for iteration in range(depth):
         iteration_start = perf_counter()
@@ -1411,7 +1483,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         grid_elapsed = perf_counter() - grid_start
 
         if signal is None:
-            print(f"No resolvable candidate (novelty >= {min_novelty}) left; stopping greedy search at {len(signals)} signals.", flush=True)
+            print(f"{tag} No resolvable candidate (novelty >= {min_novelty}) left; stopping greedy search at {len(signals)} signals.\n", flush=True)
             break
 
         signal_bounds = get_bounds(signal, f_min, f_max, Q_min, Q_max, f_margin, log_Q_margin)
@@ -1458,14 +1530,18 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
 
-        print(f"Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\nGrid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds")
+        print(
+            f"{tag} Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\n"
+            f"{tag} Grid search time: {grid_elapsed:.2f} seconds; NUTS time: {nuts_elapsed:.2f} seconds\n",
+            flush=True,
+        )
 
     final_start = perf_counter()
     checkpoints = [checkpoint for checkpoint in checkpoints if checkpoint is not None]
 
     if not checkpoints:
-        print("Colony found no resolvable signals.", flush=True)
-        return jnp.empty((0, 2)), jnp.empty((0, 4))
+        print(f"{tag} Colony found no resolvable signals.\n", flush=True)
+        return jnp.empty((0, 2)), jnp.empty((0, 4)), get_posterior_variance(t, d, B, jnp.empty((0, 2)))
 
     checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
     last_count = max(checkpoint_by_count)
@@ -1523,9 +1599,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     if prune:
         signals, bounds, removed = prune_signals(t, d, B, signals, bounds)
-        print(f"Pruning removed {len(removed)} signal(s); {len(signals)} remain.", flush=True)
-        for f_removed, Q_removed in removed:
-            print(f"  removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}", flush=True)
+        removed_lines = "".join(f"\n{tag}   removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}" for f_removed, Q_removed in removed)
+        print(f"{tag} Pruning removed {len(removed)} signal(s); {len(signals)} remain.{removed_lines}\n", flush=True)
 
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
@@ -1538,11 +1613,15 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
 
     final_elapsed = perf_counter() - final_start
+    posterior_variance = get_posterior_variance(t, d, B, signals)
 
-    print(f"Final stage completed in {final_elapsed:.2f} seconds")
-    print(f"Colony completed in {perf_counter() - start_time:.2f} seconds")
+    print(
+        f"{tag} Final stage completed in {final_elapsed:.2f} seconds\n"
+        f"{tag} Colony completed in {perf_counter() - start_time:.2f} seconds with {len(signals)} signal(s)\n",
+        flush=True,
+    )
 
-    return signals, bounds
+    return signals, bounds, posterior_variance
 
 def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False):
     start_time = perf_counter()
@@ -1556,54 +1635,50 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune)
+    signals, bounds, subband_variances = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune)
 
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     signals = jnp.asarray(signals).reshape(-1, 2)
 
+    # Marginal result: merged colony signals. Bretthorst uncertainties are reported with each
+    # signal's subband noise level (locally-white approximation); full-band ones are kept beside.
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
+    full_variance = get_posterior_variance(t, d, B, signals)
+    covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, bounds, covariance, band_edges, subband_variances, full_variance)
 
     save_iteration_diagnostics(path / "marginal_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
-    save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
+    save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, amplitudes, phases, vif)
+    save_joint_uncertainties(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, signal_scale, subband_index)
     plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
-    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale)
     plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "marginal_result" / f"covariance_{len(signals)}.png", signals, covariance)
 
-    # Prune the merged set on the full-band data before the joint fit. This also removes
-    # signals duplicated across neighbouring subbands (a duplicate adds ~nothing to the fit).
-    if prune:
-        signals, bounds, removed = prune_signals(t, d, B, signals, bounds)
-        print(f"Merged-set pruning removed {len(removed)} signal(s); {len(signals)} remain.", flush=True)
-        for f_removed, Q_removed in removed:
-            print(f"  removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}", flush=True)
-
-    # Force device values to be available before reporting/timing.
+    # Joint-run input checks; full arrays are printed only if a check fails.
     s = np.asarray(jax.device_get(signals))
     b = np.asarray(jax.device_get(bounds))
+    lo = b[:, [0, 2]]  # f_lo, Q_lo
+    hi = b[:, [1, 3]]  # f_hi, Q_hi
+    finite = bool(np.isfinite(s).all() and np.isfinite(b).all())
+    ordered = bool(np.all(lo < hi))
+    within = (s >= lo) & (s <= hi)
 
     print(
-        "NUTS inputs:",
-        f"signals shape={s.shape}, bounds shape={b.shape}",
-        f"signals finite={np.isfinite(s).all()}, bounds finite={np.isfinite(b).all()}",
+        f"Joint NUTS inputs: {len(s)} signals ({2 * len(s)} parameters), bounds shape={b.shape}\n"
+        f"  finite={finite}, bounds ordered={ordered}, signals within bounds={bool(within.all())}\n",
         flush=True,
     )
-    print("signals:\n", s, flush=True)
-    print("bounds:\n", b, flush=True)
 
-    if s.ndim == 2 and b.shape == (len(s), 4):
-        lo = b[:, [0, 2]]  # f_lo, Q_lo
-        hi = b[:, [1, 3]]  # f_hi, Q_hi
-        print("bounds ordered:", np.all(lo < hi), flush=True)
-        print("signals within bounds:", np.all((s >= lo) & (s <= hi)), flush=True)
-        print("per-signal in-bounds:\n", (s >= lo) & (s <= hi), flush=True)
+    if not (finite and ordered and within.all()):
+        print("signals:\n", s, "\nbounds:\n", b, "\nper-signal in-bounds:\n", within, "\n", flush=True)
 
-    print(f"Starting NUTS at t={perf_counter() - start_time:.2f}s", flush=True)
+    # The joint run always uses one chain, leaving it as much memory as possible.
+    print(f"Starting joint NUTS at t={perf_counter() - start_time:.2f}s (warmup={warmup}, sample={sample}, chains=1)\n", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, 50, 100, 1, return_diagnostics=True)
+        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True)
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
@@ -1611,9 +1686,20 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
             if hasattr(x, "block_until_ready") else x,
             nuts_result,
         )
-        print(f"NUTS returned in {perf_counter() - nuts_start:.2f}s", flush=True)
-    except Exception:
-        print(f"NUTS failed after {perf_counter() - nuts_start:.2f}s", flush=True)
+        print(f"Joint NUTS returned in {perf_counter() - nuts_start:.2f}s\n", flush=True)
+    except Exception as error:
+        out_of_memory = isinstance(error, MemoryError) or "RESOURCE_EXHAUSTED" in str(error) or "out of memory" in str(error).lower()
+
+        if out_of_memory:
+            print(
+                f"Joint NUTS ran out of memory after {perf_counter() - nuts_start:.2f}s with {2 * len(s)} parameters.\n"
+                f"Marginal results are saved in {path / 'marginal_result'}; skipping the joint result.\n"
+                f"Dracula completed (without joint result) in {perf_counter() - start_time:.2f} seconds",
+                flush=True,
+            )
+            return
+
+        print(f"Joint NUTS failed after {perf_counter() - nuts_start:.2f}s\n", flush=True)
         traceback.print_exc()
         raise
 
@@ -1621,15 +1707,18 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
+    full_variance = get_posterior_variance(t, d, B, signals)
+    covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, bounds, covariance, band_edges, subband_variances, full_variance)
 
     save_iteration_diagnostics(path / "joint_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
-    save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
+    save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, amplitudes, phases, vif)
+    save_joint_uncertainties(path / "joint_result", fs, Qs, fs_unc, Qs_unc, signal_scale, subband_index)
     save_nuts_diagnostics(path / "joint_result", nuts_diagnostics, fs_unc, Qs_unc)
     print_nuts_diagnostics(nuts_diagnostics)
     plot_time_series("Time Series", path / "joint_result" / f"time_series_{len(signals)}.png", t, d, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max)
-    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "joint_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc)
+    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "joint_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale)
     plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "joint_result" / f"covariance_{len(signals)}.png", signals, covariance)
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
@@ -1681,4 +1770,3 @@ if __name__ == "__main__":
         min_novelty=config.get("min_novelty", 0.1),
         prune=config.get("prune", True),
     )
-    
