@@ -1490,8 +1490,10 @@ def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, s
 def load_data(type, event, network, station):
     if type == "observed":
         path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
-    elif type == "synthetic":
+    elif type in ("synthetic", "prem"):
         path = Path.cwd() / type / event / f"{network}_{station}.dat"
+    else:
+        raise ValueError(f"Unknown data type {type!r}; expected 'observed', 'synthetic' or 'prem'.")
     data = np.loadtxt(path)
     return data[:, 0], data[:, 1]
 

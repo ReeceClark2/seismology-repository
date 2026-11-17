@@ -1,4 +1,4 @@
-type = "synthetic"
+type = "prem"
 event = "tohoku"
 network = "II"
 station = "BFO"
