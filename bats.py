@@ -1816,7 +1816,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     # Colony boxes may reach into the padding past the global band; every kept signal lies in
     # a core band, so clipping the boxes to [f_min, f_max] keeps each signal inside its box.
-    bounds = np.asarray(bounds, dtype=float).reshape(-1, 4)
+    bounds = np.array(bounds, dtype=float).reshape(-1, 4)   # writable copy; np.asarray of a JAX array is read-only
     bounds[:, 0] = np.maximum(bounds[:, 0], f_min)
     bounds[:, 1] = np.minimum(bounds[:, 1], f_max)
     bounds = jnp.asarray(bounds)
@@ -1954,3 +1954,4 @@ if __name__ == "__main__":
         ringing_db=config.get("ringing_db", DEFAULT_RINGING_DB),
         max_trim_hours=config.get("max_trim_hours", DEFAULT_MAX_TRIM_SECONDS / 3600),
     )
+    
