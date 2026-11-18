@@ -58,6 +58,13 @@ GRAM_JITTER = 1e-12
 # The cap protects the early, highest-SNR part of the record: trimming T_trim scales a mode's
 # amplitude at the new t = 0 by exp(-pi f T_trim / Q), which costs low-Q modes most.
 MIN_TRIM_SECONDS = 5 * 3600
+
+# Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
+# amplitude scale delta, the nonlinear-parameter scale gamma and the noise sigma. They enter only
+# as log(log R); delta and gamma matter only when comparing s = 0 with s >= 1.
+BRETTHORST_RATIO_DELTA = 5e1
+BRETTHORST_RATIO_GAMMA = 1e5
+BRETTHORST_RATIO_SIGMA = 1e2
 DEFAULT_MAX_TRIM_SECONDS = 10 * 3600
 DEFAULT_RINGING_DB = -60.0
 NOVELTY_JITTER = 1e-10
@@ -126,26 +133,6 @@ def get_stable_rss(t, d, fs, Qs):
     residual = d - G.T @ beta
     return jnp.sum(residual ** 2)
 
-def get_bic_fast(t, d, B, signals):
-    """BIC score matching get_glob_ll, using get_stable_rss (no QR, no rank/bounds check)."""
-    fs, Qs = unpack_signals(signals, sort=False)
-    s = fs.shape[0]
-    m = 2 * s
-    N = int(2 * t[-1] * B)
-
-    if N <= m + 2:
-        return -np.inf
-
-    rss = jnp.sum(d ** 2) if s == 0 else get_stable_rss(t, d, fs, Qs)
-    residual_sq = (N / len(d)) * rss
-    noise_variance = residual_sq / (N - m - 2.0)
-
-    if not bool(noise_variance > 0):
-        return -np.inf
-
-    log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
-    return float(log_likelihood - 2.0 * s * jnp.log(N))
-
 def get_posterior_variance(t, d, B, signals):
     """v = RSS / (N - m - 2), the noise scale of the Bretthorst covariance (N = 2BT).
 
@@ -203,23 +190,24 @@ def save_joint_uncertainties(path, fs, Qs, fs_unc_full, Qs_unc_full, signal_scal
             signal_scale,
         ))
 
-def prune_signals(t, d, B, signals, bounds):
-    """Backward elimination: drop the signal whose removal most improves BIC, repeat.
+def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max):
+    """Backward elimination: drop the signal whose removal most improves the model-selection
+    score (the Bretthorst global likelihood from get_statistics), repeat.
 
     Remaining signals are not re-optimized after a removal, so each removal score is a
     lower bound on what a refit would give (the pruning is conservative).
-    Cost per pass O(s (s n + s^3)).
+    Cost per pass O(s * n s^2): one get_statistics (QR + Fisher) per candidate removal.
     """
-    signals = np.asarray(signals).reshape(-1, 2)
-    bounds = np.asarray(bounds).reshape(-1, 4)
-    current = get_bic_fast(t, d, B, signals)
+    def score(candidate):
+        return float(get_statistics(t, d, B, jnp.asarray(candidate), f_min, f_max, Q_min, Q_max)[1])
+
+    signals = np.array(signals, dtype=float).reshape(-1, 2)
+    bounds = np.array(bounds, dtype=float).reshape(-1, 4)
+    current = score(signals)
     removed = []
 
     while signals.shape[0] > 1:
-        scores = np.array([
-            get_bic_fast(t, d, B, np.delete(signals, j, axis=0))
-            for j in range(signals.shape[0])
-        ])
+        scores = np.array([score(np.delete(signals, j, axis=0)) for j in range(signals.shape[0])])
         j = int(np.argmax(scores))
 
         if not scores[j] > current:
@@ -330,9 +318,9 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
 MAP_BOUND_TOLERANCE = 1e-3
-MAX_TREE_DEPTH = 10
+MAX_TREE_DEPTH = 6
 
-def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=100, gtol=1e-6):
+def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=600, gtol=1e-6):
     """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
 
     The NUTS prior is uniform in (f, log Q) on each signal's box, so the MAP in those
@@ -963,6 +951,67 @@ def get_uncertainties(t, d, B, signals):
 
 # Evaluation (all) ------------------------------------------------------------------------
 
+def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max):
+    """Bretthorst (1988) global likelihood log P(D | s signals), up to a model-independent constant.
+
+    Built from quantities at the MAP. Priors (Bretthorst's construction):
+      - orthonormal amplitudes ~ N(0, delta^2), delta ~ Jeffreys on a range of ratio R_delta;
+      - normalized nonlinear parameters x = (x_omega, x_logQ) ~ N(0, gamma^2), gamma ~ Jeffreys (R_gamma);
+        x maps [f_min, f_max] and [log Q_min, log Q_max] onto [-1, 1];
+      - sigma ~ Jeffreys (R_sigma).
+    Integrating amplitudes (prior evaluated at the projection), x (Laplace), then delta, gamma, sigma:
+
+      log Z = [lgamma(m/2) - log 2 - log log R_delta - (m/2) log(P / 2)]
+            + [lgamma(r/2) - log 2 - log log R_gamma - (r/2) log(X / 2)]
+            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)]
+            - (1/2) log det b_x
+
+    with m = r = 2s, P = projected energy, RSS = residual sum of squares, X = sum of x^2, and
+    b_x = -(1/2) Hessian of P in x coordinates, taken as the Gauss-Newton Fisher matrix
+    J_perp^T J_perp (exact up to the residual term). The (2 pi)^(r/2) of the Laplace integral
+    cancels the (2 pi)^(-r/2) of the Gaussian prior on x, and (2 pi)^(-N/2) is common to every
+    model. All sums are raw sums over the samples; rescaling the data shifts log Z by -(N/2) log c
+    for every model alike.
+
+    s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2).
+    """
+    n_signals = fs.shape[0]
+    log_2 = jnp.log(2.0)
+    log_log_R_sigma = jnp.log(jnp.log(BRETTHORST_RATIO_SIGMA))
+
+    if n_signals == 0:
+        return jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(sum_sq_data / 2)
+
+    m = 2 * n_signals
+    r = 2 * n_signals
+    dof = N - m - r
+
+    if dof <= 0:
+        return -jnp.inf
+
+    omega_center = jnp.pi * (f_max + f_min)
+    omega_halfwidth = jnp.pi * (f_max - f_min)
+    log_Q_center = 0.5 * (jnp.log(Q_max) + jnp.log(Q_min))
+    log_Q_halfwidth = 0.5 * (jnp.log(Q_max) - jnp.log(Q_min))
+    x_omega = (2.0 * jnp.pi * fs - omega_center) / omega_halfwidth
+    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
+    sum_sq_param = jnp.sum(x_omega ** 2 + x_log_Q ** 2)
+
+    delta_term = jsp.gammaln(m / 2) - log_2 - jnp.log(jnp.log(BRETTHORST_RATIO_DELTA)) - (m / 2) * jnp.log(sum_sq_proj / 2)
+    gamma_term = jsp.gammaln(r / 2) - log_2 - jnp.log(jnp.log(BRETTHORST_RATIO_GAMMA)) - (r / 2) * jnp.log(sum_sq_param / 2)
+    sigma_term = jsp.gammaln(dof / 2) - log_2 - log_log_R_sigma - (dof / 2) * jnp.log(rss / 2)
+
+    # Fisher is in (f, Q), interleaved [f1, Q1, ...]; convert to x: b_x = J^T b J with
+    # J = diag(df/dx_omega, dQ/dx_logQ) = diag(omega_halfwidth / 2 pi, Q log_Q_halfwidth).
+    jacobian = jnp.stack((jnp.full_like(fs, omega_halfwidth / (2.0 * jnp.pi)), Qs * log_Q_halfwidth), axis=-1).ravel()
+    fisher_x = fisher * jnp.outer(jacobian, jacobian)
+    scale = jnp.sqrt(jnp.maximum(jnp.diag(fisher_x), jnp.finfo(fisher_x.dtype).tiny))
+    eigenvalues = jnp.linalg.eigvalsh(fisher_x / jnp.outer(scale, scale))
+    eigenvalues = jnp.maximum(eigenvalues, jnp.finfo(fisher_x.dtype).eps * jnp.max(eigenvalues))
+    log_det = 2.0 * jnp.sum(jnp.log(scale)) + jnp.sum(jnp.log(eigenvalues))
+
+    return delta_term + gamma_term + sigma_term - 0.5 * log_det
+
 def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
     n_signals = fs.shape[0]
@@ -975,6 +1024,8 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
 
     if n_signals == 0:
         sum_sq_proj = jnp.asarray(0.0, dtype=d.dtype)
+        rss = sum_sq_data
+        fisher = jnp.empty((0, 0), dtype=d.dtype)
         residual_sq = (N / len(d)) * sum_sq_data
         full_rank = True
         in_bounds = True
@@ -1063,16 +1114,22 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
     snr = jnp.where(m > 0, jnp.sqrt((m / jnp.maximum(N, 1)) * (1.0 + sum_sq_proj / (m * noise_variance))), 0.0)
 
+    # BIC (kept for comparison; written to iteration diagnostics).
     log_likelihood = -0.5 * (N * jnp.log(2.0 * jnp.pi * noise_variance) + residual_sq / noise_variance)
-    score = log_likelihood - 2.0 * n_signals * jnp.log(jnp.maximum(N, 1))
+    bic_score = log_likelihood - 2.0 * n_signals * jnp.log(jnp.maximum(N, 1))
     valid = (N > m + 2) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds
-    glob_ll = jnp.where(valid, score, -jnp.inf)
+    bic = jnp.where(valid, bic_score, -jnp.inf)
 
-    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif
+    # Bretthorst global likelihood: the model-selection score (glob_ll).
+    bretthorst = get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max)
+    bretthorst_valid = valid & (rss > 0) & ((n_signals == 0) | (sum_sq_proj > 0))
+    glob_ll = jnp.where(bretthorst_valid & jnp.isfinite(bretthorst), bretthorst, -jnp.inf)
+
+    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic
 
 # Plotting --------------------------------------------------------------------------------
 
-def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, k2):
+def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glob_ll, bic, k2):
     diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / "iteration_diagnostics.csv"
@@ -1081,13 +1138,14 @@ def save_iteration_diagnostics(path, signals, noise_variance, snr, log_prob, glo
     with csv_path.open("a", newline="") as file:
         writer = csv.writer(file)
         if write_header:
-            writer.writerow(["Signals", "Noise Variance", "SNR", "Probability", "Global Likelihood", "2-norm"])
+            writer.writerow(["Signals", "Noise Variance", "SNR", "Probability", "Global Likelihood (Bretthorst)", "BIC", "2-norm"])
         writer.writerow([
             len(signals),
             float(noise_variance),
             float(snr),
             float(log_prob),
             float(glob_ll),
+            float(bic),
             float(k2),
         ])
 
@@ -1593,8 +1651,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
-    glob_ll = get_glob_ll(t, d, signals, f_min, f_max, Q_min, Q_max, B)
-    save_iteration_diagnostics(path / "diagnostic" / "tables", signals, jnp.mean(d)/len(d), 0, 0, glob_ll, 0)
+    log_prob, glob_ll, noise_variance, snr, k2, *_, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
 
     # The s = 0 score is the first measured point: BIC is assumed unimodal in the signal count,
     # so the greedy search stops as soon as a refined score falls below the previous one.
@@ -1611,7 +1669,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     print(
         f"{tag} Starting... (fit band {1000 * f_min:.3f}-{1000 * f_max:.3f} mHz; "
-        f"global likelihood at 0 signals: {float(glob_ll):.2f})\n"
+        f"global likelihood at 0 signals: {float(glob_ll):.2f}, BIC {float(bic):.2f})\n"
         f"{tag} Filter time constant {filter_info['time_constant'] / 3600:.2f} h; trimmed {filter_info['trim_seconds'] / 3600:.1f} h "
         f"at each end ({trim_note}); {t[-1] / 3600:.1f} h of record used\n",
         flush=True,
@@ -1650,12 +1708,12 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if diagnostics == "full":
             checkpoints[iteration] = (signals, bounds)
 
-            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
             if refined:
                 thumbprints.append((len(signals), float(glob_ll)))
 
-            save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+            save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
             save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
             plot_time_series("Time Series", path / "diagnostic" / "time_series" /f"time_series_{len(signals)}.png", t, d, signals)
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=core_edges)
@@ -1665,10 +1723,10 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             checkpoints[iteration] = (signals, bounds)
 
             if refined:
-                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
                 thumbprints.append((len(signals), float(glob_ll)))
 
-                save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, k2)
+                save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
                 save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
                 plot_time_series("Time Series", path / "diagnostic" / "time_series" / f"time_series_{len(signals)}.png", t, d, signals)
                 plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=core_edges)
@@ -1678,7 +1736,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
 
-        likelihood_line = f"{tag} Global likelihood at {len(signals)} signals: {thumbprints[-1][1]:.2f}\n" if refined else ""
+        likelihood_line = f"{tag} Global likelihood at {len(signals)} signals: {thumbprints[-1][1]:.2f} (BIC {float(bic):.2f})\n" if refined else ""
 
         print(
             f"{tag} Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\n"
@@ -1752,10 +1810,11 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max)
 
             log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
+            bic = statistics[-1]
             glob_lls[count] = float(glob_ll)
-            print(f"{tag} Bisection: global likelihood at {count} signals: {float(glob_ll):.2f}\n", flush=True)
+            print(f"{tag} Bisection: global likelihood at {count} signals: {float(glob_ll):.2f} (BIC {float(bic):.2f})\n", flush=True)
 
-            save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, k2)
+            save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, bic, k2)
 
     best_count = max(glob_lls, key=glob_lls.get)
     signals, bounds = refined_checkpoints[best_count]
@@ -1766,11 +1825,11 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         return signals, bounds, get_posterior_variance(t, d, B, signals)
 
     if prune:
-        signals, bounds, removed = prune_signals(t, d, B, signals, bounds)
+        signals, bounds, removed = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max)
         removed_lines = "".join(f"\n{tag}   removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}" for f_removed, Q_removed in removed)
         print(f"{tag} Pruning removed {len(removed)} signal(s); {len(signals)} remain.{removed_lines}\n", flush=True)
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
     save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -1823,12 +1882,12 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     # Marginal result: merged colony signals. Bretthorst uncertainties are reported with each
     # signal's subband noise level (locally-white approximation); full-band ones are kept beside.
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
     full_variance = get_posterior_variance(t, d, B, signals)
     covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, covariance, band_edges, subband_variances, full_variance)
 
-    save_iteration_diagnostics(path / "marginal_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+    save_iteration_diagnostics(path / "marginal_result", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
     save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, amplitudes, phases, vif)
     save_joint_uncertainties(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, signal_scale, subband_index)
     plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(signals)}.png", t, d, signals)
@@ -1886,12 +1945,12 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals = nuts_result
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
     full_variance = get_posterior_variance(t, d, B, signals)
     covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, covariance, band_edges, subband_variances, full_variance)
 
-    save_iteration_diagnostics(path / "joint_result", signals, noise_variance, snr, log_prob, glob_ll, k2)
+    save_iteration_diagnostics(path / "joint_result", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
     save_signal_diagnostics(path / "joint_result", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, amplitudes, phases, vif)
     save_joint_uncertainties(path / "joint_result", fs, Qs, fs_unc, Qs_unc, signal_scale, subband_index)
     save_nuts_diagnostics(path / "joint_result", nuts_diagnostics, fs_unc, Qs_unc)
@@ -1954,4 +2013,3 @@ if __name__ == "__main__":
         ringing_db=config.get("ringing_db", DEFAULT_RINGING_DB),
         max_trim_hours=config.get("max_trim_hours", DEFAULT_MAX_TRIM_SECONDS / 3600),
     )
-    
