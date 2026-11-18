@@ -60,10 +60,9 @@ GRAM_JITTER = 1e-12
 MIN_TRIM_SECONDS = 5 * 3600
 
 # Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
-# amplitude scale delta, the nonlinear-parameter scale gamma and the noise sigma. They enter only
-# as log(log R); delta and gamma matter only when comparing s = 0 with s >= 1.
+# amplitude scale delta and the noise sigma. They enter only as log(log R); delta matters only
+# when comparing s = 0 with s >= 1.
 BRETTHORST_RATIO_DELTA = 5e1
-BRETTHORST_RATIO_GAMMA = 1e5
 BRETTHORST_RATIO_SIGMA = 1e2
 DEFAULT_MAX_TRIM_SECONDS = 10 * 3600
 DEFAULT_RINGING_DB = -60.0
@@ -954,24 +953,26 @@ def get_uncertainties(t, d, B, signals):
 def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max):
     """Bretthorst (1988) global likelihood log P(D | s signals), up to a model-independent constant.
 
-    Built from quantities at the MAP. Priors (Bretthorst's construction):
+    Built from quantities at the MAP. Priors:
       - orthonormal amplitudes ~ N(0, delta^2), delta ~ Jeffreys on a range of ratio R_delta;
-      - normalized nonlinear parameters x = (x_omega, x_logQ) ~ N(0, gamma^2), gamma ~ Jeffreys (R_gamma);
-        x maps [f_min, f_max] and [log Q_min, log Q_max] onto [-1, 1];
+      - each signal uniform in f on [f_min, f_max] and in log Q on [log Q_min, log Q_max], i.e.
+        each normalized coordinate x = (x_omega, x_logQ) uniform on [-1, 1] (density 1/2);
+        the s signals are exchangeable;
       - sigma ~ Jeffreys (R_sigma).
-    Integrating amplitudes (prior evaluated at the projection), x (Laplace), then delta, gamma, sigma:
+    Integrating amplitudes (prior evaluated at the projection), x (Laplace), then delta and sigma:
 
-      log Z = [lgamma(m/2) - log 2 - log log R_delta - (m/2) log(P / 2)]
-            + [lgamma(r/2) - log 2 - log log R_gamma - (r/2) log(X / 2)]
-            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)]
-            - (1/2) log det b_x
+      log Z = [lgamma(m/2) - log 2 - log log R_delta - (m/2) log(P / 2)]          amplitudes, delta
+            + [-r log 2 + (r/2) log(2 pi) - (1/2) log det b_x]                    location (Occam)
+            + log s!                                                              signal labellings
+            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)]   sigma
 
-    with m = r = 2s, P = projected energy, RSS = residual sum of squares, X = sum of x^2, and
-    b_x = -(1/2) Hessian of P in x coordinates, taken as the Gauss-Newton Fisher matrix
-    J_perp^T J_perp (exact up to the residual term). The (2 pi)^(r/2) of the Laplace integral
-    cancels the (2 pi)^(-r/2) of the Gaussian prior on x, and (2 pi)^(-N/2) is common to every
-    model. All sums are raw sums over the samples; rescaling the data shifts log Z by -(N/2) log c
-    for every model alike.
+    with m = r = 2s, P = projected energy, RSS = residual sum of squares, and b_x = -(1/2) Hessian
+    of P in x coordinates, taken as the Gauss-Newton Fisher matrix J_perp^T J_perp (exact up to
+    the residual term). The location term is log(posterior volume / prior volume) per signal and
+    does not depend on where a signal sits in the band. log s! counts the s! equivalent posterior
+    modes (relabellings) that a single Laplace approximation misses. (2 pi)^(-N/2) is common to
+    every model. All sums are raw sums over the samples; rescaling the data shifts log Z by
+    -(N/2) log c for every model alike. Assumes each signal's posterior lies well inside the band.
 
     s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2).
     """
@@ -989,28 +990,23 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
     if dof <= 0:
         return -jnp.inf
 
-    omega_center = jnp.pi * (f_max + f_min)
-    omega_halfwidth = jnp.pi * (f_max - f_min)
-    log_Q_center = 0.5 * (jnp.log(Q_max) + jnp.log(Q_min))
-    log_Q_halfwidth = 0.5 * (jnp.log(Q_max) - jnp.log(Q_min))
-    x_omega = (2.0 * jnp.pi * fs - omega_center) / omega_halfwidth
-    x_log_Q = (jnp.log(Qs) - log_Q_center) / log_Q_halfwidth
-    sum_sq_param = jnp.sum(x_omega ** 2 + x_log_Q ** 2)
-
     delta_term = jsp.gammaln(m / 2) - log_2 - jnp.log(jnp.log(BRETTHORST_RATIO_DELTA)) - (m / 2) * jnp.log(sum_sq_proj / 2)
-    gamma_term = jsp.gammaln(r / 2) - log_2 - jnp.log(jnp.log(BRETTHORST_RATIO_GAMMA)) - (r / 2) * jnp.log(sum_sq_param / 2)
     sigma_term = jsp.gammaln(dof / 2) - log_2 - log_log_R_sigma - (dof / 2) * jnp.log(rss / 2)
+    labelling_term = jsp.gammaln(n_signals + 1.0)
 
     # Fisher is in (f, Q), interleaved [f1, Q1, ...]; convert to x: b_x = J^T b J with
     # J = diag(df/dx_omega, dQ/dx_logQ) = diag(omega_halfwidth / 2 pi, Q log_Q_halfwidth).
+    omega_halfwidth = jnp.pi * (f_max - f_min)
+    log_Q_halfwidth = 0.5 * (jnp.log(Q_max) - jnp.log(Q_min))
     jacobian = jnp.stack((jnp.full_like(fs, omega_halfwidth / (2.0 * jnp.pi)), Qs * log_Q_halfwidth), axis=-1).ravel()
     fisher_x = fisher * jnp.outer(jacobian, jacobian)
     scale = jnp.sqrt(jnp.maximum(jnp.diag(fisher_x), jnp.finfo(fisher_x.dtype).tiny))
     eigenvalues = jnp.linalg.eigvalsh(fisher_x / jnp.outer(scale, scale))
     eigenvalues = jnp.maximum(eigenvalues, jnp.finfo(fisher_x.dtype).eps * jnp.max(eigenvalues))
     log_det = 2.0 * jnp.sum(jnp.log(scale)) + jnp.sum(jnp.log(eigenvalues))
+    location_term = -r * log_2 + (r / 2) * jnp.log(2.0 * jnp.pi) - 0.5 * log_det
 
-    return delta_term + gamma_term + sigma_term - 0.5 * log_det
+    return delta_term + location_term + labelling_term + sigma_term
 
 def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
