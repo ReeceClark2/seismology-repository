@@ -70,6 +70,13 @@ BRETTHORST_RATIO_DELTA = 5e1
 NUTS_COVARIANCE_MIN_ESS = 50.0
 NUTS_COVARIANCE_MIN_ESS_PER_PARAMETER = 2.0
 BRETTHORST_RATIO_SIGMA = 1e2
+
+# Lower bound sigma_min of the Jeffreys prior on sigma, relative to the in-band data power:
+# sigma_min^2 = 10^(dB/10) mean(d^2). A processing-error tolerance (filter ringing, leakage), not
+# a measured noise level: the fit is not trusted to resolve structure below it. Once the residual
+# reaches it the likelihood flattens, so extra signals stop paying. Inactive while RSS is well above
+# the floor, as on ordinary noisy data.
+BRETTHORST_SIGMA_FLOOR_DB = -60.0
 DEFAULT_MAX_TRIM_SECONDS = 10 * 3600
 DEFAULT_RINGING_DB = -60.0
 
@@ -143,8 +150,30 @@ def get_stable_rss(t, d, fs, Qs):
     residual = d - G.T @ beta
     return jnp.sum(residual ** 2)
 
+def get_noise_floor_variance(sum_sq_data, N):
+    """sigma_min^2 in the effective-sample units of the Bretthorst terms (raw RSS over N = 2BT):
+    10^(dB/10) mean(d^2) per raw sample = 10^(dB/10) sum d^2 / N per effective sample."""
+    return 10.0 ** (BRETTHORST_SIGMA_FLOOR_DB / 10.0) * sum_sq_data / N
+
+def get_log_sigma_floor_factor(k, rss, floor_variance):
+    """log P(k, x), x = RSS / (2 sigma_min^2): truncating the sigma integral at sigma_min.
+
+      int_{sigma_min}^inf sigma^(-2k) exp(-RSS / 2 sigma^2) dsigma / sigma = (1/2) (RSS/2)^(-k) Gamma(k) P(k, x),
+
+    so the truncated term is the untruncated one plus log P(k, x). For RSS >> 2k sigma_min^2, P -> 1
+    (no change); for RSS << 2k sigma_min^2, P ~ x^k / Gamma(k + 1) and the RSS dependence cancels.
+    Where P underflows (deep below the floor), the leading series term is used:
+    log P ~ k log x - x - lgamma(k + 1) - log(1 - x / (k + 1)).
+    """
+    x = rss / (2.0 * floor_variance)
+    p = jsp.gammainc(k, x)
+    tiny = jnp.finfo(p.dtype).tiny
+    usable = p > tiny
+    series = k * jnp.log(jnp.maximum(x, tiny)) - x - jsp.gammaln(k + 1.0) - jnp.log1p(-jnp.minimum(x / (k + 1.0), 0.5))
+    return jnp.where(usable, jnp.log(jnp.where(usable, p, 1.0)), series)
+
 def get_posterior_variance(t, d, B, signals):
-    """v = RSS / (N - m - 2), the noise scale of the Bretthorst covariance (N = 2BT).
+    """v = max(RSS / (N - m - 2), sigma_min^2), the noise scale of the Bretthorst covariance (N = 2BT).
 
     Proportional to the in-band noise level and independent of bandwidth, so values from
     different subbands and from the full band are comparable.
@@ -154,7 +183,7 @@ def get_posterior_variance(t, d, B, signals):
     m = 2 * s
     N = int(2 * t[-1] * B)
     rss = jnp.sum(d ** 2) if s == 0 else get_stable_rss(t, d, fs, Qs)
-    return float(rss / max(N - m - 2.0, 1.0))
+    return float(jnp.maximum(rss / max(N - m - 2.0, 1.0), get_noise_floor_variance(jnp.sum(d ** 2), N)))
 
 def get_subband_index(fs, band_edges):
     """Core subband that owns each frequency: [edge_k, edge_k+1), the last core closed above.
@@ -302,8 +331,10 @@ def get_log_prob(t, d, B, signals):
     rss = get_stable_rss(t, d, fs, Qs)
     rss = jnp.maximum(rss, jnp.finfo(d.dtype).eps * sum_sq_data)
 
-    # Bretthorst: [1 - m h^2 / (N d^2)]^((m - N) / 2) = (RSS / sum d^2)^((m - N) / 2)
-    return 0.5 * (m - N) * jnp.log(rss / sum_sq_data)
+    # Bretthorst: [1 - m h^2 / (N d^2)]^((m - N) / 2) = (RSS / sum d^2)^((m - N) / 2),
+    # with sigma's prior truncated at sigma_min (flat once RSS falls below the floor).
+    floor_term = get_log_sigma_floor_factor(0.5 * (N - m), rss, get_noise_floor_variance(sum_sq_data, N))
+    return 0.5 * (m - N) * jnp.log(rss / sum_sq_data) + floor_term
 
 def get_novelty_function(t, existing):
     """Return f(signal) = 1 - ||P_existing e||^2 / ||e||^2 for a candidate's (cos, sin) pair.
@@ -1046,13 +1077,14 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
       - each signal uniform in f on [f_min, f_max] and in log Q on [log Q_min, log Q_max], i.e.
         each normalized coordinate x = (x_omega, x_logQ) uniform on [-1, 1] (density 1/2);
         the s signals are exchangeable;
-      - sigma ~ Jeffreys (R_sigma).
+      - sigma ~ Jeffreys (R_sigma), truncated below at sigma_min (BRETTHORST_SIGMA_FLOOR_DB).
     Integrating amplitudes (prior evaluated at the projection), x (Laplace), then delta and sigma:
 
       log Z = [lgamma(m/2) - log 2 - log log R_delta - (m/2) log(P / 2)]          amplitudes, delta
             + [-r log 2 + (r/2) log(2 pi) - (1/2) log det b_x]                    location (Occam)
             + log s!                                                              signal labellings
-            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)]   sigma
+            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)
+               + log P((N-m-r)/2, RSS / 2 sigma_min^2)]                               sigma
 
     with m = r = 2s, P = projected energy, RSS = residual sum of squares, and b_x = -(1/2) Hessian
     of P in x coordinates, taken as the Gauss-Newton Fisher matrix J_perp^T J_perp (exact up to
@@ -1062,13 +1094,18 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
     every model. All sums are raw sums over the samples; rescaling the data shifts log Z by
     -(N/2) log c for every model alike. Assumes each signal's posterior lies well inside the band.
 
-    s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2).
+    P is the regularized lower incomplete gamma function: 0 when RSS is well above (N-m-r) sigma_min^2,
+    and below it cancels the RSS dependence, so fitting structure under the floor earns nothing.
+    The normalization log log R_sigma is left as is; it is common to every model.
+
+    s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2) + log P(N/2, sum d^2 / 2 sigma_min^2).
 
     With posterior_covariance (the NUTS draw covariance Sigma of (f, log Q), interleaved and
     f-sorted), the Laplace volume is measured from the draws instead of the curvature. NUTS
-    samples the posterior with sigma integrated out, so Sigma = RSS / (N - m) b^-1, giving
+    samples the posterior with sigma integrated out, so Sigma = v b^-1 with v = max(RSS / (N - m), sigma_min^2),
+    giving
 
-      -(1/2) log det b_x = (1/2) log det Sigma_x - (r/2) log(RSS / (N - m)),
+      -(1/2) log det b_x = (1/2) log det Sigma_x - (r/2) log v,
 
     with Sigma_x the covariance in x coordinates. This measures the actual spread of probability
     mass and cannot diverge at a near-singular pair; it falls back to the Fisher matrix if Sigma_x
@@ -1078,8 +1115,11 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
     log_2 = jnp.log(2.0)
     log_log_R_sigma = jnp.log(jnp.log(BRETTHORST_RATIO_SIGMA))
 
+    floor_variance = get_noise_floor_variance(sum_sq_data, N)
+
     if n_signals == 0:
-        return jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(sum_sq_data / 2)
+        return (jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(sum_sq_data / 2)
+                + get_log_sigma_floor_factor(N / 2, sum_sq_data, floor_variance))
 
     m = 2 * n_signals
     r = 2 * n_signals
@@ -1089,7 +1129,8 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
         return -jnp.inf
 
     delta_term = jsp.gammaln(m / 2) - log_2 - jnp.log(jnp.log(BRETTHORST_RATIO_DELTA)) - (m / 2) * jnp.log(sum_sq_proj / 2)
-    sigma_term = jsp.gammaln(dof / 2) - log_2 - log_log_R_sigma - (dof / 2) * jnp.log(rss / 2)
+    sigma_term = (jsp.gammaln(dof / 2) - log_2 - log_log_R_sigma - (dof / 2) * jnp.log(rss / 2)
+                  + get_log_sigma_floor_factor(dof / 2, rss, floor_variance))
     labelling_term = jsp.gammaln(n_signals + 1.0)
 
     omega_halfwidth = jnp.pi * (f_max - f_min)
@@ -1106,7 +1147,7 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
 
         if bool(jnp.min(eigenvalues) > 0):
             log_det_covariance = 2.0 * jnp.sum(jnp.log(scale)) + jnp.sum(jnp.log(eigenvalues))
-            location_term = prior_term + 0.5 * log_det_covariance - (r / 2) * jnp.log(rss / (N - m))
+            location_term = prior_term + 0.5 * log_det_covariance - (r / 2) * jnp.log(jnp.maximum(rss / (N - m), floor_variance))
 
     if location_term is None:
         # Fisher is in (f, Q), interleaved [f1, Q1, ...]; convert to x: b_x = J^T b J with
@@ -1216,8 +1257,9 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None)
         safe_f_eigenvalues = jnp.maximum(f_eigenvalues, f_floor)
         covariance_scaled = (f_eigenvectors / safe_f_eigenvalues[None, :]) @ f_eigenvectors.T
 
-        # Posterior-consistent noise level: raw RSS over effective degrees of freedom N = 2BT.
-        posterior_variance = rss / safe_dof
+        # Posterior-consistent noise level: raw RSS over effective degrees of freedom N = 2BT,
+        # no lower than the sigma floor.
+        posterior_variance = jnp.maximum(rss / safe_dof, get_noise_floor_variance(sum_sq_data, N))
         covariance = posterior_variance * covariance_scaled / jnp.outer(fisher_scale, fisher_scale)
         unc = jnp.sqrt(jnp.maximum(jnp.diag(covariance), 0.0))
         fs_unc = unc[::2]
@@ -1228,7 +1270,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None)
     noise_variance = jnp.maximum(noise_variance, noise_floor)
 
     ratio = jnp.clip(sum_sq_proj / safe_sum_sq_data, 0.0, 1.0 - jnp.finfo(d.dtype).eps)
-    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
+    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio) + get_log_sigma_floor_factor(0.5 * (N - m), rss, get_noise_floor_variance(sum_sq_data, N))
     snr = jnp.where(m > 0, jnp.sqrt((m / jnp.maximum(N, 1)) * (1.0 + sum_sq_proj / (m * noise_variance))), 0.0)
 
     # BIC (kept for comparison; written to iteration diagnostics).

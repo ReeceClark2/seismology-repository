@@ -12,7 +12,7 @@ f_points = 4000
 Q_points = 150
 f_margin = 0.00004
 log_Q_margin = 2
-depth = 64
+depth = 70
 
 warmup = 500
 sample = 1_000
@@ -20,7 +20,7 @@ sample = 1_000
 devices = 12
 cores = 96
 diagnostics = "full"
-signal_step = 8
+signal_step = 7
 subbands = 6
 
 min_novelty = 0.05
