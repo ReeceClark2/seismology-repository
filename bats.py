@@ -64,19 +64,7 @@ MIN_TRIM_SECONDS = 5 * 3600
 # when comparing s = 0 with s >= 1.
 BRETTHORST_RATIO_DELTA = 5e1
 
-# Laplace volume from NUTS draws: the sample covariance of (f, log Q) is used when the smallest
-# effective sample size is at least max(MIN_ESS, MIN_ESS_PER_PARAMETER * 2s); otherwise the
-# Gauss-Newton Fisher matrix at the MAP is used instead.
-NUTS_COVARIANCE_MIN_ESS = 50.0
-NUTS_COVARIANCE_MIN_ESS_PER_PARAMETER = 2.0
 BRETTHORST_RATIO_SIGMA = 1e2
-
-# Lower bound sigma_min of the Jeffreys prior on sigma, relative to the in-band data power:
-# sigma_min^2 = 10^(dB/10) mean(d^2). A processing-error tolerance (filter ringing, leakage), not
-# a measured noise level: the fit is not trusted to resolve structure below it. Once the residual
-# reaches it the likelihood flattens, so extra signals stop paying. Inactive while RSS is well above
-# the floor, as on ordinary noisy data.
-BRETTHORST_SIGMA_FLOOR_DB = -60.0
 DEFAULT_MAX_TRIM_SECONDS = 10 * 3600
 DEFAULT_RINGING_DB = -60.0
 
@@ -150,30 +138,8 @@ def get_stable_rss(t, d, fs, Qs):
     residual = d - G.T @ beta
     return jnp.sum(residual ** 2)
 
-def get_noise_floor_variance(sum_sq_data, N):
-    """sigma_min^2 in the effective-sample units of the Bretthorst terms (raw RSS over N = 2BT):
-    10^(dB/10) mean(d^2) per raw sample = 10^(dB/10) sum d^2 / N per effective sample."""
-    return 10.0 ** (BRETTHORST_SIGMA_FLOOR_DB / 10.0) * sum_sq_data / N
-
-def get_log_sigma_floor_factor(k, rss, floor_variance):
-    """log P(k, x), x = RSS / (2 sigma_min^2): truncating the sigma integral at sigma_min.
-
-      int_{sigma_min}^inf sigma^(-2k) exp(-RSS / 2 sigma^2) dsigma / sigma = (1/2) (RSS/2)^(-k) Gamma(k) P(k, x),
-
-    so the truncated term is the untruncated one plus log P(k, x). For RSS >> 2k sigma_min^2, P -> 1
-    (no change); for RSS << 2k sigma_min^2, P ~ x^k / Gamma(k + 1) and the RSS dependence cancels.
-    Where P underflows (deep below the floor), the leading series term is used:
-    log P ~ k log x - x - lgamma(k + 1) - log(1 - x / (k + 1)).
-    """
-    x = rss / (2.0 * floor_variance)
-    p = jsp.gammainc(k, x)
-    tiny = jnp.finfo(p.dtype).tiny
-    usable = p > tiny
-    series = k * jnp.log(jnp.maximum(x, tiny)) - x - jsp.gammaln(k + 1.0) - jnp.log1p(-jnp.minimum(x / (k + 1.0), 0.5))
-    return jnp.where(usable, jnp.log(jnp.where(usable, p, 1.0)), series)
-
 def get_posterior_variance(t, d, B, signals):
-    """v = max(RSS / (N - m - 2), sigma_min^2), the noise scale of the Bretthorst covariance (N = 2BT).
+    """v = RSS / (N - m - 2), the noise scale of the Bretthorst covariance (N = 2BT).
 
     Proportional to the in-band noise level and independent of bandwidth, so values from
     different subbands and from the full band are comparable.
@@ -183,7 +149,7 @@ def get_posterior_variance(t, d, B, signals):
     m = 2 * s
     N = int(2 * t[-1] * B)
     rss = jnp.sum(d ** 2) if s == 0 else get_stable_rss(t, d, fs, Qs)
-    return float(jnp.maximum(rss / max(N - m - 2.0, 1.0), get_noise_floor_variance(jnp.sum(d ** 2), N)))
+    return float(rss / max(N - m - 2.0, 1.0))
 
 def get_subband_index(fs, band_edges):
     """Core subband that owns each frequency: [edge_k, edge_k+1), the last core closed above.
@@ -234,90 +200,35 @@ def interleaved_indices(signal_indices):
     signal_indices = np.asarray(signal_indices, dtype=int)
     return np.stack((2 * signal_indices, 2 * signal_indices + 1), axis=-1).ravel()
 
-def subset_posterior(posterior, signal_indices):
-    """Posterior summary restricted to some signals (marginal covariance of those signals)."""
-    if posterior is None or posterior.get("covariance") is None:
-        return None
-    index = interleaved_indices(signal_indices)
-    subset = dict(posterior)
-    subset["covariance"] = np.asarray(posterior["covariance"])[np.ix_(index, index)]
-    return subset
-
-def get_posterior_summary(fs, log_Qs, valid):
-    """Covariance of (f, log Q) from NUTS draws, for the Laplace volume of the global likelihood.
-
-    fs, log_Qs: (chains, draws, s), each draw sorted by f; valid: (chains, draws) mask of finite,
-    non-divergent draws. Parameters are interleaved [f1, logQ1, f2, logQ2, ...] in sorted order.
-    The covariance is returned only if the smallest effective sample size is large enough for a
-    reliable determinant and the covariance is positive definite; otherwise it is None and the
-    Fisher matrix is used instead.
-    """
-    fs = np.asarray(fs)
-    log_Qs = np.asarray(log_Qs)
-    n_chains, n_draws, n_signals = fs.shape
-    r = 2 * n_signals
-    stacked = np.stack((fs, log_Qs), axis=-1).reshape(n_chains, n_draws, r)
-    required = max(NUTS_COVARIANCE_MIN_ESS, NUTS_COVARIANCE_MIN_ESS_PER_PARAMETER * r)
-
-    ess = np.asarray(effective_sample_size(stacked)) if n_draws >= 2 else np.full(r, np.nan)
-    ess_min = float(np.nanmin(ess)) if np.any(np.isfinite(ess)) else 0.0
-    flat = stacked.reshape(-1, r)[np.asarray(valid).reshape(-1)]
-    summary = {"covariance": None, "ess_min": ess_min, "required_ess": required, "draws": int(flat.shape[0]), "reason": ""}
-
-    if flat.shape[0] <= r:
-        summary["reason"] = f"only {flat.shape[0]} valid draws for {r} parameters"
-        return summary
-    if ess_min < required:
-        summary["reason"] = f"min ESS {ess_min:.0f} < {required:.0f}"
-        return summary
-
-    covariance = np.atleast_2d(np.cov(flat, rowvar=False))
-    scale = np.sqrt(np.diag(covariance))
-
-    if not np.all(np.isfinite(covariance)) or np.any(scale <= 0):
-        summary["reason"] = "degenerate draw covariance"
-        return summary
-
-    eigenvalues = np.linalg.eigvalsh(covariance / np.outer(scale, scale))
-    if eigenvalues.min() <= np.finfo(float).eps * eigenvalues.max():
-        summary["reason"] = "singular draw covariance"
-        return summary
-
-    summary["covariance"] = covariance
-    return summary
-
-def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, posterior=None):
+def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max):
     """Backward elimination: drop the signal whose removal most improves the model-selection
     score (the Bretthorst global likelihood from get_statistics), repeat.
 
     Remaining signals are not re-optimized after a removal, so each removal score is a
-    lower bound on what a refit would give (the pruning is conservative). With a NUTS posterior,
-    each candidate is scored with the draw covariance of the signals it keeps.
+    lower bound on what a refit would give (the pruning is conservative).
     Cost per pass O(s * n s^2): one get_statistics (QR + Fisher) per candidate removal.
     """
-    all_signals = np.array(signals, dtype=float).reshape(-1, 2)
-    all_bounds = np.array(bounds, dtype=float).reshape(-1, 4)
+    def score(candidate):
+        return float(get_statistics(t, d, B, jnp.asarray(candidate), f_min, f_max, Q_min, Q_max)[1])
 
-    def score(keep):
-        return float(get_statistics(t, d, B, jnp.asarray(all_signals[keep]), f_min, f_max, Q_min, Q_max, subset_posterior(posterior, keep))[1])
-
-    keep = list(range(all_signals.shape[0]))
-    current = score(keep)
+    signals = np.array(signals, dtype=float).reshape(-1, 2)
+    bounds = np.array(bounds, dtype=float).reshape(-1, 4)
+    current = score(signals)
     removed = []
 
-    while len(keep) > 1:
-        candidates = [[index for index in keep if index != j] for j in keep]
-        scores = np.array([score(candidate) for candidate in candidates])
-        best = int(np.argmax(scores))
+    while signals.shape[0] > 1:
+        scores = np.array([score(np.delete(signals, j, axis=0)) for j in range(signals.shape[0])])
+        j = int(np.argmax(scores))
 
-        if not scores[best] > current:
+        if not scores[j] > current:
             break
 
-        removed.append(tuple(all_signals[keep[best]]))
-        keep = candidates[best]
-        current = scores[best]
+        removed.append(tuple(signals[j]))
+        signals = np.delete(signals, j, axis=0)
+        bounds = np.delete(bounds, j, axis=0)
+        current = scores[j]
 
-    return jnp.asarray(all_signals[keep]), jnp.asarray(all_bounds[keep]), removed, subset_posterior(posterior, keep)
+    return jnp.asarray(signals), jnp.asarray(bounds), removed
 
 # Signal Update --------------------------------------------------------------------------
 
@@ -331,10 +242,8 @@ def get_log_prob(t, d, B, signals):
     rss = get_stable_rss(t, d, fs, Qs)
     rss = jnp.maximum(rss, jnp.finfo(d.dtype).eps * sum_sq_data)
 
-    # Bretthorst: [1 - m h^2 / (N d^2)]^((m - N) / 2) = (RSS / sum d^2)^((m - N) / 2),
-    # with sigma's prior truncated at sigma_min (flat once RSS falls below the floor).
-    floor_term = get_log_sigma_floor_factor(0.5 * (N - m), rss, get_noise_floor_variance(sum_sq_data, N))
-    return 0.5 * (m - N) * jnp.log(rss / sum_sq_data) + floor_term
+    # Bretthorst: [1 - m h^2 / (N d^2)]^((m - N) / 2) = (RSS / sum d^2)^((m - N) / 2)
+    return 0.5 * (m - N) * jnp.log(rss / sum_sq_data)
 
 def get_novelty_function(t, existing):
     """Return f(signal) = 1 - ||P_existing e||^2 / ||e||^2 for a candidate's (cos, sin) pair.
@@ -419,7 +328,7 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
 MAP_BOUND_TOLERANCE = 1e-3
-MAX_TREE_DEPTH = 6
+MAX_TREE_DEPTH = 7
 
 def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1000, gtol=1e-6):
     """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
@@ -594,8 +503,8 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
     draws = jnp.stack((fs, log_Qs), axis=-1).reshape(-1, f_init.shape[0], 2)
     orders = order.reshape(-1, f_init.shape[0])
 
-    valid_by_chain = jnp.isfinite(extra_fields["potential_energy"]) & ~extra_fields["diverging"]
-    valid = valid_by_chain.reshape(-1)
+    valid = jnp.isfinite(extra_fields["potential_energy"]) & ~extra_fields["diverging"]
+    valid = valid.reshape(-1)
 
     if not bool(jnp.any(valid)):
         raise ValueError("NUTS produced no finite, non-divergent post-warmup draws.")
@@ -616,33 +525,23 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
     returned_signals = jnp.stack((selected[:, 0], jnp.exp(selected[:, 1])), axis=-1)
     returned_bounds = bounds[selected_order]
 
-    # Posterior covariance of (f, log Q) for the Laplace volume; rows follow the f-sorted draws,
-    # which is also the order of the returned signals.
-    posterior = get_posterior_summary(fs, log_Qs, valid_by_chain)
-    prefix = f"{tag} " if tag else ""
-
     if refine:
         returned_signals, map_info = map_refine(t, d, B, returned_signals, returned_bounds)
+        prefix = f"{tag} " if tag else ""
         print(
             f"{prefix}MAP refinement ({len(returned_signals)} signals): accepted={map_info['accepted']}, "
             f"+{map_info['improvement']:.3f} nats, {map_info['iterations']} iterations; {map_info['message']}\n"
             f"{prefix}  max |grad| per box width: free {map_info['free_gradient']:.2e}, "
-            f"at bound {map_info['bound_gradient']:.2e} ({map_info['at_bound']} signal(s) at a box bound)",
+            f"at bound {map_info['bound_gradient']:.2e} ({map_info['at_bound']} signal(s) at a box bound)\n",
             flush=True,
         )
-
-    if posterior["covariance"] is not None:
-        volume_line = f"{prefix}  Laplace volume from NUTS draws (min ESS {posterior['ess_min']:.0f}, needed {posterior['required_ess']:.0f})\n"
-    else:
-        volume_line = f"{prefix}  Laplace volume from the Fisher matrix ({posterior['reason']})\n"
-    print(volume_line, flush=True)
 
     if return_diagnostics:
         # fs and log_Qs are (chains, draws, s), each draw already sorted by f.
         diagnostics = get_nuts_diagnostics(fs, log_Qs, extra_fields)
-        return returned_signals, returned_bounds, posterior, diagnostics
+        return returned_signals, returned_bounds, diagnostics
 
-    return returned_signals, returned_bounds, posterior
+    return returned_signals, returned_bounds
 
 # Orchestrators ---------------------------------------------------------------------------
 
@@ -1069,7 +968,7 @@ def get_uncertainties(t, d, B, signals):
 
 # Evaluation (all) ------------------------------------------------------------------------
 
-def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max, posterior_covariance=None):
+def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max):
     """Bretthorst (1988) global likelihood log P(D | s signals), up to a model-independent constant.
 
     Built from quantities at the MAP. Priors:
@@ -1077,14 +976,13 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
       - each signal uniform in f on [f_min, f_max] and in log Q on [log Q_min, log Q_max], i.e.
         each normalized coordinate x = (x_omega, x_logQ) uniform on [-1, 1] (density 1/2);
         the s signals are exchangeable;
-      - sigma ~ Jeffreys (R_sigma), truncated below at sigma_min (BRETTHORST_SIGMA_FLOOR_DB).
+      - sigma ~ Jeffreys (R_sigma).
     Integrating amplitudes (prior evaluated at the projection), x (Laplace), then delta and sigma:
 
       log Z = [lgamma(m/2) - log 2 - log log R_delta - (m/2) log(P / 2)]          amplitudes, delta
             + [-r log 2 + (r/2) log(2 pi) - (1/2) log det b_x]                    location (Occam)
             + log s!                                                              signal labellings
-            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)
-               + log P((N-m-r)/2, RSS / 2 sigma_min^2)]                               sigma
+            + [lgamma((N-m-r)/2) - log 2 - log log R_sigma - ((N-m-r)/2) log(RSS / 2)]   sigma
 
     with m = r = 2s, P = projected energy, RSS = residual sum of squares, and b_x = -(1/2) Hessian
     of P in x coordinates, taken as the Gauss-Newton Fisher matrix J_perp^T J_perp (exact up to
@@ -1094,32 +992,14 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
     every model. All sums are raw sums over the samples; rescaling the data shifts log Z by
     -(N/2) log c for every model alike. Assumes each signal's posterior lies well inside the band.
 
-    P is the regularized lower incomplete gamma function: 0 when RSS is well above (N-m-r) sigma_min^2,
-    and below it cancels the RSS dependence, so fitting structure under the floor earns nothing.
-    The normalization log log R_sigma is left as is; it is common to every model.
-
-    s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2) + log P(N/2, sum d^2 / 2 sigma_min^2).
-
-    With posterior_covariance (the NUTS draw covariance Sigma of (f, log Q), interleaved and
-    f-sorted), the Laplace volume is measured from the draws instead of the curvature. NUTS
-    samples the posterior with sigma integrated out, so Sigma = v b^-1 with v = max(RSS / (N - m), sigma_min^2),
-    giving
-
-      -(1/2) log det b_x = (1/2) log det Sigma_x - (r/2) log v,
-
-    with Sigma_x the covariance in x coordinates. This measures the actual spread of probability
-    mass and cannot diverge at a near-singular pair; it falls back to the Fisher matrix if Sigma_x
-    is not positive definite.
+    s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2).
     """
     n_signals = fs.shape[0]
     log_2 = jnp.log(2.0)
     log_log_R_sigma = jnp.log(jnp.log(BRETTHORST_RATIO_SIGMA))
 
-    floor_variance = get_noise_floor_variance(sum_sq_data, N)
-
     if n_signals == 0:
-        return (jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(sum_sq_data / 2)
-                + get_log_sigma_floor_factor(N / 2, sum_sq_data, floor_variance))
+        return jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(sum_sq_data / 2)
 
     m = 2 * n_signals
     r = 2 * n_signals
@@ -1129,48 +1009,24 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
         return -jnp.inf
 
     delta_term = jsp.gammaln(m / 2) - log_2 - jnp.log(jnp.log(BRETTHORST_RATIO_DELTA)) - (m / 2) * jnp.log(sum_sq_proj / 2)
-    sigma_term = (jsp.gammaln(dof / 2) - log_2 - log_log_R_sigma - (dof / 2) * jnp.log(rss / 2)
-                  + get_log_sigma_floor_factor(dof / 2, rss, floor_variance))
+    sigma_term = jsp.gammaln(dof / 2) - log_2 - log_log_R_sigma - (dof / 2) * jnp.log(rss / 2)
     labelling_term = jsp.gammaln(n_signals + 1.0)
 
+    # Fisher is in (f, Q), interleaved [f1, Q1, ...]; convert to x: b_x = J^T b J with
+    # J = diag(df/dx_omega, dQ/dx_logQ) = diag(omega_halfwidth / 2 pi, Q log_Q_halfwidth).
     omega_halfwidth = jnp.pi * (f_max - f_min)
     log_Q_halfwidth = 0.5 * (jnp.log(Q_max) - jnp.log(Q_min))
-    prior_term = -r * log_2 + (r / 2) * jnp.log(2.0 * jnp.pi)
-    location_term = None
-
-    if posterior_covariance is not None:
-        # x_omega = (2 pi f - omega_c) / omega_hw, x_logQ = (log Q - c) / log_Q_hw: linear in (f, log Q).
-        to_x = jnp.stack((jnp.full_like(fs, 2.0 * jnp.pi / omega_halfwidth), jnp.full_like(fs, 1.0 / log_Q_halfwidth)), axis=-1).ravel()
-        covariance_x = jnp.asarray(posterior_covariance) * jnp.outer(to_x, to_x)
-        scale = jnp.sqrt(jnp.maximum(jnp.diag(covariance_x), jnp.finfo(covariance_x.dtype).tiny))
-        eigenvalues = jnp.linalg.eigvalsh(covariance_x / jnp.outer(scale, scale))
-
-        if bool(jnp.min(eigenvalues) > 0):
-            log_det_covariance = 2.0 * jnp.sum(jnp.log(scale)) + jnp.sum(jnp.log(eigenvalues))
-            location_term = prior_term + 0.5 * log_det_covariance - (r / 2) * jnp.log(jnp.maximum(rss / (N - m), floor_variance))
-
-    if location_term is None:
-        # Fisher is in (f, Q), interleaved [f1, Q1, ...]; convert to x: b_x = J^T b J with
-        # J = diag(df/dx_omega, dQ/dx_logQ) = diag(omega_halfwidth / 2 pi, Q log_Q_halfwidth).
-        jacobian = jnp.stack((jnp.full_like(fs, omega_halfwidth / (2.0 * jnp.pi)), Qs * log_Q_halfwidth), axis=-1).ravel()
-        fisher_x = fisher * jnp.outer(jacobian, jacobian)
-        scale = jnp.sqrt(jnp.maximum(jnp.diag(fisher_x), jnp.finfo(fisher_x.dtype).tiny))
-        eigenvalues = jnp.linalg.eigvalsh(fisher_x / jnp.outer(scale, scale))
-        eigenvalues = jnp.maximum(eigenvalues, jnp.finfo(fisher_x.dtype).eps * jnp.max(eigenvalues))
-        log_det = 2.0 * jnp.sum(jnp.log(scale)) + jnp.sum(jnp.log(eigenvalues))
-        location_term = prior_term - 0.5 * log_det
+    jacobian = jnp.stack((jnp.full_like(fs, omega_halfwidth / (2.0 * jnp.pi)), Qs * log_Q_halfwidth), axis=-1).ravel()
+    fisher_x = fisher * jnp.outer(jacobian, jacobian)
+    scale = jnp.sqrt(jnp.maximum(jnp.diag(fisher_x), jnp.finfo(fisher_x.dtype).tiny))
+    eigenvalues = jnp.linalg.eigvalsh(fisher_x / jnp.outer(scale, scale))
+    eigenvalues = jnp.maximum(eigenvalues, jnp.finfo(fisher_x.dtype).eps * jnp.max(eigenvalues))
+    log_det = 2.0 * jnp.sum(jnp.log(scale)) + jnp.sum(jnp.log(eigenvalues))
+    location_term = -r * log_2 + (r / 2) * jnp.log(2.0 * jnp.pi) - 0.5 * log_det
 
     return delta_term + location_term + labelling_term + sigma_term
 
-def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None):
-    """posterior: NUTS summary from nuts() for these signals (in the given order), or None.
-    Its draw covariance, when present, sets the Laplace volume of the global likelihood."""
-    posterior_covariance = None
-    if posterior is not None and posterior.get("covariance") is not None:
-        signal_order = np.asarray(jnp.argsort(jnp.asarray(signals).reshape(-1, 2)[:, 0]))
-        index = interleaved_indices(signal_order)
-        posterior_covariance = np.asarray(posterior["covariance"])[np.ix_(index, index)]
-
+def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max):
     fs, Qs = unpack_signals(signals)
     n_signals = fs.shape[0]
     m = 2 * n_signals
@@ -1257,9 +1113,8 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None)
         safe_f_eigenvalues = jnp.maximum(f_eigenvalues, f_floor)
         covariance_scaled = (f_eigenvectors / safe_f_eigenvalues[None, :]) @ f_eigenvectors.T
 
-        # Posterior-consistent noise level: raw RSS over effective degrees of freedom N = 2BT,
-        # no lower than the sigma floor.
-        posterior_variance = jnp.maximum(rss / safe_dof, get_noise_floor_variance(sum_sq_data, N))
+        # Posterior-consistent noise level: raw RSS over effective degrees of freedom N = 2BT.
+        posterior_variance = rss / safe_dof
         covariance = posterior_variance * covariance_scaled / jnp.outer(fisher_scale, fisher_scale)
         unc = jnp.sqrt(jnp.maximum(jnp.diag(covariance), 0.0))
         fs_unc = unc[::2]
@@ -1270,7 +1125,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None)
     noise_variance = jnp.maximum(noise_variance, noise_floor)
 
     ratio = jnp.clip(sum_sq_proj / safe_sum_sq_data, 0.0, 1.0 - jnp.finfo(d.dtype).eps)
-    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio) + get_log_sigma_floor_factor(0.5 * (N - m), rss, get_noise_floor_variance(sum_sq_data, N))
+    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
     snr = jnp.where(m > 0, jnp.sqrt((m / jnp.maximum(N, 1)) * (1.0 + sum_sq_proj / (m * noise_variance))), 0.0)
 
     # BIC (kept for comparison; written to iteration diagnostics).
@@ -1280,7 +1135,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None)
     bic = jnp.where(valid, bic_score, -jnp.inf)
 
     # Bretthorst global likelihood: the model-selection score (glob_ll).
-    bretthorst = get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max, posterior_covariance)
+    bretthorst = get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max)
     bretthorst_valid = valid & (rss > 0) & ((n_signals == 0) | (sum_sq_proj > 0))
     glob_ll = jnp.where(bretthorst_valid & jnp.isfinite(bretthorst), bretthorst, -jnp.inf)
 
@@ -1429,7 +1284,7 @@ def save_subband_summary(path, summaries):
         ("Filter Min (Hz)", "filter_min"), ("Filter Max (Hz)", "filter_max"), ("Fit Min (Hz)", "fit_min"), ("Fit Max (Hz)", "fit_max"),
         ("Amplitude Kept at Core Edges", "core_edge_gain"), ("Trim (h)", "trim_hours"), ("Selected Signals", "selected"),
         ("Kept Signals", "kept"), ("Global Likelihood (Bretthorst)", "glob_ll"), ("BIC", "bic"),
-        ("Noise Scale v", "noise_scale"), ("Laplace Volume", "laplace_volume"),
+        ("Noise Scale v", "noise_scale"),
     ]
 
     with (diagnostic_path / "subband_summary.csv").open("w", newline="") as file:
@@ -2007,7 +1862,6 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     checkpoints = [None] * depth
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
-    posterior = None   # NUTS summary for the current signals; None until the next refinement
 
     log_prob, glob_ll, noise_variance, snr, k2, *_, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
@@ -2056,19 +1910,18 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
         signals = jnp.concatenate([signals, signal], axis=0)
         bounds = jnp.concatenate([bounds, signal_bounds], axis=0)
-        posterior = None
 
         refined = len(signals) % signal_step == 0
 
         nuts_start = perf_counter()
         if refined:
-            signals, bounds, posterior = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag)
+            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag)
         nuts_elapsed = perf_counter() - nuts_start
 
         if diagnostics == "full":
-            checkpoints[iteration] = (signals, bounds, posterior)
+            checkpoints[iteration] = (signals, bounds)
 
-            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
 
             if refined:
                 thumbprints.append((len(signals), float(glob_ll)))
@@ -2080,10 +1933,10 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc, core_edges=core_edges, f_range=(f_min, f_max), filter_edges=filter_edges)
             plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
         else:
-            checkpoints[iteration] = (signals, bounds, posterior)
+            checkpoints[iteration] = (signals, bounds)
 
             if refined:
-                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior)
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
                 thumbprints.append((len(signals), float(glob_ll)))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
@@ -2121,20 +1974,20 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     if not checkpoints:
         print(f"{tag} Colony found no resolvable signals.\n", flush=True)
         noise_scale = get_posterior_variance(t, d, B, jnp.empty((0, 2)))
-        colony_summary.update(selected=0, kept=0, glob_ll=thumbprints[0][1], bic=float("nan"), noise_scale=noise_scale, laplace_volume="")
+        colony_summary.update(selected=0, kept=0, glob_ll=thumbprints[0][1], bic=float("nan"), noise_scale=noise_scale)
         return jnp.empty((0, 2)), jnp.empty((0, 4)), noise_scale, empty_marginal(colony_summary)
 
     checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
     last_count = max(checkpoint_by_count)
-    checkpoint_by_count[0] = (jnp.empty((0, 2)), jnp.empty((0, 4)), None)
+    checkpoint_by_count[0] = (jnp.empty((0, 2)), jnp.empty((0, 4)))
 
     # If the greedy search stopped early (or depth is not a multiple of signal_step), the last
     # checkpoint was never refined. Refine and score it so the bisection has a right-hand anchor
-    # scored the same way as every other count (MAP + NUTS-covariance Laplace volume).
+    # scored the same way as every other count (at the MAP).
     if last_count not in {int(count) for count, _ in thumbprints}:
         last_signals, last_bounds = checkpoint_by_count[last_count][0], checkpoint_by_count[last_count][1]
         checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag)
-        last_glob_ll = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, checkpoint_by_count[last_count][2])[1])
+        last_glob_ll = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max)[1])
         print(f"{tag} Refined the last checkpoint: global likelihood at {last_count} signals: {last_glob_ll:.2f}\n", flush=True)
         thumbprints.append((last_count, last_glob_ll))
 
@@ -2173,7 +2026,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
         for count, checkpoint in zip(candidates, candidate_refits):
             refined_checkpoints[count] = checkpoint
-            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max, checkpoint[2])
+            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max)
 
             log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
             bic = statistics[-1]
@@ -2183,21 +2036,21 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, bic, k2)
 
     best_count = max(glob_lls, key=glob_lls.get)
-    signals, bounds, posterior = refined_checkpoints[best_count]
+    signals, bounds = refined_checkpoints[best_count]
     print(f"{tag} Selected {best_count} signals (global likelihood {glob_lls[best_count]:.2f})\n", flush=True)
 
     if best_count == 0:
         print(f"{tag} Colony completed in {perf_counter() - start_time:.2f} seconds with 0 signals\n", flush=True)
         noise_scale = get_posterior_variance(t, d, B, signals)
-        colony_summary.update(selected=0, kept=0, glob_ll=glob_lls[0], bic=float("nan"), noise_scale=noise_scale, laplace_volume="")
+        colony_summary.update(selected=0, kept=0, glob_ll=glob_lls[0], bic=float("nan"), noise_scale=noise_scale)
         return signals, bounds, noise_scale, empty_marginal(colony_summary)
 
     if prune:
-        signals, bounds, removed, posterior = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, posterior)
+        signals, bounds, removed = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max)
         removed_lines = "".join(f"\n{tag}   removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}" for f_removed, Q_removed in removed)
         print(f"{tag} Pruning removed {len(removed)} signal(s); {len(signals)} remain.{removed_lines}\n", flush=True)
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
 
     save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2228,7 +2081,6 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     owned_sorted = (fs_sorted >= core_min) & ((fs_sorted <= core_max) if closed_above else (fs_sorted < core_max))
     colony_summary.update(
         selected=best_count, kept=int(owned.sum()), glob_ll=float(glob_ll), bic=float(bic), noise_scale=posterior_variance,
-        laplace_volume="NUTS draws" if (posterior is not None and posterior.get("covariance") is not None) else "Fisher",
     )
     marginal = make_marginal(colony_summary, owned_sorted, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, covariance)
 
@@ -2306,7 +2158,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"[joint] Starting NUTS at t={perf_counter() - start_time:.2f}s (warmup={warmup}, sample={sample}, chains=1)\n", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result, bounds, joint_posterior, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]")
+        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]")
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
@@ -2333,7 +2185,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals = nuts_result
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, joint_posterior)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
     model = get_model(t, d, signals)
     full_variance = get_posterior_variance(t, d, B, signals)
     covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, covariance, band_edges, subband_variances, full_variance)
@@ -2403,4 +2255,3 @@ if __name__ == "__main__":
         filter_order=config.get("filter_order", DEFAULT_FILTER_ORDER),
         core_gain=config.get("core_gain", DEFAULT_CORE_GAIN),
     )
-    
