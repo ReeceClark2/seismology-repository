@@ -1,32 +1,34 @@
-type = "synthetic"
-event = "other"
-network = "XX"
-station = "ARB6"
+type = "prem"
+event = "tohoku"
+network = "II"
+station = "BFO"
 
-f_min = 0.0002
-f_max = 0.0020
-Q_min = 100
-Q_max = 5200
+f_min = 0.00028
+f_max = 0.00500
+Q_min = 40
+Q_max = 10000
 
 f_points = 4000
-Q_points = 100
-f_margin = 0.0001
-log_Q_margin = 1.8
-depth = 8
+Q_points = 150
+f_margin = 0.00004
+log_Q_margin = 2
+depth = 72
 
 warmup = 500
 sample = 1_000
 
-devices = 2
-cores = 24
+devices = 12
+cores = 96
 diagnostics = "full"
-signal_step = 1
-subbands = 1
+signal_step = 8
+subbands = 6
 
 min_novelty = 0.05
 prune = true
 
-subband_padding = 0.25
+subband_padding = 0.5
+filter_order = 8
+core_gain = 0.99
 
 ringing_db = -60.0
 max_trim_hours = 10
