@@ -747,9 +747,10 @@ def _colony_worker(args):
     core = (core_min, core_max, ind == n_subbands - 1)
     filter_band = (filter_min, filter_max, core_edge_gain)
 
-    signals, bounds, posterior_variance = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order)
+    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order)
 
-    return ind, np.asarray(signals), np.asarray(bounds), posterior_variance
+    marginal["summary"]["subband"] = ind + 1
+    return ind, np.asarray(signals), np.asarray(bounds), posterior_variance, marginal
 
 def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, subband_padding=0.0, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN):
     n_subbands = len(band_edges) - 1
@@ -767,8 +768,9 @@ def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, 
     signals = jnp.concatenate([jnp.asarray(result[1]).reshape(-1, 2) for result in results], axis=0)
     bounds = jnp.concatenate([jnp.asarray(result[2]).reshape(-1, 4) for result in results], axis=0)
     subband_variances = np.array([result[3] for result in results], dtype=float)
+    marginals = [result[4] for result in results]
 
-    return signals, bounds, subband_variances
+    return signals, bounds, subband_variances, marginals
 
 # Evaluation (critical) -------------------------------------------------------------------
 
@@ -1322,15 +1324,77 @@ def print_nuts_diagnostics(diagnostics, tag=""):
 
     print("", flush=True)
 
-def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif):
+def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, extra_columns=None):
+    """extra_columns: optional {header: per-signal values} appended after the standard columns."""
     diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     csv_path = diagnostic_path / f"signals_iteration_{len(fs)}.csv"
+    extra_columns = extra_columns or {}
 
     with csv_path.open("w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["Frequency", "Frequency Uncertainty", "Quality Factor", "Quality Factor Uncertainty", "Amplitude", "Phase", "VIF"])
-        writer.writerows(zip(fs, fs_unc, Qs, Qs_unc, amplitudes, phases, vif))
+        writer.writerow(["Frequency", "Frequency Uncertainty", "Quality Factor", "Quality Factor Uncertainty", "Amplitude", "Phase", "VIF"] + list(extra_columns))
+        writer.writerows(zip(fs, fs_unc, Qs, Qs_unc, amplitudes, phases, vif, *extra_columns.values()))
+
+def empty_marginal(summary):
+    """Marginal record of a colony that keeps no signals."""
+    empty = np.empty(0)
+    return {"fs": empty, "Qs": empty, "fs_unc": empty, "Qs_unc": empty, "amplitudes": empty, "phases": empty, "vif": empty, "covariance": np.empty((0, 0)), "summary": summary}
+
+def make_marginal(summary, owned, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, covariance):
+    """A colony's own statistics for the signals it keeps (owned: mask over the f-sorted statistics).
+
+    Values are taken as the colony computed them. Amplitudes and phases are on the colony's own
+    clock (t = 0 at the end of its trim), which differs between colonies.
+    """
+    index = np.nonzero(np.asarray(owned))[0]
+    parameter_index = interleaved_indices(index)
+
+    return {
+        "fs": np.asarray(fs)[index],
+        "Qs": np.asarray(Qs)[index],
+        "fs_unc": np.asarray(fs_unc)[index],
+        "Qs_unc": np.asarray(Qs_unc)[index],
+        "amplitudes": np.asarray(amplitudes)[index],
+        "phases": np.asarray(phases)[index],
+        "vif": np.asarray(vif)[index],
+        "covariance": np.asarray(covariance)[np.ix_(parameter_index, parameter_index)],
+        "summary": summary,
+    }
+
+def append_marginals(marginals):
+    """Append colony marginal records (in subband order); the covariance is block-diagonal."""
+    keys = ["fs", "Qs", "fs_unc", "Qs_unc", "amplitudes", "phases", "vif"]
+    appended = {key: np.concatenate([np.asarray(marginal[key], dtype=float).reshape(-1) for marginal in marginals]) for key in keys}
+    appended["subband"] = np.concatenate([np.full(len(marginal["fs"]), marginal["summary"]["subband"], dtype=int) for marginal in marginals])
+
+    size = 2 * len(appended["fs"])
+    covariance = np.zeros((size, size))
+    position = 0
+    for marginal in marginals:
+        block = np.asarray(marginal["covariance"])
+        covariance[position:position + block.shape[0], position:position + block.shape[0]] = block
+        position += block.shape[0]
+    appended["covariance"] = covariance
+
+    return appended
+
+def save_subband_summary(path, summaries):
+    diagnostic_path = Path(path)
+    diagnostic_path.mkdir(parents=True, exist_ok=True)
+    columns = [
+        ("Subband", "subband"), ("Core Min (Hz)", "core_min"), ("Core Max (Hz)", "core_max"),
+        ("Filter Min (Hz)", "filter_min"), ("Filter Max (Hz)", "filter_max"), ("Fit Min (Hz)", "fit_min"), ("Fit Max (Hz)", "fit_max"),
+        ("Amplitude Kept at Core Edges", "core_edge_gain"), ("Trim (h)", "trim_hours"), ("Selected Signals", "selected"),
+        ("Kept Signals", "kept"), ("Global Likelihood (Bretthorst)", "glob_ll"), ("BIC", "bic"),
+        ("Noise Scale v", "noise_scale"), ("Laplace Volume", "laplace_volume"),
+    ]
+
+    with (diagnostic_path / "subband_summary.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([header for header, _ in columns])
+        for summary in summaries:
+            writer.writerow([summary.get(key, "") for _, key in columns])
 
 def plot_probability_surface(title, path, probability_surface):
     path = Path(path)
@@ -1888,6 +1952,10 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     filter_edges = (filter_min, filter_max)
 
     B = filter_max - filter_min
+    colony_summary = {
+        "core_min": core_min, "core_max": core_max, "filter_min": filter_min, "filter_max": filter_max,
+        "fit_min": f_min, "fit_max": f_max, "core_edge_gain": core_edge_gain, "trim_hours": filter_info["trim_seconds"] / 3600,
+    }
 
     initial_plot(path, t, d, f_min, f_max, core_edges, filter_edges)
 
@@ -2010,7 +2078,9 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     if not checkpoints:
         print(f"{tag} Colony found no resolvable signals.\n", flush=True)
-        return jnp.empty((0, 2)), jnp.empty((0, 4)), get_posterior_variance(t, d, B, jnp.empty((0, 2)))
+        noise_scale = get_posterior_variance(t, d, B, jnp.empty((0, 2)))
+        colony_summary.update(selected=0, kept=0, glob_ll=thumbprints[0][1], bic=float("nan"), noise_scale=noise_scale, laplace_volume="")
+        return jnp.empty((0, 2)), jnp.empty((0, 4)), noise_scale, empty_marginal(colony_summary)
 
     checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
     last_count = max(checkpoint_by_count)
@@ -2076,7 +2146,9 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     if best_count == 0:
         print(f"{tag} Colony completed in {perf_counter() - start_time:.2f} seconds with 0 signals\n", flush=True)
-        return signals, bounds, get_posterior_variance(t, d, B, signals)
+        noise_scale = get_posterior_variance(t, d, B, signals)
+        colony_summary.update(selected=0, kept=0, glob_ll=glob_lls[0], bic=float("nan"), noise_scale=noise_scale, laplace_volume="")
+        return signals, bounds, noise_scale, empty_marginal(colony_summary)
 
     if prune:
         signals, bounds, removed, posterior = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, posterior)
@@ -2108,7 +2180,17 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         flush=True,
     )
 
-    return core_signals, core_bounds, posterior_variance
+    # Marginal record: this colony's own statistics (its data, filter, sigma and NUTS run) for the
+    # signals it keeps. get_statistics returns them f-sorted, so ownership is re-applied to that order.
+    fs_sorted = np.asarray(fs)
+    owned_sorted = (fs_sorted >= core_min) & ((fs_sorted <= core_max) if closed_above else (fs_sorted < core_max))
+    colony_summary.update(
+        selected=best_count, kept=int(owned.sum()), glob_ll=float(glob_ll), bic=float(bic), noise_scale=posterior_variance,
+        laplace_volume="NUTS draws" if (posterior is not None and posterior.get("covariance") is not None) else "Fisher",
+    )
+    marginal = make_marginal(colony_summary, owned_sorted, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, covariance)
+
+    return core_signals, core_bounds, posterior_variance, marginal
 
 def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, subband_padding=0.25, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN):
     start_time = perf_counter()
@@ -2132,7 +2214,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds, subband_variances = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, subband_padding, ringing_db, max_trim_seconds, filter_order, core_gain)
+    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, subband_padding, ringing_db, max_trim_seconds, filter_order, core_gain)
 
     signals = jnp.asarray(signals).reshape(-1, 2)
 
@@ -2143,21 +2225,22 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     bounds[:, 1] = np.minimum(bounds[:, 1], f_max)
     bounds = jnp.asarray(bounds)
 
-    # Marginal result: merged colony signals. Bretthorst uncertainties are reported with each
-    # signal's subband noise level (locally-white approximation); full-band ones are kept beside.
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max)
-    model = get_model(t, d, signals)
-    full_variance = get_posterior_variance(t, d, B, signals)
-    covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, covariance, band_edges, subband_variances, full_variance)
+    # Marginal result: each colony's own results for the signals it keeps, appended in subband order.
+    # Nothing is refitted: every value comes from the colony that owns the signal (its filtered data,
+    # sigma and NUTS run). Amplitudes and phases are on each colony's own clock (t = 0 at its trim).
+    # The covariance is block-diagonal: correlations between subbands are not estimated.
+    marginal = append_marginals(marginals)
+    marginal_signals = jnp.stack((jnp.asarray(marginal["fs"]), jnp.asarray(marginal["Qs"])), axis=-1).reshape(-1, 2)
+    model = get_model(t, d, marginal_signals)   # display only: amplitudes refitted to the full-band data
 
-    save_iteration_diagnostics(path / "marginal_result", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
-    save_signal_diagnostics(path / "marginal_result", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, amplitudes, phases, vif)
-    save_joint_uncertainties(path / "marginal_result", fs, Qs, fs_unc, Qs_unc, signal_scale, subband_index)
-    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(signals)}.png", t, d, signals)
-    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=band_edges, edges_label="Subband boundaries")
-    plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max, core_edges=band_edges, edges_label="Subband boundaries")
-    plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, core_edges=band_edges, f_range=(f_min, f_max), edges_label="Subband boundaries")
-    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "marginal_result" / f"covariance_{len(signals)}.png", signals, covariance)
+    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"]})
+    save_subband_summary(path / "marginal_result", [colony_marginal["summary"] for colony_marginal in marginals])
+    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(marginal_signals)}.png", t, d, marginal_signals)
+    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}.png", t, d, f_min, f_max, marginal_signals, core_edges=band_edges, edges_label="Subband boundaries")
+    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}_model.png", t, model, f_min, f_max, core_edges=band_edges, edges_label="Subband boundaries")
+    plot_signal_space(f"f-Q Diagram {len(marginal_signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(marginal_signals)}.png", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], core_edges=band_edges, f_range=(f_min, f_max), edges_label="Subband boundaries")
+    plot_covariance(f"Parameter Correlation {len(marginal_signals)} Signal Model", path / "marginal_result" / f"covariance_{len(marginal_signals)}.png", marginal_signals, marginal["covariance"])
+    print(f"Marginal result: {len(marginal_signals)} signals appended from {len(marginals)} subband(s)\n", flush=True)
 
     # Joint-run input checks; full arrays are printed only if a check fails.
     s = np.asarray(jax.device_get(signals))
