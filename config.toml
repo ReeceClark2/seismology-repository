@@ -12,7 +12,7 @@ f_points = 4000
 Q_points = 150
 f_margin = 0.00004
 log_Q_margin = 2
-depth = 72
+depth = 64
 
 warmup = 500
 sample = 1_000

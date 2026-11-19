@@ -1121,6 +1121,16 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
 
     return delta_term + location_term + labelling_term + sigma_term
 
+def selection_score(glob_ll, posterior):
+    """Model-selection score: the global likelihood, or -inf when NUTS could not determine the
+    model (no usable draw covariance: ESS too low, too few valid draws, or a singular covariance).
+    A low ESS means the posterior is poorly determined, which is how overfit models show up; the
+    Fisher fallback would otherwise inflate their Laplace volume."""
+    if posterior is None or posterior.get("covariance") is None:
+        return -np.inf
+    return float(glob_ll)
+
+
 def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior=None):
     """posterior: NUTS summary from nuts() for these signals (in the given order), or None.
     Its draw covariance, when present, sets the Laplace volume of the global likelihood."""
@@ -2029,7 +2039,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior)
 
             if refined:
-                thumbprints.append((len(signals), float(glob_ll)))
+                thumbprints.append((len(signals), selection_score(glob_ll, posterior)))
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
             save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2042,7 +2052,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
             if refined:
                 log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, posterior)
-                thumbprints.append((len(signals), float(glob_ll)))
+                thumbprints.append((len(signals), selection_score(glob_ll, posterior)))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
                 save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2062,6 +2072,13 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             f"{likelihood_line}",
             flush=True,
         )
+
+        # Early stop: a refined model NUTS could not determine (ESS too low) is treated as overfit.
+        # It stays as the last checkpoint (score -inf), so bisection brackets below it.
+        if refined and not np.isfinite(thumbprints[-1][1]):
+            reason = posterior["reason"] if posterior is not None else "no usable draws"
+            print(f"{tag} NUTS could not determine the {len(signals)}-signal model ({reason}); stopping greedy search.\n", flush=True)
+            break
 
         # Early stop: only on a refined score lower than the previous refined score.
         if refined and thumbprints[-1][1] < thumbprints[-2][1]:
@@ -2092,13 +2109,14 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     if last_count not in {int(count) for count, _ in thumbprints}:
         last_signals, last_bounds = checkpoint_by_count[last_count][0], checkpoint_by_count[last_count][1]
         checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag)
-        last_glob_ll = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, checkpoint_by_count[last_count][2])[1])
+        last_glob_ll = selection_score(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, checkpoint_by_count[last_count][2])[1], checkpoint_by_count[last_count][2])
         print(f"{tag} Refined the last checkpoint: global likelihood at {last_count} signals: {last_glob_ll:.2f}\n", flush=True)
         thumbprints.append((last_count, last_glob_ll))
 
     thumbprints = np.asarray(thumbprints, dtype=float)
 
-    glob_lls = {int(count): float(score) for count, score in thumbprints if np.isfinite(score) and int(count) in checkpoint_by_count}
+    # -inf (NUTS could not determine the model) counts as measured, so bisection never refits it.
+    glob_lls = {int(count): float(score) for count, score in thumbprints if not np.isnan(score) and int(count) in checkpoint_by_count}
     refined_checkpoints = {count: checkpoint_by_count[count] for count in glob_lls}
 
     while True:
@@ -2135,8 +2153,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
             log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
             bic = statistics[-1]
-            glob_lls[count] = float(glob_ll)
-            print(f"{tag} Bisection: global likelihood at {count} signals: {float(glob_ll):.2f} (BIC {float(bic):.2f})\n", flush=True)
+            glob_lls[count] = selection_score(glob_ll, checkpoint[2])
+            print(f"{tag} Bisection: global likelihood at {count} signals: {glob_lls[count]:.2f} (BIC {float(bic):.2f})\n", flush=True)
 
             save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, bic, k2)
 
@@ -2361,4 +2379,3 @@ if __name__ == "__main__":
         filter_order=config.get("filter_order", DEFAULT_FILTER_ORDER),
         core_gain=config.get("core_gain", DEFAULT_CORE_GAIN),
     )
-    
