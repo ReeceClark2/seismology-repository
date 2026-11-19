@@ -32,3 +32,4 @@ core_gain = 0.99
 
 ringing_db = -60.0
 max_trim_hours = 10
+max_condition = 1000.0
