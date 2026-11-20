@@ -78,6 +78,17 @@ DEFAULT_CORE_GAIN = 0.99
 # 1,000 is an eigenvalue ratio of 1e6, an overlap of about 1 - 1e-6 for two signals, far beyond any
 # pair the record can resolve. Such a model is invalid and ends the greedy search.
 DEFAULT_MAX_CONDITION = 1e3
+
+# Fit band: each side extends from the filter edge until the zero-phase amplitude gain |H|^2 falls
+# to this value (1e-3 = -60 dB), so a mode beyond the fit band leaks in at no more than that
+# fraction of its amplitude. Set per side: the upper skirt falls more slowly in linear frequency.
+DEFAULT_FIT_EDGE_GAIN = 1e-3
+
+# Model error: what the model class cannot represent (leakage, filter artifacts, departures from
+# pure damped sinusoids), in dB relative to the subband's mean power. The BIC never assumes a
+# noise variance below 10^(model_error_db / 10) mean(d^2), so the fit is not credited with
+# structure below the pipeline's own error. Inactive whenever the real noise is above it.
+DEFAULT_MODEL_ERROR_DB = -50.0
 NOVELTY_JITTER = 1e-10
 
 def get_basis(t, fs, Qs):
@@ -224,7 +235,7 @@ def interleaved_indices(signal_indices):
     signal_indices = np.asarray(signal_indices, dtype=int)
     return np.stack((2 * signal_indices, 2 * signal_indices + 1), axis=-1).ravel()
 
-def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION):
+def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
     """Backward elimination: drop the signal whose removal most improves the model-selection
     score (the BIC from get_statistics), repeat.
 
@@ -233,7 +244,7 @@ def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_cond
     Cost per pass O(s * n s^2): one get_statistics (QR + Fisher) per candidate removal.
     """
     def score(candidate):
-        return float(get_statistics(t, d, B, jnp.asarray(candidate), f_min, f_max, Q_min, Q_max, max_condition=max_condition)[-1])
+        return float(get_statistics(t, d, B, jnp.asarray(candidate), f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)[-1])
 
     signals = np.array(signals, dtype=float).reshape(-1, 2)
     bounds = np.array(bounds, dtype=float).reshape(-1, 4)
@@ -683,7 +694,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag=""):
     return optimized_checkpoints
 
 def _colony_worker(args):
-    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, subband_padding, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition = args
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db = args
     n_subbands = len(band_edges) - 1
     core_min = float(band_edges[ind])
     core_max = float(band_edges[ind + 1])
@@ -691,28 +702,26 @@ def _colony_worker(args):
 
     # Three ranges: the core [core_min, core_max] decides which signals this colony keeps; the
     # filter band is widened so the filter keeps >= core_gain of the amplitude at the core edges;
-    # the fit band adds subband_padding x the filter width on each side so modes leaking in from
-    # beyond the filter edges are fitted where they are. Ranges may extend past the global band.
+    # the fit band extends each side until the filter's gain falls to fit_edge_gain, so modes leaking
+    # in from beyond the filter edges are fitted where they are. Ranges may extend past the global band.
     sampling_rate = 1 / np.mean(np.diff(t_raw))
     filter_min, filter_max, core_edge_gain = get_filter_band(core_min, core_max, sampling_rate, filter_order, core_gain)
-    padding = subband_padding * (filter_max - filter_min)
-    fit_min = max(filter_min - padding, 0.5 * filter_min)
-    fit_max = filter_max + padding
+    fit_min, fit_max = get_fit_band(filter_min, filter_max, sampling_rate, filter_order, fit_edge_gain)
     core = (core_min, core_max, ind == n_subbands - 1)
     filter_band = (filter_min, filter_max, core_edge_gain)
 
-    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition)
+    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db)
 
     marginal["summary"]["subband"] = ind + 1
     return ind, np.asarray(signals), np.asarray(bounds), posterior_variance, marginal
 
-def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, subband_padding=0.0, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION):
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
     n_subbands = len(band_edges) - 1
     n_workers = min(devices, n_subbands)
     devices_per_colony = devices // n_workers
     cores_per_colony = cores // n_workers
 
-    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, subband_padding, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition) for ind in range(n_subbands)]
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db) for ind in range(n_subbands)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -1067,7 +1076,7 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
 
     return delta_term + location_term + labelling_term + sigma_term
 
-def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION):
+def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
     fs, Qs = unpack_signals(signals)
     n_signals = fs.shape[0]
     m = 2 * n_signals
@@ -1164,11 +1173,17 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=D
     snr = jnp.where(m > 0, jnp.sqrt((m / jnp.maximum(N, 1)) * (1.0 + sum_sq_proj / (m * noise_variance))), 0.0)
 
     # BIC, the model-selection score, as log L_max - (k / 2) log N (higher is better; -2x this is the
-    # usual BIC). Gaussian white noise over N = 2BT effective samples, maximized over the amplitudes
-    # and sigma: sigma^2_ML = RSS_eff / N, so log L_max = -(N / 2) (log(2 pi sigma^2_ML) + 1).
+    # usual BIC). Gaussian errors over N = 2BT effective samples: noise plus a model error of at least
+    # sigma^2_model = 10^(model_error_db / 10) mean(d^2). Maximized over the amplitudes and over
+    # sigma^2 >= sigma^2_model:
+    #   sigma^2 = max(RSS_eff / N, sigma^2_model),  log L_max = -(N / 2) log(2 pi sigma^2) - RSS_eff / (2 sigma^2).
+    # Above the floor this is the usual -(N / 2) (log(2 pi RSS_eff / N) + 1); below it an extra signal gains
+    # only Delta RSS_eff / (2 sigma^2_model), so the 2 log N penalty wins once the fit reaches the model error.
     # k = 4 per signal (f, Q and two amplitudes); sigma is common to every model and left out.
-    ml_variance = jnp.maximum(residual_sq / jnp.maximum(N, 1), jnp.finfo(d.dtype).eps * safe_sum_sq_data / len(d))
-    log_likelihood = -0.5 * N * (jnp.log(2.0 * jnp.pi * ml_variance) + 1.0)
+    mean_sq_data = safe_sum_sq_data / len(d)
+    model_variance = jnp.maximum(10.0 ** (model_error_db / 10.0) * mean_sq_data, jnp.finfo(d.dtype).eps * mean_sq_data)
+    ml_variance = jnp.maximum(residual_sq / jnp.maximum(N, 1), model_variance)
+    log_likelihood = -0.5 * N * jnp.log(2.0 * jnp.pi * ml_variance) - residual_sq / (2.0 * ml_variance)
     bic_score = log_likelihood - 2.0 * n_signals * jnp.log(jnp.maximum(N, 1))
     # A basis above max_condition is not a resolved model (a signal is a combination of the others).
     valid = (N > m + 2) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds & (k2 <= max_condition)
@@ -1567,10 +1582,11 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init
 
 SUBBAND_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 
-def plot_filter_responses(path, band_edges, f_min, f_max, sampling_rate, filter_order, core_gain, subband_padding):
+def plot_filter_responses(path, band_edges, f_min, f_max, sampling_rate, filter_order, core_gain, fit_edge_gain):
     """Zero-phase amplitude gain |H|^2 of every subband filter over the full band, linear and in dB.
 
-    Solid grey lines: core (subband) boundaries. Dotted line: the core_gain target. Colored
+    Solid grey lines: core (subband) boundaries. Dotted lines: the core_gain target (linear panel)
+    and the fit_edge_gain target (dB panel), where each fit band ends. Colored
     brackets above the curves: each subband's fit band. Dashed black: the full-band filter.
     """
     path = Path(path)
@@ -1582,8 +1598,8 @@ def plot_filter_responses(path, band_edges, f_min, f_max, sampling_rate, filter_
     for ind in range(n_subbands):
         core_min, core_max = float(band_edges[ind]), float(band_edges[ind + 1])
         filter_min, filter_max, edge_gain = get_filter_band(core_min, core_max, sampling_rate, filter_order, core_gain)
-        padding = subband_padding * (filter_max - filter_min)
-        bands.append((core_min, core_max, filter_min, filter_max, max(filter_min - padding, 0.5 * filter_min), filter_max + padding, edge_gain))
+        fit_min, fit_max = get_fit_band(filter_min, filter_max, sampling_rate, filter_order, fit_edge_gain)
+        bands.append((core_min, core_max, filter_min, filter_max, fit_min, fit_max, edge_gain))
 
     full_filter_min, full_filter_max, _ = get_filter_band(f_min, f_max, sampling_rate, filter_order, core_gain)
     x_min = 0.9 * min(band[4] for band in bands)
@@ -1624,6 +1640,7 @@ def plot_filter_responses(path, band_edges, f_min, f_max, sampling_rate, filter_
     ax_linear.set_ylabel("Amplitude gain |H|^2 (zero-phase)")
     ax_linear.set_title(f"Subband filter responses (Butterworth order {filter_order}, applied forward and backward)")
 
+    ax_db.axhline(20 * np.log10(fit_edge_gain), color="#52514e", linestyle=":", linewidth=1.0)
     ax_db.set_ylim(-100, 5)
     ax_db.set_xlim(1e3 * x_min, 1e3 * x_max)
     ax_db.set_xlabel("Frequency (mHz)")
@@ -1774,6 +1791,29 @@ def get_ringing_envelope(sos, fs, time_constant):
     tail = response[half_length:]
     return np.maximum.accumulate(tail[::-1])[::-1]
 
+def get_fit_band(filter_min, filter_max, fs, order=DEFAULT_FILTER_ORDER, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN):
+    """Fit band around a filter band: each side extends outward from the filter edge until the
+    zero-phase (forward-backward) amplitude gain |H(f)|^2 falls to fit_edge_gain, solved per side by
+    root-finding (the skirt is monotonic outside the passband). A mode beyond the fit band therefore
+    leaks in at no more than fit_edge_gain of its amplitude, and modes inside it are fitted where they
+    are. The upper side reaches further, since the skirt falls more slowly above the band in linear
+    frequency. The lower edge stops at half the filter's lower edge and the upper edge at 0.45 fs;
+    at a limit the gain there is above the target. fit_edge_gain >= 1/2 gives the filter band itself.
+    Returns (fit_min, fit_max).
+    """
+    if fit_edge_gain >= 0.5:
+        return filter_min, filter_max
+    sos = butter(order, [filter_min, filter_max], btype="bandpass", fs=fs, output="sos")
+
+    def excess(f):
+        _, response = sosfreqz(sos, worN=[f], fs=fs)
+        return float(np.abs(response[0]) ** 2) - fit_edge_gain
+
+    lower_limit, upper_limit = 0.5 * filter_min, 0.45 * fs
+    fit_min = lower_limit if excess(lower_limit) > 0 else brentq(excess, lower_limit, filter_min, xtol=1e-12)
+    fit_max = upper_limit if excess(upper_limit) > 0 else brentq(excess, filter_max, upper_limit, xtol=1e-12)
+    return fit_min, fit_max
+
 def get_filter_band(core_min, core_max, fs, order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN):
     """Filter passband that keeps at least core_gain of a signal's amplitude at both core edges.
 
@@ -1869,7 +1909,7 @@ def filter_data(t, d, f_min, f_max, order=DEFAULT_FILTER_ORDER, ringing_db=DEFAU
 
 # Run -------------------------------------------------------------------------------------
 
-def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION):
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
     """Fit one subband, using three nested frequency ranges.
 
     core = (core_min, core_max, closed_above): the true subband; only signals whose frequency lies
@@ -1903,7 +1943,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
-    log_prob, glob_ll, noise_variance, snr, k2, *_, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition)
+    log_prob, glob_ll, noise_variance, snr, k2, *_, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
     save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
 
     # The s = 0 score is the first measured point: the BIC is assumed unimodal in the signal count,
@@ -1921,7 +1961,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         trim_note = f"ringing below {ringing_db:.0f} dB"
 
     print(
-        f"{tag} Starting... (BIC at 0 signals: {float(bic):.2f}; Bretthorst {float(glob_ll):.2f}; max condition number {max_condition:g})\n"
+        f"{tag} Starting... (BIC at 0 signals: {float(bic):.2f}; Bretthorst {float(glob_ll):.2f}; max condition number {max_condition:g}; model error {model_error_db:g} dB)\n"
         f"{tag} Bands: core {1000 * core_min:.3f}-{1000 * core_max:.3f} mHz; filter {1000 * filter_min:.3f}-{1000 * filter_max:.3f} mHz "
         f"(order {filter_order}, {core_edge_gain:.3f} of amplitude kept at the core edges); fit {1000 * f_min:.3f}-{1000 * f_max:.3f} mHz\n"
         f"{tag} Filter time constant {filter_info['time_constant'] / 3600:.2f} h; trimmed {filter_info['trim_seconds'] / 3600:.1f} h "
@@ -1974,7 +2014,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if diagnostics == "full":
             checkpoints[iteration] = (signals, bounds)
 
-            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
 
             if refined:
                 thumbprints.append((len(signals), float(bic)))
@@ -1989,7 +2029,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             checkpoints[iteration] = (signals, bounds)
 
             if refined:
-                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition)
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
                 thumbprints.append((len(signals), float(bic)))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
@@ -2040,7 +2080,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     if last_count not in {int(count) for count, _ in thumbprints}:
         last_signals, last_bounds = checkpoint_by_count[last_count][0], checkpoint_by_count[last_count][1]
         checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag)
-        last_bic = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, max_condition=max_condition)[-1])
+        last_bic = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)[-1])
         print(f"{tag} Refined the last checkpoint: BIC at {last_count} signals: {last_bic:.2f}\n", flush=True)
         thumbprints.append((last_count, last_bic))
 
@@ -2079,7 +2119,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
         for count, checkpoint in zip(candidates, candidate_refits):
             refined_checkpoints[count] = checkpoint
-            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max, max_condition=max_condition)
+            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
 
             log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
             bic = statistics[-1]
@@ -2099,11 +2139,11 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         return signals, bounds, noise_scale, empty_marginal(colony_summary)
 
     if prune:
-        signals, bounds, removed = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition)
+        signals, bounds, removed = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition, model_error_db)
         removed_lines = "".join(f"\n{tag}   removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}" for f_removed, Q_removed in removed)
         print(f"{tag} Pruning removed {len(removed)} signal(s); {len(signals)} remain.{removed_lines}\n", flush=True)
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
     model = get_model(t, d, signals)
 
     save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2139,7 +2179,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     return core_signals, core_bounds, posterior_variance, marginal
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, subband_padding=0.25, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
     start_time = perf_counter()
     t_raw, d_raw = load_data(type, event, network, station)
     max_trim_seconds = max_trim_hours * 3600
@@ -2156,12 +2196,12 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     edges_init, band_edges = get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, 100, 100, subbands)
     plot_fourier_space("Fourier Space", path / "fourier_space.png", t, d, f_min, f_max, edges_init=edges_init, band_edges=band_edges)
-    plot_filter_responses(path / "filter_response.png", band_edges, f_min, f_max, sampling_rate, filter_order, core_gain, subband_padding)
+    plot_filter_responses(path / "filter_response.png", band_edges, f_min, f_max, sampling_rate, filter_order, core_gain, fit_edge_gain)
     plot_time_series("Time Series", path / "time_series.png", t, d)
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, subband_padding, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition)
+    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db)
 
     signals = jnp.asarray(signals).reshape(-1, 2)
 
@@ -2238,7 +2278,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals = nuts_result
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
     model = get_model(t, d, signals)
     full_variance = get_posterior_variance(t, d, B, signals)
     covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, covariance, band_edges, subband_variances, full_variance)
@@ -2302,10 +2342,11 @@ if __name__ == "__main__":
 
         min_novelty=config.get("min_novelty", 0.1),
         prune=config.get("prune", True),
-        subband_padding=config.get("subband_padding", 0.25),
+        fit_edge_gain=config.get("fit_edge_gain", DEFAULT_FIT_EDGE_GAIN),
         ringing_db=config.get("ringing_db", DEFAULT_RINGING_DB),
         max_trim_hours=config.get("max_trim_hours", DEFAULT_MAX_TRIM_SECONDS / 3600),
         filter_order=config.get("filter_order", DEFAULT_FILTER_ORDER),
         core_gain=config.get("core_gain", DEFAULT_CORE_GAIN),
         max_condition=config.get("max_condition", DEFAULT_MAX_CONDITION),
+        model_error_db=config.get("model_error_db", DEFAULT_MODEL_ERROR_DB),
     )
