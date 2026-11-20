@@ -18,7 +18,7 @@ warmup = 500
 sample = 1_000
 
 devices = 8
-cores = 64
+cores = 96
 diagnostics = "full"
 signal_step = 8
 subbands = 8

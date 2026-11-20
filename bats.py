@@ -57,7 +57,7 @@ GRAM_JITTER = 1e-12
 # to the transient's peak), never less than MIN_TRIM_SECONDS and never more than the cap.
 # The cap protects the early, highest-SNR part of the record: trimming T_trim scales a mode's
 # amplitude at the new t = 0 by exp(-pi f T_trim / Q), which costs low-Q modes most.
-MIN_TRIM_SECONDS = 5 * 3600
+MIN_TRIM_SECONDS = 1 * 3600
 
 # Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
 # amplitude scale delta and the noise sigma. They enter only as log(log R); delta matters only
@@ -395,7 +395,7 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
 MAP_BOUND_TOLERANCE = 1e-3
-MAX_TREE_DEPTH = 7
+MAX_TREE_DEPTH = 6
 
 def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1000, gtol=1e-6):
     """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
@@ -1329,7 +1329,8 @@ def make_marginal(summary, owned, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vi
     """A colony's own statistics for the signals it keeps (owned: mask over the f-sorted statistics).
 
     Values are taken as the colony computed them. Amplitudes and phases are on the colony's own
-    clock (t = 0 at the end of its trim), which differs between colonies.
+    clock (t = 0 at the end of its trim, summary['start_hours'] on the raw clock), which differs
+    between colonies; shift_marginals_to_reference puts them on a common clock.
     """
     index = np.nonzero(np.asarray(owned))[0]
     parameter_index = interleaved_indices(index)
@@ -1363,13 +1364,37 @@ def append_marginals(marginals):
 
     return appended
 
+def shift_marginals_to_reference(marginals, reference_hours=None):
+    """Express every colony's amplitudes and phases at one common time.
+
+    Each colony fits A exp(-pi f t / Q) sin(2 pi f t + phi) with t = 0 at the end of its own trim
+    (start_hours on the raw clock). At a later reference time, Delta = reference - start >= 0:
+
+        A_ref = A exp(-pi f Delta / Q),   phi_ref = phi + 2 pi f Delta  (wrapped to (-pi, pi]),
+
+    the same signal written on the shared clock. The default reference is the latest start, i.e.
+    the subband that trimmed the most, so every colony's record covers it. Frequencies, Qs and their
+    covariance are unchanged. Modifies the marginals in place and returns the reference (hours).
+    """
+    if reference_hours is None:
+        reference_hours = max(float(marginal["summary"]["start_hours"]) for marginal in marginals)
+    for marginal in marginals:
+        delta = (reference_hours - float(marginal["summary"]["start_hours"])) * 3600.0
+        fs = np.asarray(marginal["fs"], dtype=float)
+        Qs = np.asarray(marginal["Qs"], dtype=float)
+        marginal["amplitudes"] = np.asarray(marginal["amplitudes"], dtype=float) * np.exp(-np.pi * fs * delta / Qs)
+        marginal["phases"] = np.angle(np.exp(1j * (np.asarray(marginal["phases"], dtype=float) + 2.0 * np.pi * fs * delta)))
+        marginal["summary"]["reference_hours"] = reference_hours
+    return reference_hours
+
 def save_subband_summary(path, summaries):
     diagnostic_path = Path(path)
     diagnostic_path.mkdir(parents=True, exist_ok=True)
     columns = [
         ("Subband", "subband"), ("Core Min (Hz)", "core_min"), ("Core Max (Hz)", "core_max"),
         ("Filter Min (Hz)", "filter_min"), ("Filter Max (Hz)", "filter_max"), ("Fit Min (Hz)", "fit_min"), ("Fit Max (Hz)", "fit_max"),
-        ("Amplitude Kept at Core Edges", "core_edge_gain"), ("Trim (h)", "trim_hours"), ("Selected Signals", "selected"),
+        ("Amplitude Kept at Core Edges", "core_edge_gain"), ("Trim (h)", "trim_hours"), ("Record Start (h)", "start_hours"),
+        ("Reference Time (h)", "reference_hours"), ("Selected Signals", "selected"),
         ("Kept Signals", "kept"), ("Global Likelihood (Bretthorst)", "glob_ll"), ("BIC", "bic"),
         ("Noise Scale v", "noise_scale"),
     ]
@@ -1931,6 +1956,7 @@ def filter_data(t, d, f_min, f_max, order=DEFAULT_FILTER_ORDER, ringing_db=DEFAU
     if return_info:
         info = {
             "trim_seconds": trim_seconds,
+            "start_seconds": float(t[trim] - t[0]),   # trimmed record's t = 0 on the raw clock
             "time_constant": time_constant,
             "ringing_left_db": ringing_left_db,
             "capped": ringing_seconds > max_trim_seconds,
@@ -1964,6 +1990,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     colony_summary = {
         "core_min": core_min, "core_max": core_max, "filter_min": filter_min, "filter_max": filter_max,
         "fit_min": f_min, "fit_max": f_max, "core_edge_gain": core_edge_gain, "trim_hours": filter_info["trim_seconds"] / 3600,
+        "start_hours": filter_info["start_seconds"] / 3600,
     }
 
     initial_plot(path, t, d, f_min, f_max, core_edges, filter_edges)
@@ -2246,13 +2273,16 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     # Marginal result: each colony's own results for the signals it keeps, appended in subband order.
     # Nothing is refitted: every value comes from the colony that owns the signal (its filtered data,
-    # sigma and NUTS run). Amplitudes and phases are on each colony's own clock (t = 0 at its trim).
-    # The covariance is block-diagonal: correlations between subbands are not estimated.
+    # sigma and NUTS run). Amplitudes and phases are moved from each colony's own clock to one common
+    # reference time, the end of the longest trim. The covariance is block-diagonal: correlations
+    # between subbands are not estimated.
+    reference_hours = shift_marginals_to_reference(marginals)
+    print(f"Marginal amplitudes and phases are at t = {reference_hours:.3f} h after the record start (the longest subband trim).\n", flush=True)
     marginal = append_marginals(marginals)
     marginal_signals = jnp.stack((jnp.asarray(marginal["fs"]), jnp.asarray(marginal["Qs"])), axis=-1).reshape(-1, 2)
     model = get_model(t, d, marginal_signals)   # display only: amplitudes refitted to the full-band data
 
-    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"]})
+    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours)})
     save_subband_summary(path / "marginal_result", [colony_marginal["summary"] for colony_marginal in marginals])
     plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(marginal_signals)}.png", t, d, marginal_signals)
     plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}.png", t, d, f_min, f_max, marginal_signals, core_edges=band_edges, edges_label="Subband boundaries")
