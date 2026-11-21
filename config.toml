@@ -35,3 +35,5 @@ model_error_db = -50.0
 ringing_db = -60.0
 max_trim_hours = 10
 max_condition = 1000.0
+
+sample_seconds = 600

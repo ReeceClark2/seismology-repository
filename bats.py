@@ -57,7 +57,7 @@ GRAM_JITTER = 1e-12
 # to the transient's peak), never less than MIN_TRIM_SECONDS and never more than the cap.
 # The cap protects the early, highest-SNR part of the record: trimming T_trim scales a mode's
 # amplitude at the new t = 0 by exp(-pi f T_trim / Q), which costs low-Q modes most.
-MIN_TRIM_SECONDS = 1 * 3600
+MIN_TRIM_SECONDS = 5 * 3600
 
 # Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
 # amplitude scale delta and the noise sigma. They enter only as log(log R); delta matters only
@@ -395,7 +395,7 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
     numpyro.factor("surface", get_log_prob(t, d, B, signals))
  
 MAP_BOUND_TOLERANCE = 1e-3
-MAX_TREE_DEPTH = 6
+MAX_TREE_DEPTH = 7
 
 def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1000, gtol=1e-6):
     """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
@@ -541,7 +541,16 @@ def get_nuts_diagnostics(fs, log_Qs, extra_fields, max_tree_depth=MAX_TREE_DEPTH
         "rhat_log_Q": rhat(log_Qs),
     }
 
-def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False, tag=""):
+SAMPLE_BLOCK = 50
+
+def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False, tag="", sample_seconds=None):
+    """NUTS from the given signals, then MAP refinement from the best draw.
+
+    sample is the maximum number of post-warmup draws per chain. With sample_seconds > 0, draws are
+    taken in blocks of SAMPLE_BLOCK and sampling stops after the first block that ends past
+    sample_seconds; the clock starts after warmup, so warmup always completes. The chain continues
+    across blocks from its last state, so the draws are the same as one uninterrupted run.
+    """
     f_init, Q_init = unpack_signals(signals, sort=False)
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     fs_min = bounds[:, 0].astype(f_init.dtype)
@@ -555,12 +564,45 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
 
     warmup_key, _ = jax.random.split(jax.random.PRNGKey(int(rng_key_value)))
     kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=MAX_TREE_DEPTH)
-    mcmc = MCMC(kernel, num_warmup=warmup, num_samples=sample, num_chains=chains, chain_method="parallel", progress_bar=False)
-    mcmc.warmup(warmup_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max)
-    mcmc.run(mcmc.post_warmup_state.rng_key, t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, extra_fields=("potential_energy", "diverging", "accept_prob", "num_steps"))
+    time_limited = sample_seconds is not None and sample_seconds > 0
+    block = min(SAMPLE_BLOCK, sample) if time_limited else sample
+    model_kwargs = dict(t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max)
+    extra_names = ("potential_energy", "diverging", "accept_prob", "num_steps")
 
-    samples = mcmc.get_samples(group_by_chain=True)
-    extra_fields = mcmc.get_extra_fields(group_by_chain=True)
+    mcmc = MCMC(kernel, num_warmup=warmup, num_samples=block, num_chains=chains, chain_method="parallel", progress_bar=False)
+    warmup_start = perf_counter()
+    mcmc.warmup(warmup_key, **model_kwargs)
+    jax.block_until_ready(mcmc.post_warmup_state)
+    warmup_elapsed = perf_counter() - warmup_start
+
+    # Sample in blocks, each continuing from the previous block's last state. device_get waits for
+    # the block to finish, so the clock measures completed sampling.
+    sample_blocks, extra_blocks = [], []
+    drawn = 0
+    stopped_by_time = False
+    sampling_start = perf_counter()
+    while drawn < sample:
+        mcmc.run(mcmc.post_warmup_state.rng_key, extra_fields=extra_names, **model_kwargs)
+        sample_blocks.append(jax.device_get(mcmc.get_samples(group_by_chain=True)))
+        extra_blocks.append(jax.device_get(mcmc.get_extra_fields(group_by_chain=True)))
+        mcmc.post_warmup_state = mcmc.last_state
+        drawn = min(drawn + block, sample)
+        if time_limited and drawn < sample and perf_counter() - sampling_start > sample_seconds:
+            stopped_by_time = True
+            break
+    sampling_elapsed = perf_counter() - sampling_start
+
+    samples = {name: jnp.asarray(np.concatenate([b[name] for b in sample_blocks], axis=1)[:, :drawn]) for name in sample_blocks[0]}
+    extra_fields = {name: jnp.asarray(np.concatenate([b[name] for b in extra_blocks], axis=1)[:, :drawn]) for name in extra_names}
+
+    prefix = f"{tag} " if tag else ""
+    limit_note = f", stopped at the {sample_seconds:.0f} s limit" if stopped_by_time else ""
+    print(
+        f"{prefix}NUTS ({f_init.shape[0]} signals, {chains} chain(s)): warmup {warmup} in {warmup_elapsed:.1f} s; "
+        f"sampled {drawn} of {sample} draws per chain ({drawn * chains} total) in {sampling_elapsed:.1f} s{limit_note}\n",
+        flush=True,
+    )
+
     fs = samples["fs"]
     log_Qs = samples["log_Qs"]
 
@@ -693,7 +735,7 @@ def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_
     return signal
 
 def _nuts_worker(args):
-    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed, tag = args
+    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed, tag, sample_seconds = args
     signals, bounds = checkpoint[0], checkpoint[1]
 
     return nuts(
@@ -707,9 +749,10 @@ def _nuts_worker(args):
         chains=cores_per_worker,
         rng_key_value=seed,
         tag=tag,
+        sample_seconds=sample_seconds,
     )
 
-def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag=""):
+def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag="", sample_seconds=None):
     if not checkpoints:
         return []
 
@@ -717,7 +760,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag=""):
     n_workers = min(devices, n_checkpoints)
     devices_per_worker = max(1, devices // n_checkpoints)
 
-    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index, tag) for index, checkpoint in enumerate(checkpoints)]
+    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index, tag, sample_seconds) for index, checkpoint in enumerate(checkpoints)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -726,7 +769,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag=""):
     return optimized_checkpoints
 
 def _colony_worker(args):
-    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db = args
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds = args
     n_subbands = len(band_edges) - 1
     core_min = float(band_edges[ind])
     core_max = float(band_edges[ind + 1])
@@ -742,18 +785,18 @@ def _colony_worker(args):
     core = (core_min, core_max, ind == n_subbands - 1)
     filter_band = (filter_min, filter_max, core_edge_gain)
 
-    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db)
+    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db, sample_seconds)
 
     marginal["summary"]["subband"] = ind + 1
     return ind, np.asarray(signals), np.asarray(bounds), posterior_variance, marginal
 
-def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None):
     n_subbands = len(band_edges) - 1
     n_workers = min(devices, n_subbands)
     devices_per_colony = devices // n_workers
     cores_per_colony = cores // n_workers
 
-    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db) for ind in range(n_subbands)]
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds) for ind in range(n_subbands)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -1967,7 +2010,7 @@ def filter_data(t, d, f_min, f_max, order=DEFAULT_FILTER_ORDER, ringing_db=DEFAU
 
 # Run -------------------------------------------------------------------------------------
 
-def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None):
     """Fit one subband, using three nested frequency ranges.
 
     core = (core_min, core_max, closed_above): the true subband; only signals whose frequency lies
@@ -2055,7 +2098,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
         nuts_start = perf_counter()
         if refined:
-            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag)
+            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds)
         nuts_elapsed = perf_counter() - nuts_start
 
         # Linear dependence: once the newest signal is (numerically) a combination of the others, all
@@ -2138,7 +2181,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     # scored the same way as every other count (at the MAP).
     if last_count not in {int(count) for count, _ in thumbprints}:
         last_signals, last_bounds = checkpoint_by_count[last_count][0], checkpoint_by_count[last_count][1]
-        checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag)
+        checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds)
         last_bic = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)[-1])
         print(f"{tag} Refined the last checkpoint: BIC at {last_count} signals: {last_bic:.2f}\n", flush=True)
         thumbprints.append((last_count, last_bic))
@@ -2174,7 +2217,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if not candidates:
             break
 
-        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices, tag=tag)
+        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds)
 
         for count, checkpoint in zip(candidates, candidate_refits):
             refined_checkpoints[count] = checkpoint
@@ -2238,7 +2281,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     return core_signals, core_bounds, posterior_variance, marginal
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None):
     start_time = perf_counter()
     t_raw, d_raw = load_data(type, event, network, station)
     max_trim_seconds = max_trim_hours * 3600
@@ -2260,7 +2303,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db)
+    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds)
 
     signals = jnp.asarray(signals).reshape(-1, 2)
 
@@ -2313,7 +2356,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"[joint] Starting NUTS at t={perf_counter() - start_time:.2f}s (warmup={warmup}, sample={sample}, chains=1)\n", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]")
+        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]", sample_seconds=sample_seconds)
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
@@ -2411,4 +2454,5 @@ if __name__ == "__main__":
         core_gain=config.get("core_gain", DEFAULT_CORE_GAIN),
         max_condition=config.get("max_condition", DEFAULT_MAX_CONDITION),
         model_error_db=config.get("model_error_db", DEFAULT_MODEL_ERROR_DB),
+        sample_seconds=config.get("sample_seconds", None),
     )
