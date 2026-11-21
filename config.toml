@@ -1,4 +1,4 @@
-type = "prem"
+type = "observed"
 event = "tohoku"
 network = "II"
 station = "BFO"
@@ -8,16 +8,16 @@ f_max = 0.00500
 Q_min = 40
 Q_max = 10000
 
-f_points = 4000
-Q_points = 150
+f_points = 3000
+Q_points = 100
 f_margin = 0.00005
-log_Q_margin = 2
+log_Q_margin = 1.6
 depth = 64
 
-warmup = 500
-sample = 1_000
+warmup = 200
+sample = 400
 
-devices = 8
+devices = 16
 cores = 96
 diagnostics = "full"
 signal_step = 8

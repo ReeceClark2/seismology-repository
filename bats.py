@@ -925,6 +925,30 @@ def get_model(t, d, signals):
     model =  G.T @ coefficients
     return model
 
+def get_parameter_model(t, start_hours, reference_hours, fs, Qs, amplitudes, phases, gain=None):
+    """Model sum_j A_j exp(-pi f_j t / Q_j) sin(2 pi f_j t + phi_j) from given amplitudes and phases.
+
+    t = 0 is start_hours on the raw clock; amplitudes and phases are given at reference_hours (as in
+    the marginal result), so they are first moved to t = 0. gain (complex, per signal) applies a filter
+    to the model, so it can be compared with filtered data. Nothing is fitted. Returns the model and the
+    amplitudes and phases at t = 0 (including the gain).
+    """
+    t = np.asarray(t, dtype=float)
+    fs = np.asarray(fs, dtype=float)
+    Qs = np.asarray(Qs, dtype=float)
+    delta = (start_hours - reference_hours) * 3600.0
+    amplitudes_0 = np.asarray(amplitudes, dtype=float) * np.exp(-np.pi * fs * delta / Qs)
+    phases_0 = np.asarray(phases, dtype=float) + 2.0 * np.pi * fs * delta
+    if gain is not None:
+        amplitudes_0 = amplitudes_0 * np.abs(gain)
+        phases_0 = phases_0 + np.angle(gain)
+    phases_0 = np.angle(np.exp(1j * phases_0))
+
+    model = np.zeros_like(t)
+    for f, Q, amplitude, phase in zip(fs, Qs, amplitudes_0, phases_0):   # one signal at a time keeps memory at O(n)
+        model += amplitude * np.exp(-np.pi * f * t / Q) * np.sin(2.0 * np.pi * f * t + phase)
+    return model, amplitudes_0, phases_0
+
 # Evaluation (minor) ----------------------------------------------------------------------
 
 def get_noise_variance(t, d, B, signals):
@@ -1366,25 +1390,33 @@ def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vi
 def empty_marginal(summary):
     """Marginal record of a colony that keeps no signals."""
     empty = np.empty(0)
-    return {"fs": empty, "Qs": empty, "fs_unc": empty, "Qs_unc": empty, "amplitudes": empty, "phases": empty, "vif": empty, "covariance": np.empty((0, 0)), "summary": summary}
+    return {"fs": empty, "Qs": empty, "fs_unc": empty, "Qs_unc": empty, "amplitudes": empty, "phases": empty, "vif": empty, "filter_gain": empty, "covariance": np.empty((0, 0)), "summary": summary}
 
 def make_marginal(summary, owned, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, covariance):
     """A colony's own statistics for the signals it keeps (owned: mask over the f-sorted statistics).
 
-    Values are taken as the colony computed them. Amplitudes and phases are on the colony's own
-    clock (t = 0 at the end of its trim, summary['start_hours'] on the raw clock), which differs
-    between colonies; shift_marginals_to_reference puts them on a common clock.
+    Values are taken as the colony computed them, except that amplitudes and phases are corrected
+    for the colony's filter: the fit sees each signal through the bandpass, scaled by |G| and shifted
+    by arg G (get_filter_gain), so A / |G| and phi - arg G describe the unfiltered signal. Without the
+    correction, amplitudes near core edges are low by up to 1 - core_gain. |G| is kept as filter_gain.
+    Amplitudes and phases are on the colony's own clock (t = 0 at the end of its trim,
+    summary['start_hours'] on the raw clock), which differs between colonies;
+    shift_marginals_to_reference puts them on a common clock.
     """
     index = np.nonzero(np.asarray(owned))[0]
     parameter_index = interleaved_indices(index)
+    kept_fs = np.asarray(fs, dtype=float)[index]
+    kept_Qs = np.asarray(Qs, dtype=float)[index]
+    gain = get_filter_gain(kept_fs, kept_Qs, summary["filter_min"], summary["filter_max"], summary["sampling_rate"], summary["filter_order"])
 
     return {
-        "fs": np.asarray(fs)[index],
-        "Qs": np.asarray(Qs)[index],
+        "fs": kept_fs,
+        "Qs": kept_Qs,
         "fs_unc": np.asarray(fs_unc)[index],
         "Qs_unc": np.asarray(Qs_unc)[index],
-        "amplitudes": np.asarray(amplitudes)[index],
-        "phases": np.asarray(phases)[index],
+        "amplitudes": np.asarray(amplitudes, dtype=float)[index] / np.abs(gain),
+        "phases": np.angle(np.exp(1j * (np.asarray(phases, dtype=float)[index] - np.angle(gain)))),
+        "filter_gain": np.abs(gain),
         "vif": np.asarray(vif)[index],
         "covariance": np.asarray(covariance)[np.ix_(parameter_index, parameter_index)],
         "summary": summary,
@@ -1392,7 +1424,7 @@ def make_marginal(summary, owned, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vi
 
 def append_marginals(marginals):
     """Append colony marginal records (in subband order); the covariance is block-diagonal."""
-    keys = ["fs", "Qs", "fs_unc", "Qs_unc", "amplitudes", "phases", "vif"]
+    keys = ["fs", "Qs", "fs_unc", "Qs_unc", "amplitudes", "phases", "vif", "filter_gain"]
     appended = {key: np.concatenate([np.asarray(marginal[key], dtype=float).reshape(-1) for marginal in marginals]) for key in keys}
     appended["subband"] = np.concatenate([np.full(len(marginal["fs"]), marginal["summary"]["subband"], dtype=int) for marginal in marginals])
 
@@ -1516,14 +1548,16 @@ def plot_signal_space(title, path, fs, Qs, fs_unc, Qs_unc, core_edges=None, f_ra
 
     return
 
-def plot_time_series(title, path, t, d, signals=None):
+def plot_time_series(title, path, t, d, signals=None, model=None):
+    """With signals, the model is refitted to d (amplitudes by least squares) unless model is given."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if signals is not None:
         fig, (ax, ax_resid) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
 
-        model = get_model(t, d, signals)
+        if model is None:
+            model = get_model(t, d, signals)
 
         ax.plot(t, d, color="black", label="Data")
         ax.plot(t, model, color="red", label="Model", alpha=0.7)
@@ -1551,53 +1585,175 @@ def plot_time_series(title, path, t, d, signals=None):
     return
 
 # TODO: Inspect covariance plotting
-def plot_covariance(title, path, signals, covariance):
+CORRELATION_COLORS = ["#174a8b", "#2a78d6", "#f0efec", "#e34948", "#a3201f"]   # blue <-> red, neutral gray midpoint
+INK_PRIMARY, INK_SECONDARY, GRID_COLOR = "#0b0b0b", "#52514e", "#dcdad5"
+MAX_MATRIX_SIGNALS = 40       # largest matrix (2 x 40 parameters) that stays readable with one label per signal
+MATRIX_WINDOW_OVERLAP = 10    # signals shared by consecutive windows when a large matrix is split
+ARC_THRESHOLD = 0.3           # pairs drawn in the overview's correlation panel
+MAX_ARCS = 3000
+
+def get_correlation(covariance):
+    """Correlation from covariance; rows whose variance is not finite and positive are NaN."""
+    covariance = np.asarray(covariance, dtype=float)
+    std = np.sqrt(np.clip(np.diag(covariance), 0, None))
+    denominator = np.outer(std, std)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correlation = np.divide(covariance, denominator, out=np.full(covariance.shape, np.nan), where=np.isfinite(denominator) & (denominator > 0))
+    return np.clip(correlation, -1.0, 1.0), std
+
+def style_axis(ax):
+    ax.grid(True, color=GRID_COLOR, linewidth=0.6)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color(INK_SECONDARY)
+    ax.tick_params(colors=INK_SECONDARY, labelsize=8)
+    ax.yaxis.label.set_color(INK_PRIMARY)
+    ax.xaxis.label.set_color(INK_PRIMARY)
+
+def plot_covariance(title, path, signals, covariance, groups=None, edges=None):
+    """Uncertainty and correlation plots that stay readable for any number of signals.
+
+    covariance follows get_statistics: f-sorted signals, interleaved [f1, Q1, f2, Q2, ...]. Writes
+      path                      overview against frequency: sigma_f, sigma_Q / Q, and arcs joining
+                                pairs of signals with |correlation| >= ARC_THRESHOLD (apex height =
+                                |correlation|, colour = sign). A signal's own f-Q correlation is not
+                                shown: f and Q are the two parts of one complex frequency and are
+                                essentially uncorrelated at the optimum (it remains in the matrix);
+      <stem>_matrix.png         the correlation matrix, if there are at most MAX_MATRIX_SIGNALS signals;
+      <stem>_matrix/*.png       otherwise one matrix per group (e.g. subband; the marginal covariance is
+                                block-diagonal by subband) or overlapping windows of consecutive signals.
+    groups: optional per-signal labels (e.g. subband numbers). edges: optional frequencies (Hz) drawn as
+    vertical lines (subband or core edges). Covariance is not plotted directly: f (Hz) and Q differ by
+    ~10 orders of magnitude, so its information is shown as the standard deviations and correlations.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    signals = np.asarray(signals)
-    if signals.ndim == 1:
-        signals = signals.reshape(1, 2)
-
     covariance = np.asarray(covariance, dtype=float)
-    n_signals = signals.shape[0]
-    n_parameters = 2 * n_signals
+    fs = np.sort(np.asarray(signals, dtype=float).reshape(-1, 2)[:, 0])
+    Qs_sorted = np.asarray(signals, dtype=float).reshape(-1, 2)[np.argsort(np.asarray(signals, dtype=float).reshape(-1, 2)[:, 0]), 1]
+    n = len(fs)
+    if n == 0 or covariance.shape != (2 * n, 2 * n):
+        return
 
-    order = np.concatenate((np.arange(0, n_parameters, 2), np.arange(1, n_parameters, 2)))
-    covariance = covariance[np.ix_(order, order)]
+    correlation, std = get_correlation(covariance)
+    sigma_f, sigma_Q = std[0::2], std[1::2]
+    pair = np.nanmax(np.abs(correlation.reshape(n, 2, n, 2)), axis=(1, 3)) if n > 1 else np.zeros((1, 1))
+    signed = correlation.reshape(n, 2, n, 2)
+    np.fill_diagonal(pair, np.nan)
+    cmap = matplotlib.colors.LinearSegmentedColormap.from_list("correlation", CORRELATION_COLORS)
+    cmap.set_bad("#ffffff")
 
-    labels = [f"f{index + 1}" for index in range(n_signals)] + [f"Q{index + 1}" for index in range(n_signals)]
-    std = np.sqrt(np.diag(covariance))
-    denominator = np.outer(std, std)
+    plot_correlation_overview(title, path, fs, Qs_sorted, sigma_f, sigma_Q, pair, signed, cmap, edges)
+
+    groups = None if groups is None else np.asarray(groups)
+    if n <= MAX_MATRIX_SIGNALS:
+        plot_correlation_matrix(f"{title}: correlation matrix", path.with_name(f"{path.stem}_matrix{path.suffix}"), fs, correlation, np.arange(n), cmap)
+        return
+
+    matrix_dir = path.with_name(f"{path.stem}_matrix")
+    if matrix_dir.exists():
+        shutil.rmtree(matrix_dir)
+    matrix_dir.mkdir(parents=True)
+    if groups is not None and len(groups) == n:
+        blocks = [(f"group_{group}", np.nonzero(groups == group)[0]) for group in np.unique(groups)]
+    else:
+        blocks = [(None, np.arange(n))]
+    for name, members in blocks:
+        step = MAX_MATRIX_SIGNALS - MATRIX_WINDOW_OVERLAP
+        starts = [0] if len(members) <= MAX_MATRIX_SIGNALS else list(range(0, len(members) - MATRIX_WINDOW_OVERLAP, step))
+        for start in starts:
+            window = members[start:start + MAX_MATRIX_SIGNALS]
+            label = f"{1e3 * fs[window[0]]:.4f}-{1e3 * fs[window[-1]]:.4f} mHz"
+            prefix = f"{name}_" if name is not None else ""
+            heading = f"{title}: {'subband ' + name.split('_', 1)[1] + ', ' if name is not None else ''}signals {window[0] + 1}-{window[-1] + 1} ({label})"
+            parameters = np.ravel(np.column_stack((2 * window, 2 * window + 1)))
+            plot_correlation_matrix(heading, matrix_dir / f"{prefix}signals_{window[0] + 1:03d}-{window[-1] + 1:03d}{path.suffix}", fs[window], correlation[np.ix_(parameters, parameters)], window, cmap)
+
+def plot_correlation_overview(title, path, fs, Qs, sigma_f, sigma_Q, pair, signed, cmap, edges=None):
+    f_mhz = 1e3 * fs
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True, gridspec_kw={"height_ratios": [1, 1, 2]})
+    ax_f, ax_Q, ax_pair = axes
+    marker = dict(marker="o", markersize=3, linestyle="none", color=CORRELATION_COLORS[1])
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        correlation = np.divide(covariance, denominator, out=np.full(covariance.shape, np.nan, dtype=float), where=np.isfinite(denominator) & (denominator > 0))
+        ax_f.plot(f_mhz, 1e6 * sigma_f, **marker)
+        ax_Q.plot(f_mhz, 100 * sigma_Q / Qs, **marker)
+    ax_f.set_yscale("log")
+    ax_f.set_ylabel("$\\sigma_f$ (µHz)")
+    ax_Q.set_yscale("log")
+    ax_Q.set_ylabel("$\\sigma_Q / Q$ (%)")
 
-    finite_covariance = covariance[np.isfinite(covariance)]
-    cov_limit = np.max(np.abs(finite_covariance)) if finite_covariance.size else 0.0
-    if cov_limit == 0:
-        cov_limit = 1.0
+    # Arcs between correlated signals: apex at |correlation| (strongest of the four f/Q combinations),
+    # colour by its sign. Weak pairs are omitted; ticks along the bottom mark every signal.
+    n = len(fs)
+    ii, jj = np.nonzero(np.triu(np.nan_to_num(pair, nan=0.0) >= ARC_THRESHOLD, k=1))
+    strength = pair[ii, jj]
+    keep = np.argsort(strength)[-MAX_ARCS:]                                       # strongest drawn last, on top
+    theta = np.linspace(0, np.pi, 40)
+    for index in keep:
+        i, j = ii[index], jj[index]
+        block = signed[i, :, j, :]
+        value = block.flat[np.nanargmax(np.abs(block))]
+        x0, x1 = f_mhz[i], f_mhz[j]
+        x = 0.5 * (x0 + x1) - 0.5 * (x1 - x0) * np.cos(theta)
+        y = abs(value) * np.sin(theta)
+        ax_pair.plot(x, y, color=cmap(0.5 + 0.5 * value), linewidth=0.4 + 1.6 * abs(value), alpha=0.85)
+    ax_pair.plot(f_mhz, np.zeros(n), marker="|", markersize=8, linestyle="none", color=INK_SECONDARY)
+    ax_pair.set_ylim(0, 1.05)
+    ax_pair.set_ylabel(f"|corr| between signals\n(pairs ≥ {ARC_THRESHOLD})")
+    ax_pair.set_xlabel("Frequency (mHz)")
+    handles = [matplotlib.lines.Line2D([], [], color=cmap(0.95), linewidth=1.6, label="positive"),
+               matplotlib.lines.Line2D([], [], color=cmap(0.05), linewidth=1.6, label="negative")]
+    ax_pair.legend(handles=handles, loc="upper right", frameon=False, fontsize=8, title="sign", title_fontsize=8)
+    if len(ii) == 0:
+        ax_pair.text(0.5, 0.5, f"no pair reaches |corr| {ARC_THRESHOLD}", transform=ax_pair.transAxes, ha="center", color=INK_SECONDARY)
 
-    cmap = plt.get_cmap("coolwarm").copy()
-    cmap.set_bad("lightgray")
+    for ax in axes:
+        style_axis(ax)
+        if edges is not None:
+            for edge in np.asarray(edges, dtype=float):
+                ax.axvline(1e3 * edge, color=INK_SECONDARY, linewidth=0.6, linestyle=":", alpha=0.7)
+    pad = 0.01 * max(f_mhz[-1] - f_mhz[0], 1e-6)
+    ax_pair.set_xlim(f_mhz[0] - pad, f_mhz[-1] + pad)
 
-    fig, (ax_cov, ax_corr) = plt.subplots(1, 2, figsize=(12, 8))
-
-    cov_image = ax_cov.imshow(np.ma.masked_invalid(covariance), cmap=cmap, vmin=-cov_limit, vmax=cov_limit, interpolation="nearest")
-    ax_cov.set_title("Covariance")
-    fig.colorbar(cov_image, ax=ax_cov, label="Covariance")
-
-    corr_image = ax_corr.imshow(np.ma.masked_invalid(correlation), cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
-    ax_corr.set_title("Correlation")
-    fig.colorbar(corr_image, ax=ax_corr, label="Correlation")
-
-    for ax in (ax_cov, ax_corr):
-        ax.set_xticks(np.arange(n_parameters), labels=labels, rotation=45, ha="right")
-        ax.set_yticks(np.arange(n_parameters), labels=labels)
-
-    fig.suptitle(title)
+    fig.suptitle(f"{title}: uncertainty and correlation ({n} signals)", color=INK_PRIMARY)
     fig.tight_layout()
-    fig.savefig(path, dpi=300)
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+def plot_correlation_matrix(title, path, fs, correlation, numbers, cmap):
+    """Correlation matrix for up to MAX_MATRIX_SIGNALS signals, each signal's f and Q kept together.
+
+    The unit diagonal is blanked so the off-diagonal structure uses the full colour range. Rows and
+    columns are labelled once per signal by number and frequency; thin lines separate signals.
+    """
+    n = len(fs)
+    shown = np.array(correlation, dtype=float)
+    np.fill_diagonal(shown, np.nan)
+    size = 2 * n
+    side = min(16, max(6, 0.16 * size + 3))
+    fig, ax = plt.subplots(figsize=(side + 1.5, side))
+    image = ax.imshow(np.ma.masked_invalid(shown), cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
+    for boundary in np.arange(2, size, 2) - 0.5:
+        ax.axhline(boundary, color="#ffffff", linewidth=0.8)
+        ax.axvline(boundary, color="#ffffff", linewidth=0.8)
+    labels = [f"{number + 1}: {1e3 * f:.4f}" for number, f in zip(numbers, fs)]
+    centres = np.arange(0, size, 2) + 0.5
+    ax.set_xticks(centres, labels=labels, rotation=90, fontsize=7)
+    ax.set_yticks(centres, labels=labels, fontsize=7)
+    ax.tick_params(length=0, colors=INK_SECONDARY)
+    if size <= 24:                                                               # values only where they fit
+        for (row, column), value in np.ndenumerate(shown):
+            if np.isfinite(value) and abs(value) >= 0.2:
+                ax.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=6, color=INK_PRIMARY)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
+    colorbar.set_label("Correlation", color=INK_PRIMARY)
+    ax.set_xlabel("Signal: frequency (mHz); each signal spans f then Q", color=INK_PRIMARY)
+    ax.set_title(title, color=INK_PRIMARY, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
     plt.close(fig)
 
 def draw_core_edges(ax, core_edges, label="Core band edges", filter_edges=None):
@@ -1624,7 +1780,9 @@ def draw_core_edges(ax, core_edges, label="Core band edges", filter_edges=None):
     ax.set_xlim(x_min, x_max)
     ax.legend()
 
-def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init=None, band_edges=None, core_edges=None, edges_label="Core band edges", filter_edges=None):
+def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init=None, band_edges=None, core_edges=None, edges_label="Core band edges", filter_edges=None, model=None, amplitudes=None, phases=None):
+    """With signals, amplitudes are refitted to d unless model, amplitudes and phases (at t = 0, in the
+    order of signals) are given."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1632,10 +1790,13 @@ def plot_fourier_space(title, path, t, d, f_min, f_max, signals=None, edges_init
     outputs = [(path, None)]
 
     if signals is not None:
-        model = get_model(t, d, signals)
-        fs, Qs = unpack_signals(signals)
+        if model is None or amplitudes is None or phases is None:
+            model = get_model(t, d, signals)
+            amplitudes, phases = get_phasor(t, d, signals)
+            fs, Qs = unpack_signals(signals)
+        else:
+            fs, Qs = unpack_signals(signals, sort=False)
         ks = jnp.pi * fs / Qs
-        amplitudes, phases = get_phasor(t, d, signals)
 
         lorentzian_p = get_model_fourier(f, fs, ks, amplitudes, phases)
         _, fft_p = get_fft(t, model, f_min, f_max)
@@ -1914,6 +2075,30 @@ def get_fit_band(filter_min, filter_max, fs, order=DEFAULT_FILTER_ORDER, fit_edg
     fit_max = upper_limit if excess(upper_limit) > 0 else brentq(excess, filter_max, upper_limit, xtol=1e-12)
     return fit_min, fit_max
 
+def get_filter_gain(fs, Qs, filter_min, filter_max, sampling_rate, order=DEFAULT_FILTER_ORDER):
+    """Complex gain of filter_data's zero-phase bandpass on A exp(-pi f t / Q) sin(2 pi f t + phi).
+
+    The signal is Im[A e^(i phi) e^(s t)] with s = -pi f / Q + 2 pi i f. sosfiltfilt runs H forward
+    (input e^(s t)) and then backward (input e^(-s t) in reversed time), so in steady state the output
+    is Im[G A e^(i phi) e^(s t)] with G = H(e^(s dt)) H(e^(-s dt)): amplitude times |G|, phase plus arg G.
+    For an undamped signal G = |H(f)|^2 and arg G = 0. Exact once the filter's own ringing has died
+    out, i.e. for modes that decay more slowly than the filter rings (checked to 0.2% for Q >= 150 and
+    ~1% at Q 80 at a core edge); a mode that decays faster than the filter rings has no exact gain.
+    """
+    fs = np.asarray(fs, dtype=float)
+    Qs = np.asarray(Qs, dtype=float)
+    sos = butter(order, [filter_min, filter_max], btype="bandpass", fs=sampling_rate, output="sos")
+    z = np.exp((-np.pi * fs / Qs + 2j * np.pi * fs) / sampling_rate)
+
+    def response(z):
+        z_inverse = 1.0 / z
+        out = np.ones_like(z, dtype=complex)
+        for b0, b1, b2, a0, a1, a2 in sos:
+            out = out * (b0 + b1 * z_inverse + b2 * z_inverse ** 2) / (a0 + a1 * z_inverse + a2 * z_inverse ** 2)
+        return out
+
+    return response(z) * response(1.0 / z)
+
 def get_filter_band(core_min, core_max, fs, order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN):
     """Filter passband that keeps at least core_gain of a signal's amplitude at both core edges.
 
@@ -2033,7 +2218,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     colony_summary = {
         "core_min": core_min, "core_max": core_max, "filter_min": filter_min, "filter_max": filter_max,
         "fit_min": f_min, "fit_max": f_max, "core_edge_gain": core_edge_gain, "trim_hours": filter_info["trim_seconds"] / 3600,
-        "start_hours": filter_info["start_seconds"] / 3600,
+        "start_hours": filter_info["start_seconds"] / 3600, "sampling_rate": float(1 / np.mean(np.diff(t))), "filter_order": filter_order,
     }
 
     initial_plot(path, t, d, f_min, f_max, core_edges, filter_edges)
@@ -2126,7 +2311,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             plot_time_series("Time Series", path / "diagnostic" / "time_series" /f"time_series_{len(signals)}.png", t, d, signals)
             plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=core_edges, filter_edges=filter_edges)
             plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc, core_edges=core_edges, f_range=(f_min, f_max), filter_edges=filter_edges)
-            plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+            plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance, edges=core_edges)
         else:
             checkpoints[iteration] = (signals, bounds)
 
@@ -2139,7 +2324,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
                 plot_time_series("Time Series", path / "diagnostic" / "time_series" / f"time_series_{len(signals)}.png", t, d, signals)
                 plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "diagnostic" / "fourier_space" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=core_edges, filter_edges=filter_edges)
                 plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "diagnostic" / "signal_space" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc, core_edges=core_edges, f_range=(f_min, f_max), filter_edges=filter_edges)
-                plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance)
+                plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "diagnostic" / "covariance" / f"covariance_{len(signals)}.png", signals, covariance, edges=core_edges)
 
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
@@ -2253,7 +2438,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=core_edges, filter_edges=filter_edges)
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max, core_edges=core_edges, filter_edges=filter_edges)
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc, Qs_unc, core_edges=core_edges, f_range=(f_min, f_max), filter_edges=filter_edges)
-    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "result" / f"covariance_{len(signals)}.png", signals, covariance, edges=core_edges)
 
     final_elapsed = perf_counter() - final_start
     posterior_variance = get_posterior_variance(t, d, B, signals)
@@ -2288,7 +2473,8 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     # The full band is filtered like a colony: widened so the band edges keep >= core_gain of the amplitude.
     sampling_rate = 1 / np.mean(np.diff(t_raw))
     full_filter_min, full_filter_max, full_edge_gain = get_filter_band(f_min, f_max, sampling_rate, filter_order, core_gain)
-    t, d = filter_data(t_raw, d_raw, full_filter_min, full_filter_max, order=filter_order, ringing_db=ringing_db, max_trim_seconds=max_trim_seconds)
+    t, d, full_filter_info = filter_data(t_raw, d_raw, full_filter_min, full_filter_max, order=filter_order, ringing_db=ringing_db, max_trim_seconds=max_trim_seconds, return_info=True)
+    full_start_hours = full_filter_info["start_seconds"] / 3600
     B = full_filter_max - full_filter_min
     print(
         f"Full band {1000 * f_min:.3f}-{1000 * f_max:.3f} mHz; filter {1000 * full_filter_min:.3f}-{1000 * full_filter_max:.3f} mHz "
@@ -2323,15 +2509,18 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"Marginal amplitudes and phases are at t = {reference_hours:.3f} h after the record start (the longest subband trim).\n", flush=True)
     marginal = append_marginals(marginals)
     marginal_signals = jnp.stack((jnp.asarray(marginal["fs"]), jnp.asarray(marginal["Qs"])), axis=-1).reshape(-1, 2)
-    model = get_model(t, d, marginal_signals)   # display only: amplitudes refitted to the full-band data
+    # The marginal model is built from the marginal amplitudes and phases themselves (nothing refitted),
+    # passed through the full-band filter so it compares like for like with the full-band data d.
+    full_gain = get_filter_gain(marginal["fs"], marginal["Qs"], full_filter_min, full_filter_max, sampling_rate, filter_order)
+    model, model_amplitudes, model_phases = get_parameter_model(t, full_start_hours, reference_hours, marginal["fs"], marginal["Qs"], marginal["amplitudes"], marginal["phases"], gain=full_gain)
 
-    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours)})
+    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours), "Filter Gain": marginal["filter_gain"]})
     save_subband_summary(path / "marginal_result", [colony_marginal["summary"] for colony_marginal in marginals])
-    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(marginal_signals)}.png", t, d, marginal_signals)
-    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}.png", t, d, f_min, f_max, marginal_signals, core_edges=band_edges, edges_label="Subband boundaries")
+    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(marginal_signals)}.png", t, d, marginal_signals, model=model)
+    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}.png", t, d, f_min, f_max, marginal_signals, core_edges=band_edges, edges_label="Subband boundaries", model=model, amplitudes=model_amplitudes, phases=model_phases)
     plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}_model.png", t, model, f_min, f_max, core_edges=band_edges, edges_label="Subband boundaries")
     plot_signal_space(f"f-Q Diagram {len(marginal_signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(marginal_signals)}.png", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], core_edges=band_edges, f_range=(f_min, f_max), edges_label="Subband boundaries")
-    plot_covariance(f"Parameter Correlation {len(marginal_signals)} Signal Model", path / "marginal_result" / f"covariance_{len(marginal_signals)}.png", marginal_signals, marginal["covariance"])
+    plot_covariance(f"Parameter Correlation {len(marginal_signals)} Signal Model", path / "marginal_result" / f"covariance_{len(marginal_signals)}.png", marginal_signals, marginal["covariance"], groups=marginal["subband"], edges=band_edges)
     print(f"Marginal result: {len(marginal_signals)} signals appended from {len(marginals)} subband(s)\n", flush=True)
 
     # Joint-run input checks; full arrays are printed only if a check fails.
@@ -2397,7 +2586,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}.png", t, d, f_min, f_max, signals, core_edges=band_edges, edges_label="Subband boundaries")
     plot_fourier_space(f"Fourier Space {len(signals)} Signal Model", path / "joint_result" / f"fourier_space_{len(signals)}_model.png", t, model, f_min, f_max, core_edges=band_edges, edges_label="Subband boundaries")
     plot_signal_space(f"f-Q Diagram {len(signals)} Signal Model", path / "joint_result" / f"signal_space_{len(signals)}.png", fs, Qs, fs_unc * signal_scale, Qs_unc * signal_scale, core_edges=band_edges, f_range=(f_min, f_max), edges_label="Subband boundaries")
-    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "joint_result" / f"covariance_{len(signals)}.png", signals, covariance)
+    plot_covariance(f"Parameter Correlation {len(signals)} Signal Model", path / "joint_result" / f"covariance_{len(signals)}.png", signals, covariance, edges=band_edges)
 
     print(f"Dracula completed in {perf_counter() - start_time:.2f} seconds")
 
