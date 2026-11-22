@@ -1588,6 +1588,8 @@ def plot_time_series(title, path, t, d, signals=None, model=None):
 CORRELATION_COLORS = ["#174a8b", "#2a78d6", "#f0efec", "#e34948", "#a3201f"]   # blue <-> red, neutral gray midpoint
 INK_PRIMARY, INK_SECONDARY, GRID_COLOR = "#0b0b0b", "#52514e", "#dcdad5"
 MAX_MATRIX_SIGNALS = 40       # largest matrix (2 x 40 parameters) that stays readable with one label per signal
+MAX_COUPLING_SIGNALS = 80     # coupling matrix has one cell per signal, so it stays readable to about twice that
+COUPLING_COLORS = ["#f7f6f3", "#c9ddf3", "#7fb0e8", "#2a78d6", "#174a8b"]   # one hue, light -> dark (magnitude)
 MATRIX_WINDOW_OVERLAP = 10    # signals shared by consecutive windows when a large matrix is split
 ARC_THRESHOLD = 0.3           # pairs drawn in the overview's correlation panel
 MAX_ARCS = 3000
@@ -1621,6 +1623,9 @@ def plot_covariance(title, path, signals, covariance, groups=None, edges=None):
                                 |correlation|, colour = sign). A signal's own f-Q correlation is not
                                 shown: f and Q are the two parts of one complex frequency and are
                                 essentially uncorrelated at the optimum (it remains in the matrix);
+      <stem>_coupling.png       coupling between whole signals: the Frobenius norm of each signal pair's
+                                2 x 2 correlation block (f-f, f-Q, Q-f, Q-Q), one cell per pair; split
+                                like the matrix below if there are more than MAX_COUPLING_SIGNALS;
       <stem>_matrix.png         the correlation matrix, if there are at most MAX_MATRIX_SIGNALS signals;
       <stem>_matrix/*.png       otherwise one matrix per group (e.g. subband; the marginal covariance is
                                 block-diagonal by subband) or overlapping windows of consecutive signals.
@@ -1647,29 +1652,51 @@ def plot_covariance(title, path, signals, covariance, groups=None, edges=None):
 
     plot_correlation_overview(title, path, fs, Qs_sorted, sigma_f, sigma_Q, pair, signed, cmap, edges)
 
-    groups = None if groups is None else np.asarray(groups)
-    if n <= MAX_MATRIX_SIGNALS:
-        plot_correlation_matrix(f"{title}: correlation matrix", path.with_name(f"{path.stem}_matrix{path.suffix}"), fs, correlation, np.arange(n), cmap)
-        return
+    # Coupling between whole signals: Frobenius norm of each 2 x 2 correlation block.
+    blocks_2x2 = correlation.reshape(n, 2, n, 2).transpose(0, 2, 1, 3)              # [i, j] -> 2 x 2 block
+    coupling = np.sqrt(np.nansum(blocks_2x2 ** 2, axis=(2, 3)))
+    coupling_cmap = matplotlib.colors.LinearSegmentedColormap.from_list("coupling", COUPLING_COLORS)
 
-    matrix_dir = path.with_name(f"{path.stem}_matrix")
-    if matrix_dir.exists():
-        shutil.rmtree(matrix_dir)
-    matrix_dir.mkdir(parents=True)
+    groups = None if groups is None else np.asarray(groups)
     if groups is not None and len(groups) == n:
         blocks = [(f"group_{group}", np.nonzero(groups == group)[0]) for group in np.unique(groups)]
     else:
         blocks = [(None, np.arange(n))]
+
+    def windows(members, size):
+        step = size - MATRIX_WINDOW_OVERLAP
+        starts = [0] if len(members) <= size else list(range(0, len(members) - MATRIX_WINDOW_OVERLAP, step))
+        return [members[start:start + size] for start in starts]
+
+    def heading(kind, name, window):
+        label = f"{1e3 * fs[window[0]]:.4f}-{1e3 * fs[window[-1]]:.4f} mHz"
+        return f"{title}: {kind}, {'subband ' + name.split('_', 1)[1] + ', ' if name is not None else ''}signals {window[0] + 1}-{window[-1] + 1} ({label})"
+
+    def fresh_dir(directory):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True)
+        return directory
+
+    if n <= MAX_COUPLING_SIGNALS:
+        plot_coupling_matrix(f"{title}: signal coupling", path.with_name(f"{path.stem}_coupling{path.suffix}"), fs, coupling, np.arange(n), coupling_cmap)
+    else:
+        coupling_dir = fresh_dir(path.with_name(f"{path.stem}_coupling"))
+        for name, members in blocks:
+            for window in windows(members, MAX_COUPLING_SIGNALS):
+                prefix = f"{name}_" if name is not None else ""
+                plot_coupling_matrix(heading("signal coupling", name, window), coupling_dir / f"{prefix}signals_{window[0] + 1:03d}-{window[-1] + 1:03d}{path.suffix}", fs[window], coupling[np.ix_(window, window)], window, coupling_cmap)
+
+    if n <= MAX_MATRIX_SIGNALS:
+        plot_correlation_matrix(f"{title}: correlation matrix", path.with_name(f"{path.stem}_matrix{path.suffix}"), fs, correlation, np.arange(n), cmap)
+        return
+
+    matrix_dir = fresh_dir(path.with_name(f"{path.stem}_matrix"))
     for name, members in blocks:
-        step = MAX_MATRIX_SIGNALS - MATRIX_WINDOW_OVERLAP
-        starts = [0] if len(members) <= MAX_MATRIX_SIGNALS else list(range(0, len(members) - MATRIX_WINDOW_OVERLAP, step))
-        for start in starts:
-            window = members[start:start + MAX_MATRIX_SIGNALS]
-            label = f"{1e3 * fs[window[0]]:.4f}-{1e3 * fs[window[-1]]:.4f} mHz"
+        for window in windows(members, MAX_MATRIX_SIGNALS):
             prefix = f"{name}_" if name is not None else ""
-            heading = f"{title}: {'subband ' + name.split('_', 1)[1] + ', ' if name is not None else ''}signals {window[0] + 1}-{window[-1] + 1} ({label})"
             parameters = np.ravel(np.column_stack((2 * window, 2 * window + 1)))
-            plot_correlation_matrix(heading, matrix_dir / f"{prefix}signals_{window[0] + 1:03d}-{window[-1] + 1:03d}{path.suffix}", fs[window], correlation[np.ix_(parameters, parameters)], window, cmap)
+            plot_correlation_matrix(heading("correlation matrix", name, window), matrix_dir / f"{prefix}signals_{window[0] + 1:03d}-{window[-1] + 1:03d}{path.suffix}", fs[window], correlation[np.ix_(parameters, parameters)], window, cmap)
 
 def plot_correlation_overview(title, path, fs, Qs, sigma_f, sigma_Q, pair, signed, cmap, edges=None):
     f_mhz = 1e3 * fs
@@ -1726,7 +1753,8 @@ def plot_correlation_overview(title, path, fs, Qs, sigma_f, sigma_Q, pair, signe
 def plot_correlation_matrix(title, path, fs, correlation, numbers, cmap):
     """Correlation matrix for up to MAX_MATRIX_SIGNALS signals, each signal's f and Q kept together.
 
-    The unit diagonal is blanked so the off-diagonal structure uses the full colour range. Rows and
+    The unit diagonal is drawn in dark gray, outside the colour scale, so the off-diagonal structure
+    uses the full range and the diagonal cannot be read as zero. Rows and
     columns are labelled once per signal by number and frequency; thin lines separate signals.
     """
     n = len(fs)
@@ -1736,6 +1764,8 @@ def plot_correlation_matrix(title, path, fs, correlation, numbers, cmap):
     side = min(16, max(6, 0.16 * size + 3))
     fig, ax = plt.subplots(figsize=(side + 1.5, side))
     image = ax.imshow(np.ma.masked_invalid(shown), cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
+    diagonal = np.where(np.eye(size, dtype=bool), 1.0, np.nan)                      # self-correlation (= 1), drawn dark
+    ax.imshow(np.ma.masked_invalid(diagonal), cmap=matplotlib.colors.ListedColormap([INK_SECONDARY]), vmin=0, vmax=1, interpolation="nearest")
     for boundary in np.arange(2, size, 2) - 0.5:
         ax.axhline(boundary, color="#ffffff", linewidth=0.8)
         ax.axvline(boundary, color="#ffffff", linewidth=0.8)
@@ -1750,7 +1780,38 @@ def plot_correlation_matrix(title, path, fs, correlation, numbers, cmap):
                 ax.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=6, color=INK_PRIMARY)
     colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
     colorbar.set_label("Correlation", color=INK_PRIMARY)
-    ax.set_xlabel("Signal: frequency (mHz); each signal spans f then Q", color=INK_PRIMARY)
+    ax.set_xlabel("Signal: frequency (mHz); each signal spans f then Q. Dark gray diagonal: self-correlation (= 1), left out of the colour scale", color=INK_PRIMARY)
+    ax.set_title(title, color=INK_PRIMARY, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+def plot_coupling_matrix(title, path, fs, coupling, numbers, cmap):
+    """One cell per signal pair: ||C_ij||_F, the Frobenius norm of their 2 x 2 correlation block.
+
+    0 = uncoupled; 1 = one parameter pair fully correlated; 2 = all four fully correlated (the maximum).
+    The diagonal (a signal with itself, sqrt(2 + 2 corr(f, Q)^2) ~ 1.41) is drawn dark gray, outside
+    the colour scale.
+    """
+    n = len(fs)
+    shown = np.array(coupling, dtype=float)
+    np.fill_diagonal(shown, np.nan)
+    side = min(16, max(6, 0.16 * n + 3))
+    fig, ax = plt.subplots(figsize=(side + 1.5, side))
+    image = ax.imshow(np.ma.masked_invalid(shown), cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
+    diagonal = np.where(np.eye(n, dtype=bool), 1.0, np.nan)
+    ax.imshow(np.ma.masked_invalid(diagonal), cmap=matplotlib.colors.ListedColormap([INK_SECONDARY]), vmin=0, vmax=1, interpolation="nearest")
+    labels = [f"{number + 1}: {1e3 * f:.4f}" for number, f in zip(numbers, fs)]
+    ax.set_xticks(np.arange(n), labels=labels, rotation=90, fontsize=7)
+    ax.set_yticks(np.arange(n), labels=labels, fontsize=7)
+    ax.tick_params(length=0, colors=INK_SECONDARY)
+    if n <= 16:
+        for (row, column), value in np.ndenumerate(shown):
+            if np.isfinite(value) and value >= 0.2:
+                ax.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=6, color="#ffffff" if value > 1.2 else INK_PRIMARY)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
+    colorbar.set_label("Coupling $\\|C_{ij}\\|_F$ (0 to 2)", color=INK_PRIMARY)
+    ax.set_xlabel("Signal: frequency (mHz). Each cell: Frobenius norm of the pair's 2 x 2 (f, Q) correlation block. Dark gray diagonal: self", color=INK_PRIMARY)
     ax.set_title(title, color=INK_PRIMARY, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -2509,10 +2570,19 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"Marginal amplitudes and phases are at t = {reference_hours:.3f} h after the record start (the longest subband trim).\n", flush=True)
     marginal = append_marginals(marginals)
     marginal_signals = jnp.stack((jnp.asarray(marginal["fs"]), jnp.asarray(marginal["Qs"])), axis=-1).reshape(-1, 2)
-    # The marginal model is built from the marginal amplitudes and phases themselves (nothing refitted),
-    # passed through the full-band filter so it compares like for like with the full-band data d.
+    # The marginal model is built from the marginal amplitudes and phases themselves (nothing refitted;
+    # they describe the unfiltered signals). To compare like for like with the full-band data d, the
+    # model is built on the raw record and passed through exactly the same filter and trim as d.
+    # The Lorentzians describe the same trimmed window analytically: there each mode is the filter's
+    # steady-state response to it, i.e. its amplitude and phase at d's t = 0 times its complex gain G
+    # (get_filter_gain). Multiplying an unfiltered Lorentzian by |H(f)|^2 instead would describe a
+    # signal switched on at the window start, which the trimmed data are not.
+    model_raw, _, _ = get_parameter_model(t_raw - t_raw[0], 0.0, reference_hours, marginal["fs"], marginal["Qs"], marginal["amplitudes"], marginal["phases"])
+    _, model = filter_data(t_raw, model_raw, full_filter_min, full_filter_max, order=filter_order, ringing_db=ringing_db, max_trim_seconds=max_trim_seconds)
+    if len(model) != len(d):
+        raise RuntimeError(f"Filtered marginal model has {len(model)} samples, data {len(d)}")
     full_gain = get_filter_gain(marginal["fs"], marginal["Qs"], full_filter_min, full_filter_max, sampling_rate, filter_order)
-    model, model_amplitudes, model_phases = get_parameter_model(t, full_start_hours, reference_hours, marginal["fs"], marginal["Qs"], marginal["amplitudes"], marginal["phases"], gain=full_gain)
+    _, model_amplitudes, model_phases = get_parameter_model(t[:1], full_start_hours, reference_hours, marginal["fs"], marginal["Qs"], marginal["amplitudes"], marginal["phases"], gain=full_gain)
 
     save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours), "Filter Gain": marginal["filter_gain"]})
     save_subband_summary(path / "marginal_result", [colony_marginal["summary"] for colony_marginal in marginals])
