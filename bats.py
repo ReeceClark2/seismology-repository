@@ -57,7 +57,7 @@ GRAM_JITTER = 1e-12
 # to the transient's peak), never less than MIN_TRIM_SECONDS and never more than the cap.
 # The cap protects the early, highest-SNR part of the record: trimming T_trim scales a mode's
 # amplitude at the new t = 0 by exp(-pi f T_trim / Q), which costs low-Q modes most.
-MIN_TRIM_SECONDS = 5 * 3600
+MIN_TRIM_SECONDS = 1 * 3600
 
 # Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
 # amplitude scale delta and the noise sigma. They enter only as log(log R); delta matters only
@@ -1620,9 +1620,9 @@ def plot_covariance(title, path, signals, covariance, groups=None, edges=None):
     covariance follows get_statistics: f-sorted signals, interleaved [f1, Q1, f2, Q2, ...]. Writes
       path                      overview against frequency: sigma_f, sigma_Q / Q, and arcs joining
                                 pairs of signals with |correlation| >= ARC_THRESHOLD (apex height =
-                                |correlation|, colour = sign). A signal's own f-Q correlation is not
-                                shown: f and Q are the two parts of one complex frequency and are
-                                essentially uncorrelated at the optimum (it remains in the matrix);
+                                |correlation|, colour = sign). A signal's own f-Q correlation is set
+                                to 0 throughout: f and Q are the two parts of one complex frequency
+                                and are essentially uncorrelated at the optimum (corr ~ 1 / 2Q);
       <stem>_coupling.png       coupling between whole signals: the Frobenius norm of each signal pair's
                                 2 x 2 correlation block (f-f, f-Q, Q-f, Q-Q), one cell per pair; split
                                 like the matrix below if there are more than MAX_COUPLING_SIGNALS;
@@ -1644,6 +1644,11 @@ def plot_covariance(title, path, signals, covariance, groups=None, edges=None):
 
     correlation, std = get_correlation(covariance)
     sigma_f, sigma_Q = std[0::2], std[1::2]
+    # Shown values: self-correlation 1 on the diagonal and 0 for each signal's own f-Q term
+    # (corr(f, Q) ~ 1 / 2Q at the optimum: f and Q are the two parts of one complex frequency).
+    within = np.arange(0, 2 * n, 2)
+    correlation[within, within + 1] = correlation[within + 1, within] = 0.0
+    np.fill_diagonal(correlation, 1.0)
     pair = np.nanmax(np.abs(correlation.reshape(n, 2, n, 2)), axis=(1, 3)) if n > 1 else np.zeros((1, 1))
     signed = correlation.reshape(n, 2, n, 2)
     np.fill_diagonal(pair, np.nan)
@@ -1753,19 +1758,15 @@ def plot_correlation_overview(title, path, fs, Qs, sigma_f, sigma_Q, pair, signe
 def plot_correlation_matrix(title, path, fs, correlation, numbers, cmap):
     """Correlation matrix for up to MAX_MATRIX_SIGNALS signals, each signal's f and Q kept together.
 
-    The unit diagonal is drawn in dark gray, outside the colour scale, so the off-diagonal structure
-    uses the full range and the diagonal cannot be read as zero. Rows and
-    columns are labelled once per signal by number and frequency; thin lines separate signals.
+    The diagonal is 1 (self-correlation) and each signal's own f-Q term is 0, both on the colour scale.
+    Rows and columns are labelled once per signal by number and frequency; thin lines separate signals.
     """
     n = len(fs)
     shown = np.array(correlation, dtype=float)
-    np.fill_diagonal(shown, np.nan)
     size = 2 * n
     side = min(16, max(6, 0.16 * size + 3))
     fig, ax = plt.subplots(figsize=(side + 1.5, side))
     image = ax.imshow(np.ma.masked_invalid(shown), cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
-    diagonal = np.where(np.eye(size, dtype=bool), 1.0, np.nan)                      # self-correlation (= 1), drawn dark
-    ax.imshow(np.ma.masked_invalid(diagonal), cmap=matplotlib.colors.ListedColormap([INK_SECONDARY]), vmin=0, vmax=1, interpolation="nearest")
     for boundary in np.arange(2, size, 2) - 0.5:
         ax.axhline(boundary, color="#ffffff", linewidth=0.8)
         ax.axvline(boundary, color="#ffffff", linewidth=0.8)
@@ -1776,11 +1777,11 @@ def plot_correlation_matrix(title, path, fs, correlation, numbers, cmap):
     ax.tick_params(length=0, colors=INK_SECONDARY)
     if size <= 24:                                                               # values only where they fit
         for (row, column), value in np.ndenumerate(shown):
-            if np.isfinite(value) and abs(value) >= 0.2:
+            if np.isfinite(value) and abs(value) >= 0.2 and row != column:
                 ax.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=6, color=INK_PRIMARY)
     colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
     colorbar.set_label("Correlation", color=INK_PRIMARY)
-    ax.set_xlabel("Signal: frequency (mHz); each signal spans f then Q. Dark gray diagonal: self-correlation (= 1), left out of the colour scale", color=INK_PRIMARY)
+    ax.set_xlabel("Signal: frequency (mHz); each signal spans f then Q. Diagonal = 1; a signal's own f-Q term = 0", color=INK_PRIMARY)
     ax.set_title(title, color=INK_PRIMARY, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -1790,28 +1791,24 @@ def plot_coupling_matrix(title, path, fs, coupling, numbers, cmap):
     """One cell per signal pair: ||C_ij||_F, the Frobenius norm of their 2 x 2 correlation block.
 
     0 = uncoupled; 1 = one parameter pair fully correlated; 2 = all four fully correlated (the maximum).
-    The diagonal (a signal with itself, sqrt(2 + 2 corr(f, Q)^2) ~ 1.41) is drawn dark gray, outside
-    the colour scale.
+    The diagonal (a signal with itself: the 2 x 2 identity) is sqrt(2), on the colour scale.
     """
     n = len(fs)
     shown = np.array(coupling, dtype=float)
-    np.fill_diagonal(shown, np.nan)
     side = min(16, max(6, 0.16 * n + 3))
     fig, ax = plt.subplots(figsize=(side + 1.5, side))
     image = ax.imshow(np.ma.masked_invalid(shown), cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
-    diagonal = np.where(np.eye(n, dtype=bool), 1.0, np.nan)
-    ax.imshow(np.ma.masked_invalid(diagonal), cmap=matplotlib.colors.ListedColormap([INK_SECONDARY]), vmin=0, vmax=1, interpolation="nearest")
     labels = [f"{number + 1}: {1e3 * f:.4f}" for number, f in zip(numbers, fs)]
     ax.set_xticks(np.arange(n), labels=labels, rotation=90, fontsize=7)
     ax.set_yticks(np.arange(n), labels=labels, fontsize=7)
     ax.tick_params(length=0, colors=INK_SECONDARY)
     if n <= 16:
         for (row, column), value in np.ndenumerate(shown):
-            if np.isfinite(value) and value >= 0.2:
+            if np.isfinite(value) and value >= 0.2 and row != column:
                 ax.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=6, color="#ffffff" if value > 1.2 else INK_PRIMARY)
     colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
     colorbar.set_label("Coupling $\\|C_{ij}\\|_F$ (0 to 2)", color=INK_PRIMARY)
-    ax.set_xlabel("Signal: frequency (mHz). Each cell: Frobenius norm of the pair's 2 x 2 (f, Q) correlation block. Dark gray diagonal: self", color=INK_PRIMARY)
+    ax.set_xlabel("Signal: frequency (mHz). Each cell: Frobenius norm of the pair's 2 x 2 (f, Q) correlation block. Diagonal = sqrt(2)", color=INK_PRIMARY)
     ax.set_title(title, color=INK_PRIMARY, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
