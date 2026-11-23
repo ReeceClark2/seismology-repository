@@ -77,6 +77,11 @@ BOX_INTERIOR = 1e-6
 BRETTHORST_RATIO_DELTA = 5e1
 
 BRETTHORST_RATIO_SIGMA = 1e2
+
+# Model selection (greedy stopping, bisection, pruning): "bretthorst" = Bretthorst's global likelihood
+# log P(D | s signals) (get_bretthorst_glob_ll), "bic" = the BIC. Both are computed and logged either way.
+DEFAULT_SELECTION = "bretthorst"
+SCORE_NAMES = {"bretthorst": "Bretthorst", "bic": "BIC"}
 DEFAULT_MAX_TRIM_SECONDS = 10 * 3600
 DEFAULT_RINGING_DB = -60.0
 
@@ -97,9 +102,12 @@ DEFAULT_MAX_CONDITION = 1e3
 DEFAULT_FIT_EDGE_GAIN = 1e-3
 
 # Model error: what the model class cannot represent (leakage, filter artifacts, departures from
-# pure damped sinusoids), in dB relative to the subband's mean power. The BIC never assumes a
-# noise variance below 10^(model_error_db / 10) mean(d^2), so the fit is not credited with
-# structure below the pipeline's own error. Inactive whenever the real noise is above it.
+# pure damped sinusoids), in dB relative to the subband's mean power. One noise model is used
+# throughout: the residual is noise plus model error of variance sigma^2_model =
+# 10^(model_error_db / 10) mean(d^2). The objective (get_log_prob: grid-free fitting, NUTS, MAP
+# refinement) adds n sigma^2_model to the RSS, the Fisher covariance uses the same variance, and the
+# BIC is the profile likelihood of that model (sigma^2 = max(RSS / N, sigma^2_model)). The fit is
+# not credited with structure below the pipeline's own error; inactive whenever the real noise is above it.
 DEFAULT_MODEL_ERROR_DB = -50.0
 NOVELTY_JITTER = 1e-10
 
@@ -279,16 +287,16 @@ def interleaved_indices(signal_indices):
     signal_indices = np.asarray(signal_indices, dtype=int)
     return np.stack((2 * signal_indices, 2 * signal_indices + 1), axis=-1).ravel()
 
-def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
+def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, selection=DEFAULT_SELECTION):
     """Backward elimination: drop the signal whose removal most improves the model-selection
-    score (the BIC from get_statistics), repeat.
+    score (get_statistics' score: the global likelihood or the BIC, per selection), repeat.
 
     Remaining signals are not re-optimized after a removal, so each removal score is a
     lower bound on what a refit would give (the pruning is conservative).
     Cost per pass O(s * n s^2): one get_statistics (QR + Fisher) per candidate removal.
     """
     def score(candidate):
-        return float(get_statistics(t, d, B, jnp.asarray(candidate), f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)[-1])
+        return float(get_statistics(t, d, B, jnp.asarray(candidate), f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)[-1])
 
     signals = np.array(signals, dtype=float).reshape(-1, 2)
     bounds = np.array(bounds, dtype=float).reshape(-1, 4)
@@ -311,7 +319,19 @@ def prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_cond
 
 # Signal Update --------------------------------------------------------------------------
 
-def get_log_prob(t, d, B, signals):
+def get_log_prob(t, d, B, signals, model_error_db=None):
+    """Bretthorst's marginal posterior of (f, Q), optionally with a model-error variance.
+
+    Without model error: (m - N)/2 log(RSS / sum d^2), Bretthorst's [1 - m h^2 / (N d^2)]^((m - N) / 2).
+    With model_error_db: the residual is noise plus model error, variance sigma^2 + sigma^2_model with
+    sigma^2_model = 10^(model_error_db / 10) mean(d^2), and RSS is replaced by RSS + n sigma^2_model
+    = RSS + 10^(model_error_db / 10) sum d^2. That matches the marginal over sigma in both limits:
+    (m - N)/2 log RSS when RSS >> n sigma^2_model, and -(N - m) RSS / (2 N sigma^2_model) + const
+    (no reward beyond the model error) when RSS << n sigma^2_model. The BIC's max(RSS / N, sigma^2_model)
+    is the profile likelihood of the same model, and the Fisher covariance uses the same variance.
+    d must be the colony's data (not a residual), since sigma^2_model is referenced to its power;
+    model_error_db=None gives Bretthorst's form (used by the grid search, whose ranking it leaves unchanged).
+    """
     # Permutation-invariant, so no sorting is needed inside the objective.
     fs, Qs = unpack_signals(signals, sort=False)
     m = 2 * fs.shape[0]
@@ -320,8 +340,9 @@ def get_log_prob(t, d, B, signals):
     sum_sq_data = jnp.sum(d ** 2)
     rss = get_stable_rss(t, d, fs, Qs)
     rss = jnp.maximum(rss, jnp.finfo(d.dtype).eps * sum_sq_data)
+    if model_error_db is not None:
+        rss = rss + 10.0 ** (model_error_db / 10.0) * sum_sq_data
 
-    # Bretthorst: [1 - m h^2 / (N d^2)]^((m - N) / 2) = (RSS / sum d^2)^((m - N) / 2)
     return 0.5 * (m - N) * jnp.log(rss / sum_sq_data)
 
 def get_novelty_function(t, existing):
@@ -397,19 +418,19 @@ def grid_search(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, batch_size
     
     return probability_surface
 
-def objective(t, d, B, f_min, f_max, Q_min, Q_max):
+def objective(t, d, B, f_min, f_max, Q_min, Q_max, model_error_db=None):
     fs = numpyro.sample("fs", numpyro.distributions.Uniform(f_min, f_max).to_event(1))
     log_Qs = numpyro.sample("log_Qs", numpyro.distributions.Uniform(jnp.log(Q_min), jnp.log(Q_max)).to_event(1))
 
     Qs = numpyro.deterministic("Qs", jnp.exp(log_Qs))
     signals = jnp.stack((fs, Qs), axis=-1)
 
-    numpyro.factor("surface", get_log_prob(t, d, B, signals))
+    numpyro.factor("surface", get_log_prob(t, d, B, signals, model_error_db))
  
 MAP_BOUND_TOLERANCE = 1e-3
 MAX_TREE_DEPTH = 7
 
-def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
+def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=500, model_error_db=None):
     """MAP refinement as bounded variable-projection least squares (scipy least_squares, method "trf").
 
     With m fixed, get_log_prob = (m - N)/2 log(RSS / sum d^2) is a decreasing function of the RSS, so
@@ -419,7 +440,9 @@ def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
     (no sigmoid, so no steps spent pushing towards an edge that can only be reached at infinity).
     Gauss-Newton trust-region steps (its model J^T J is positive semi-definite) with the exact Jacobian
     of r, one column per parameter (lax.map over JVPs, so memory stays at one n-vector per column).
-    The residual is scaled by sqrt((N - m) / RSS_0), so the cost is in nats to first order.
+    The residual is scaled by sqrt((N - m) / RSS_0), so the cost is in nats to first order (RSS_0 includes
+    the model-error variance when model_error_db is given; the minimizer is the same either way, since
+    the log probability is a decreasing function of the RSS for any model_error_db).
     max_iterations caps the function evaluations (about one per iteration).
     """
     fs0, Qs0 = unpack_signals(signals, sort=False)
@@ -442,8 +465,10 @@ def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
         fs, Qs = unpack_signals(to_signals(p), sort=False)
         return get_projection_pieces(t, d, fs, Qs)[3]
 
-    start_log_prob = float(get_log_prob(t, d, B, to_signals(p0)))
+    start_log_prob = float(get_log_prob(t, d, B, to_signals(p0), model_error_db))
     rss0 = float(jnp.sum(residual(p0) ** 2))
+    if model_error_db is not None:
+        rss0 += 10.0 ** (model_error_db / 10.0) * float(jnp.sum(d ** 2))
     scale = np.sqrt(max(N - m, 1) / max(rss0, np.finfo(np.float64).tiny))
 
     residual_jit = jax.jit(residual)
@@ -466,7 +491,7 @@ def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
         return jnp.stack((fs0, Qs0), axis=-1), {**failure, "message": str(error)}
 
     p_result = jnp.clip(jnp.asarray(result.x), BOX_INTERIOR, 1.0 - BOX_INTERIOR)   # trf may stop exactly on a bound
-    final_log_prob = float(get_log_prob(t, d, B, to_signals(p_result)))
+    final_log_prob = float(get_log_prob(t, d, B, to_signals(p_result), model_error_db))
     accepted = bool(np.isfinite(final_log_prob) and final_log_prob >= start_log_prob)
     p_final = p_result if accepted else p0
     near_bound = (p_final < MAP_BOUND_TOLERANCE) | (p_final > 1.0 - MAP_BOUND_TOLERANCE)
@@ -476,7 +501,7 @@ def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
     at_bound = int(jnp.sum(signal_at_bound))
 
     def log_prob_x(x):
-        return get_log_prob(t, d, B, jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1))
+        return get_log_prob(t, d, B, jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1), model_error_db)
 
     scaled_gradient = jnp.abs(jax.grad(log_prob_x)(lower + width * p_final) * width)
     signal_gradient = jnp.maximum(scaled_gradient[:s], scaled_gradient[s:])
@@ -494,7 +519,7 @@ def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
     }
     return to_signals(p_final), info
 
-def map_refine(t, d, B, signals, bounds, method="trf", max_iterations=200, gtol=1e-6):
+def map_refine(t, d, B, signals, bounds, method="trf", max_iterations=200, gtol=1e-6, model_error_db=None):
     """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
 
     method "trf" (default): bounded least squares, see map_refine_least_squares. The trust-region
@@ -517,7 +542,7 @@ def map_refine(t, d, B, signals, bounds, method="trf", max_iterations=200, gtol=
     The result is accepted only if it does not lower the log probability.
     """
     if method == "trf":
-        return map_refine_least_squares(t, d, B, signals, bounds, max_iterations=max_iterations)
+        return map_refine_least_squares(t, d, B, signals, bounds, max_iterations=max_iterations, model_error_db=model_error_db)
 
     fs0, Qs0 = unpack_signals(signals, sort=False)
     bounds = jnp.asarray(bounds).reshape(-1, 4)
@@ -535,7 +560,7 @@ def map_refine(t, d, B, signals, bounds, method="trf", max_iterations=200, gtol=
         return jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1)
 
     def negative_log_prob(u):
-        return -get_log_prob(t, d, B, to_signals(u))
+        return -get_log_prob(t, d, B, to_signals(u), model_error_db)
 
     gradient = jax.grad(negative_log_prob)
     value_and_grad = jax.jit(jax.value_and_grad(negative_log_prob))
@@ -584,7 +609,7 @@ def map_refine(t, d, B, signals, bounds, method="trf", max_iterations=200, gtol=
     # Convergence check (one extra gradient): d log p / d(x / box width) in (f, log Q),
     # so f and log Q are comparable, in nats per box width. Near zero = stationary.
     def log_prob_x(x):
-        return get_log_prob(t, d, B, jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1))
+        return get_log_prob(t, d, B, jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1), model_error_db)
 
     x_final = lower + width * p_final
     scaled_gradient = jnp.abs(jax.grad(log_prob_x)(x_final) * width)
@@ -646,7 +671,7 @@ def get_nuts_diagnostics(fs, log_Qs, extra_fields, max_tree_depth=MAX_TREE_DEPTH
 
 SAMPLE_BLOCK = 50
 
-def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False, tag="", sample_seconds=None):
+def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, refine=True, return_diagnostics=False, tag="", sample_seconds=None, model_error_db=None):
     """NUTS from the given signals, then MAP refinement from the best draw.
 
     sample is the maximum number of post-warmup draws per chain. With sample_seconds > 0, draws are
@@ -674,7 +699,7 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
     kernel = NUTS(objective, init_strategy=init_strategy, max_tree_depth=MAX_TREE_DEPTH)
     time_limited = sample_seconds is not None and sample_seconds > 0
     block = min(SAMPLE_BLOCK, sample) if time_limited else sample
-    model_kwargs = dict(t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max)
+    model_kwargs = dict(t=t, d=d, B=B, f_min=fs_min, f_max=fs_max, Q_min=Qs_min, Q_max=Qs_max, model_error_db=model_error_db)
     extra_names = ("potential_energy", "diverging", "accept_prob", "num_steps")
 
     mcmc = MCMC(kernel, num_warmup=warmup, num_samples=block, num_chains=chains, chain_method="parallel", progress_bar=False)
@@ -733,7 +758,7 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
     # potential energy includes the unconstraining Jacobian, so get_log_prob is evaluated
     # directly; lax.map keeps memory at one evaluation at a time.
     candidate_signals = jnp.stack((draws[..., 0], jnp.exp(draws[..., 1])), axis=-1)
-    draw_log_probs = jax.lax.map(lambda candidate: get_log_prob(t, d, B, candidate), candidate_signals)
+    draw_log_probs = jax.lax.map(lambda candidate: get_log_prob(t, d, B, candidate, model_error_db), candidate_signals)
     draw_log_probs = jnp.where(jnp.isfinite(draw_log_probs), draw_log_probs, -jnp.inf)
     selected_index = jnp.argmax(draw_log_probs)
     selected = draws[selected_index]
@@ -743,7 +768,7 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
     returned_bounds = bounds[selected_order]
 
     if refine:
-        returned_signals, map_info = map_refine(t, d, B, returned_signals, returned_bounds)
+        returned_signals, map_info = map_refine(t, d, B, returned_signals, returned_bounds, model_error_db=model_error_db)
         prefix = f"{tag} " if tag else ""
         print(
             f"{prefix}MAP refinement ({len(returned_signals)} signals): accepted={map_info['accepted']}, "
@@ -843,7 +868,7 @@ def grid_search_orchestrator(path, signals, t, d, f_min, f_max, Q_min, Q_max, f_
     return signal
 
 def _nuts_worker(args):
-    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed, tag, sample_seconds = args
+    checkpoint, t, d, B, warmup, sample, cores_per_worker, seed, tag, sample_seconds, model_error_db = args
     signals, bounds = checkpoint[0], checkpoint[1]
 
     return nuts(
@@ -858,9 +883,10 @@ def _nuts_worker(args):
         rng_key_value=seed,
         tag=tag,
         sample_seconds=sample_seconds,
+        model_error_db=model_error_db,
     )
 
-def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag="", sample_seconds=None):
+def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag="", sample_seconds=None, model_error_db=None):
     if not checkpoints:
         return []
 
@@ -868,7 +894,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag="", sam
     n_workers = min(devices, n_checkpoints)
     devices_per_worker = max(1, devices // n_checkpoints)
 
-    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index, tag, sample_seconds) for index, checkpoint in enumerate(checkpoints)]
+    tasks = [(checkpoint, t, d, B, warmup, sample, devices_per_worker, index, tag, sample_seconds, model_error_db) for index, checkpoint in enumerate(checkpoints)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -877,7 +903,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag="", sam
     return optimized_checkpoints
 
 def _colony_worker(args):
-    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample = args
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample, selection = args
     n_subbands = len(band_edges) - 1
     core_min = float(band_edges[ind])
     core_max = float(band_edges[ind + 1])
@@ -893,18 +919,18 @@ def _colony_worker(args):
     core = (core_min, core_max, ind == n_subbands - 1)
     filter_band = (filter_min, filter_max, core_edge_gain)
 
-    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db, sample_seconds, downsample)
+    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db, sample_seconds, downsample, selection)
 
     marginal["summary"]["subband"] = ind + 1
     return ind, np.asarray(signals), np.asarray(bounds), posterior_variance, marginal
 
-def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True):
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True, selection=DEFAULT_SELECTION):
     n_subbands = len(band_edges) - 1
     n_workers = min(devices, n_subbands)
     devices_per_colony = devices // n_workers
     cores_per_colony = cores // n_workers
 
-    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample) for ind in range(n_subbands)]
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample, selection) for ind in range(n_subbands)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -1208,7 +1234,7 @@ def get_uncertainties(t, d, B, signals):
 
 # Evaluation (all) ------------------------------------------------------------------------
 
-def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max):
+def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max, model_error_fraction=0.0):
     """Bretthorst (1988) global likelihood log P(D | s signals), up to a model-independent constant.
 
     Built from quantities at the MAP. Priors:
@@ -1243,13 +1269,19 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
     -(N/2) log c for every model alike. Assumes each signal's posterior lies well inside the band.
 
     s = 0 (noise only): lgamma(N/2) - log 2 - log log R_sigma - (N/2) log(sum d^2 / 2).
+
+    Model error: as in get_log_prob, the residual is noise plus model error, so RSS is replaced by
+    RSS + model_error_fraction sum d^2 (= RSS + n sigma^2_model) in the sigma term and in the
+    determined-direction threshold (s = 0: sum d^2 (1 + model_error_fraction)). The fit then earns no
+    evidence for structure below the model error, consistent with the objective and the covariance.
     """
     n_signals = fs.shape[0]
     log_2 = jnp.log(2.0)
     log_log_R_sigma = jnp.log(jnp.log(BRETTHORST_RATIO_SIGMA))
+    rss = rss + model_error_fraction * sum_sq_data
 
     if n_signals == 0:
-        return jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(sum_sq_data / 2)
+        return jsp.gammaln(N / 2) - log_2 - log_log_R_sigma - (N / 2) * jnp.log(rss / 2)
 
     m = 2 * n_signals
 
@@ -1283,7 +1315,10 @@ def get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_m
 
     return delta_term + location_term + labelling_term + sigma_term
 
-def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB):
+def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, selection=DEFAULT_SELECTION):
+    """Fit statistics at the given signals. Returns (log_prob, glob_ll, noise_variance, snr, k2, fs, Qs,
+    fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic, score): glob_ll is Bretthorst's global
+    likelihood, bic the BIC, and score the one named by selection (-inf for an invalid model)."""
     fs, Qs = unpack_signals(signals)
     n_signals = fs.shape[0]
     m = 2 * n_signals
@@ -1292,6 +1327,8 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=D
     safe_sum_sq_data = jnp.maximum(sum_sq_data, jnp.finfo(d.dtype).tiny)
     dof = N - m - 2
     safe_dof = jnp.maximum(dof, 1)
+    # Model-error variance as a fraction of mean(d^2): sigma^2_model = model_error_fraction mean(d^2).
+    model_error_fraction = 0.0 if model_error_db is None else 10.0 ** (model_error_db / 10.0)
 
     if n_signals == 0:
         sum_sq_proj = jnp.asarray(0.0, dtype=d.dtype)
@@ -1364,19 +1401,21 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=D
         safe_f_eigenvalues = jnp.maximum(f_eigenvalues, f_floor)
         covariance_scaled = (f_eigenvectors / safe_f_eigenvalues[None, :]) @ f_eigenvectors.T
 
-        # Posterior-consistent noise level: raw RSS over effective degrees of freedom N = 2BT.
-        posterior_variance = rss / safe_dof
+        # Posterior-consistent noise level: raw RSS plus the model-error variance over n samples
+        # (n sigma^2_model = 10^(model_error_db / 10) sum d^2, as in get_log_prob), over the effective
+        # degrees of freedom N = 2BT. This is the Laplace covariance of get_log_prob with model error.
+        posterior_variance = (rss + model_error_fraction * safe_sum_sq_data) / safe_dof
         covariance = posterior_variance * covariance_scaled / jnp.outer(fisher_scale, fisher_scale)
         unc = jnp.sqrt(jnp.maximum(jnp.diag(covariance), 0.0))
         fs_unc = unc[::2]
         Qs_unc = unc[1::2]
 
-    noise_variance = residual_sq / safe_dof
+    noise_variance = (residual_sq + model_error_fraction * (N / len(d)) * safe_sum_sq_data) / safe_dof
     noise_floor = jnp.finfo(d.dtype).eps * safe_sum_sq_data / safe_dof
     noise_variance = jnp.maximum(noise_variance, noise_floor)
 
     ratio = jnp.clip(sum_sq_proj / safe_sum_sq_data, 0.0, 1.0 - jnp.finfo(d.dtype).eps)
-    log_prob = 0.5 * (m - N) * jnp.log1p(-ratio)
+    log_prob = 0.5 * (m - N) * jnp.log(1.0 - ratio + model_error_fraction)   # = get_log_prob(..., model_error_db)
     snr = jnp.where(m > 0, jnp.sqrt((m / jnp.maximum(N, 1)) * (1.0 + sum_sq_proj / (m * noise_variance))), 0.0)
 
     # BIC, the model-selection score, as log L_max - (k / 2) log N (higher is better; -2x this is the
@@ -1388,7 +1427,7 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=D
     # only Delta RSS_eff / (2 sigma^2_model), so the 2 log N penalty wins once the fit reaches the model error.
     # k = 4 per signal (f, Q and two amplitudes); sigma is common to every model and left out.
     mean_sq_data = safe_sum_sq_data / len(d)
-    model_variance = jnp.maximum(10.0 ** (model_error_db / 10.0) * mean_sq_data, jnp.finfo(d.dtype).eps * mean_sq_data)
+    model_variance = jnp.maximum(model_error_fraction * mean_sq_data, jnp.finfo(d.dtype).eps * mean_sq_data)
     ml_variance = jnp.maximum(residual_sq / jnp.maximum(N, 1), model_variance)
     log_likelihood = -0.5 * N * jnp.log(2.0 * jnp.pi * ml_variance) - residual_sq / (2.0 * ml_variance)
     bic_score = log_likelihood - 2.0 * n_signals * jnp.log(jnp.maximum(N, 1))
@@ -1396,12 +1435,16 @@ def get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=D
     valid = (N > m + 2) & (residual_sq > 0) & (noise_variance > 0) & full_rank & in_bounds & (k2 <= max_condition)
     bic = jnp.where(valid, bic_score, -jnp.inf)
 
-    # Bretthorst global likelihood (diagnostic only; selection uses the BIC).
-    bretthorst = get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max)
+    # Bretthorst global likelihood (the default model-selection score; see DEFAULT_SELECTION).
+    bretthorst = get_bretthorst_glob_ll(N, sum_sq_data, sum_sq_proj, rss, fisher, fs, Qs, f_min, f_max, Q_min, Q_max, model_error_fraction)
     bretthorst_valid = valid & (rss > 0) & ((n_signals == 0) | (sum_sq_proj > 0))
     glob_ll = jnp.where(bretthorst_valid & jnp.isfinite(bretthorst), bretthorst, -jnp.inf)
 
-    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic
+    if selection not in SCORE_NAMES:
+        raise ValueError(f"selection must be one of {sorted(SCORE_NAMES)}, not {selection!r}")
+    score = glob_ll if selection == "bretthorst" else bic
+
+    return log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic, score
 
 # Plotting --------------------------------------------------------------------------------
 
@@ -2375,7 +2418,7 @@ def filter_data(t, d, f_min, f_max, order=DEFAULT_FILTER_ORDER, ringing_db=DEFAU
 
 # Run -------------------------------------------------------------------------------------
 
-def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True):
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True, selection=DEFAULT_SELECTION):
     """Fit one subband, using three nested frequency ranges.
 
     core = (core_min, core_max, closed_above): the true subband; only signals whose frequency lies
@@ -2419,13 +2462,15 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     signals = jnp.empty((0, 2))
     bounds = jnp.empty((0, 4))
 
-    log_prob, glob_ll, noise_variance, snr, k2, *_, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
+    log_prob, glob_ll, noise_variance, snr, k2, *_, bic, score = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)
     save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
 
-    # The s = 0 score is the first measured point: the BIC is assumed unimodal in the signal count,
-    # so the greedy search stops as soon as a refined score falls below the previous one.
+    # The s = 0 score is the first measured point: the selection score is assumed unimodal in the
+    # signal count, so the greedy search stops as soon as a refined score falls below the previous one.
     zero_glob_ll = float(glob_ll)
-    thumbprints.append((0, float(bic)))
+    zero_bic = float(bic)
+    score_name = SCORE_NAMES[selection]
+    thumbprints.append((0, float(score)))
 
     start_time = perf_counter()
     tag = f"[{1000 * core_min:.3f}-{1000 * core_max:.3f} mHz]"
@@ -2437,7 +2482,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         trim_note = f"ringing below {ringing_db:.0f} dB"
 
     print(
-        f"{tag} Starting... (BIC at 0 signals: {float(bic):.2f}; Bretthorst {float(glob_ll):.2f}; max condition number {max_condition:g}; model error {model_error_db:g} dB)\n"
+        f"{tag} Starting... (selection by {score_name}; BIC at 0 signals: {float(bic):.2f}; Bretthorst {float(glob_ll):.2f}; max condition number {max_condition:g}; model error {model_error_db:g} dB)\n"
         f"{tag} Bands: core {1000 * core_min:.3f}-{1000 * core_max:.3f} mHz; filter {1000 * filter_min:.3f}-{1000 * filter_max:.3f} mHz "
         f"(order {filter_order}, {core_edge_gain:.3f} of amplitude kept at the core edges); fit {1000 * f_min:.3f}-{1000 * f_max:.3f} mHz\n"
         f"{tag} Filter time constant {filter_info['time_constant'] / 3600:.2f} h; trimmed {filter_info['trim_seconds'] / 3600:.1f} h "
@@ -2474,7 +2519,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
         nuts_start = perf_counter()
         if refined:
-            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds)
+            signals, bounds = nuts(t, d, B, signals, bounds, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds, model_error_db=model_error_db)
         nuts_elapsed = perf_counter() - nuts_start
 
         # Linear dependence: once the newest signal is (numerically) a combination of the others, all
@@ -2492,10 +2537,10 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if diagnostics == "full":
             checkpoints[iteration] = (signals, bounds)
 
-            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
+            log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic, score = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)
 
             if refined:
-                thumbprints.append((len(signals), float(bic)))
+                thumbprints.append((len(signals), float(score)))
 
             save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
             save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2507,8 +2552,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
             checkpoints[iteration] = (signals, bounds)
 
             if refined:
-                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
-                thumbprints.append((len(signals), float(bic)))
+                log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic, score = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)
+                thumbprints.append((len(signals), float(score)))
 
                 save_iteration_diagnostics(path / "diagnostic" / "tables", signals, noise_variance, snr, log_prob, glob_ll, bic, k2)
                 save_signal_diagnostics(path / "diagnostic" / "tables", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2520,7 +2565,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         iteration_elapsed = perf_counter() - iteration_start
         total_elapsed = perf_counter() - start_time
 
-        likelihood_line = f"{tag} BIC at {len(signals)} signals: {thumbprints[-1][1]:.2f} (Bretthorst {float(glob_ll):.2f})\n" if refined else ""
+        likelihood_line = f"{tag} {score_name} at {len(signals)} signals: {thumbprints[-1][1]:.2f} (BIC {float(bic):.2f}; Bretthorst {float(glob_ll):.2f})\n" if refined else ""
 
         print(
             f"{tag} Signal {len(signals)} completed in {iteration_elapsed:.2f} seconds (total elapsed: {total_elapsed:.2f} seconds)\n"
@@ -2533,7 +2578,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if refined and thumbprints[-1][1] < thumbprints[-2][1]:
             (previous_count, previous_score), (current_count, current_score) = thumbprints[-2], thumbprints[-1]
             print(
-                f"{tag} BIC decreased from {previous_score:.2f} ({previous_count} signals) "
+                f"{tag} {score_name} decreased from {previous_score:.2f} ({previous_count} signals) "
                 f"to {current_score:.2f} ({current_count} signals); stopping greedy search.\n",
                 flush=True,
             )
@@ -2545,7 +2590,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     if not checkpoints:
         print(f"{tag} Colony found no resolvable signals.\n", flush=True)
         noise_scale = get_posterior_variance(t, d, B, jnp.empty((0, 2)))
-        colony_summary.update(selected=0, kept=0, glob_ll=zero_glob_ll, bic=thumbprints[0][1], noise_scale=noise_scale)
+        colony_summary.update(selected=0, kept=0, glob_ll=zero_glob_ll, bic=zero_bic, noise_scale=noise_scale)
         return jnp.empty((0, 2)), jnp.empty((0, 4)), noise_scale, empty_marginal(colony_summary)
 
     checkpoint_by_count = {int(checkpoint[0].shape[0]): checkpoint for checkpoint in checkpoints}
@@ -2557,10 +2602,10 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     # scored the same way as every other count (at the MAP).
     if last_count not in {int(count) for count, _ in thumbprints}:
         last_signals, last_bounds = checkpoint_by_count[last_count][0], checkpoint_by_count[last_count][1]
-        checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds)
-        last_bic = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)[-1])
-        print(f"{tag} Refined the last checkpoint: BIC at {last_count} signals: {last_bic:.2f}\n", flush=True)
-        thumbprints.append((last_count, last_bic))
+        checkpoint_by_count[last_count] = nuts(t, d, B, last_signals, last_bounds, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds, model_error_db=model_error_db)
+        last_score = float(get_statistics(t, d, B, checkpoint_by_count[last_count][0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)[-1])
+        print(f"{tag} Refined the last checkpoint: {score_name} at {last_count} signals: {last_score:.2f}\n", flush=True)
+        thumbprints.append((last_count, last_score))
 
     thumbprints = np.asarray(thumbprints, dtype=float)
 
@@ -2593,35 +2638,35 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         if not candidates:
             break
 
-        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds)
+        candidate_refits = nuts_orchestrator([checkpoint_by_count[count] for count in candidates], t, d, B, warmup, sample, devices, tag=tag, sample_seconds=sample_seconds, model_error_db=model_error_db)
 
         for count, checkpoint in zip(candidates, candidate_refits):
             refined_checkpoints[count] = checkpoint
-            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
+            statistics = get_statistics(t, d, B, checkpoint[0], f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)
 
             log_prob, glob_ll, noise_variance, snr, k2 = statistics[:5]
-            bic = statistics[-1]
-            scores[count] = float(bic)
-            print(f"{tag} Bisection: BIC at {count} signals: {float(bic):.2f} (Bretthorst {float(glob_ll):.2f})\n", flush=True)
+            bic, score = statistics[-2], statistics[-1]
+            scores[count] = float(score)
+            print(f"{tag} Bisection: {score_name} at {count} signals: {float(score):.2f} (BIC {float(bic):.2f}; Bretthorst {float(glob_ll):.2f})\n", flush=True)
 
             save_iteration_diagnostics(path / "result", checkpoint[0], noise_variance, snr, log_prob, glob_ll, bic, k2)
 
     best_count = max(scores, key=scores.get)
     signals, bounds = refined_checkpoints[best_count]
-    print(f"{tag} Selected {best_count} signals (BIC {scores[best_count]:.2f})\n", flush=True)
+    print(f"{tag} Selected {best_count} signals ({score_name} {scores[best_count]:.2f})\n", flush=True)
 
     if best_count == 0:
         print(f"{tag} Colony completed in {perf_counter() - start_time:.2f} seconds with 0 signals\n", flush=True)
         noise_scale = get_posterior_variance(t, d, B, signals)
-        colony_summary.update(selected=0, kept=0, glob_ll=zero_glob_ll, bic=scores[0], noise_scale=noise_scale)
+        colony_summary.update(selected=0, kept=0, glob_ll=zero_glob_ll, bic=zero_bic, noise_scale=noise_scale)
         return signals, bounds, noise_scale, empty_marginal(colony_summary)
 
     if prune:
-        signals, bounds, removed = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition, model_error_db)
+        signals, bounds, removed = prune_signals(t, d, B, signals, bounds, f_min, f_max, Q_min, Q_max, max_condition, model_error_db, selection)
         removed_lines = "".join(f"\n{tag}   removed f={f_removed:.6e} Hz, Q={Q_removed:.2f}" for f_removed, Q_removed in removed)
         print(f"{tag} Pruning removed {len(removed)} signal(s); {len(signals)} remain.{removed_lines}\n", flush=True)
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic, score = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)
     model = get_model(t, d, signals)
 
     save_signal_diagnostics(path / "result", fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif)
@@ -2657,7 +2702,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     return core_signals, core_bounds, posterior_variance, marginal
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True, selection=DEFAULT_SELECTION):
     start_time = perf_counter()
     t_raw, d_raw = load_data(type, event, network, station)
     max_trim_seconds = max_trim_hours * 3600
@@ -2680,7 +2725,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample)
+    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample, selection)
 
     signals = jnp.asarray(signals).reshape(-1, 2)
 
@@ -2745,7 +2790,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"[joint] Starting NUTS at t={perf_counter() - start_time:.2f}s (warmup={warmup}, sample={sample}, chains=1)\n", flush=True)
     nuts_start = perf_counter()
     try:
-        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]", sample_seconds=sample_seconds)
+        nuts_result, bounds, nuts_diagnostics = nuts(t, d, B, signals, bounds, warmup, sample, 1, return_diagnostics=True, tag="[joint]", sample_seconds=sample_seconds, model_error_db=model_error_db)
 
         # JAX may dispatch work asynchronously; wait before stopping the timer.
         nuts_result = jax.tree_util.tree_map(
@@ -2772,7 +2817,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     signals = nuts_result
 
-    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db)
+    log_prob, glob_ll, noise_variance, snr, k2, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, covariance, vif, bic, score = get_statistics(t, d, B, signals, f_min, f_max, Q_min, Q_max, max_condition=max_condition, model_error_db=model_error_db, selection=selection)
     model = get_model(t, d, signals)
     full_variance = get_posterior_variance(t, d, B, signals)
     covariance, signal_scale, subband_index = get_subband_scaled_covariance(signals, covariance, band_edges, subband_variances, full_variance)
@@ -2845,4 +2890,5 @@ if __name__ == "__main__":
         model_error_db=config.get("model_error_db", DEFAULT_MODEL_ERROR_DB),
         sample_seconds=config.get("sample_seconds", None),
         downsample=config.get("downsample", True),
+        selection=config.get("selection", DEFAULT_SELECTION),
     )
