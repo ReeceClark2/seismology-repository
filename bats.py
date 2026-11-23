@@ -66,6 +66,11 @@ MIN_TRIM_SECONDS = 1 * 3600
 # and anything folded onto them is far below both the fit-edge leakage and the model-error floor.
 ALIAS_GAIN = 1e-5
 
+# A NUTS starting point exactly on a box edge maps to +-infinity in the unconstrained coordinates and
+# gives no finite draws, so starting points and refined signals are kept this far (as a fraction of
+# the box width) inside their box. For an 80 uHz frequency margin that is 0.16 nHz.
+BOX_INTERIOR = 1e-6
+
 # Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
 # amplitude scale delta and the noise sigma. They enter only as log(log R); delta matters only
 # when comparing s = 0 with s >= 1.
@@ -460,9 +465,10 @@ def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
         print(f"MAP refinement failed ({error}); keeping the starting point.", flush=True)
         return jnp.stack((fs0, Qs0), axis=-1), {**failure, "message": str(error)}
 
-    final_log_prob = float(get_log_prob(t, d, B, to_signals(jnp.asarray(result.x))))
+    p_result = jnp.clip(jnp.asarray(result.x), BOX_INTERIOR, 1.0 - BOX_INTERIOR)   # trf may stop exactly on a bound
+    final_log_prob = float(get_log_prob(t, d, B, to_signals(p_result)))
     accepted = bool(np.isfinite(final_log_prob) and final_log_prob >= start_log_prob)
-    p_final = jnp.asarray(result.x) if accepted else p0
+    p_final = p_result if accepted else p0
     near_bound = (p_final < MAP_BOUND_TOLERANCE) | (p_final > 1.0 - MAP_BOUND_TOLERANCE)
     if accepted:
         near_bound = near_bound | jnp.asarray(result.active_mask != 0)
@@ -654,6 +660,11 @@ def nuts(t, d, B, signals, bounds, warmup, sample, chains, rng_key_value=None, r
     fs_max = bounds[:, 1].astype(f_init.dtype)
     Qs_min = bounds[:, 2].astype(Q_init.dtype)
     Qs_max = bounds[:, 3].astype(Q_init.dtype)
+    # Start strictly inside each box: a value on an edge is +-infinity in the unconstrained space.
+    f_inset = BOX_INTERIOR * (fs_max - fs_min)
+    f_init = jnp.clip(f_init, fs_min + f_inset, fs_max - f_inset)
+    log_Q_inset = BOX_INTERIOR * (jnp.log(Qs_max) - jnp.log(Qs_min))
+    Q_init = jnp.exp(jnp.clip(jnp.log(Q_init), jnp.log(Qs_min) + log_Q_inset, jnp.log(Qs_max) - log_Q_inset))
     init_strategy = init_to_value(values={"fs": f_init, "log_Qs": jnp.log(Q_init)})
 
     if rng_key_value is None:
