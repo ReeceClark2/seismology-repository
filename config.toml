@@ -26,8 +26,8 @@ subbands = 12
 min_novelty = 0.05
 prune = true
 
-filter_order = 8
-core_gain = 0.9
+filter_order = 4
+core_gain = 0.8
 fit_edge_gain = 0.002
 model_error_db = -45.0
 

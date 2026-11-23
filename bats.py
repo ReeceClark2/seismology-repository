@@ -1083,21 +1083,50 @@ def get_parameter_model(t, start_hours, reference_hours, fs, Qs, amplitudes, pha
         model += amplitude * np.exp(-np.pi * f * t / Q) * np.sin(2.0 * np.pi * f * t + phase)
     return model, amplitudes_0, phases_0
 
-def get_linear_fit(t, d, fs, Qs):
-    """Amplitudes and phases of fixed (f, Q) by linear least squares on (t, d): the projection of d
-    onto the damped-sinusoid basis (Householder QR, as in get_statistics). Returns (model, amplitudes,
-    phases) with the model A exp(-pi f t / Q) sin(2 pi f t + phi) at t = 0 of the given record."""
+MARGINAL_TAPER_HZ = 2e-5   # width of the cosine roll-off inside each edge of the marginal band mask
+
+def get_band_mask(n, sample_spacing, band_min, band_max, taper=MARGINAL_TAPER_HZ):
+    """Real FFT mask: 1 on [band_min + taper, band_max - taper], cosine roll-off to 0 at band_min and
+    band_max, 0 outside. The roll-off lies inside the band, so nothing outside it passes."""
+    frequencies = np.fft.rfftfreq(n, sample_spacing)
+    mask = np.zeros_like(frequencies)
+    inside = (frequencies > band_min) & (frequencies < band_max)
+    mask[inside] = 1.0
+    low = inside & (frequencies < band_min + taper)
+    high = inside & (frequencies > band_max - taper)
+    mask[low] = np.sin(0.5 * np.pi * (frequencies[low] - band_min) / taper) ** 2
+    mask[high] = np.sin(0.5 * np.pi * (band_max - frequencies[high]) / taper) ** 2
+    return mask
+
+def get_linear_fit(t, d, fs, Qs, band=None):
+    """Amplitudes and phases of fixed (f, Q) by linear least squares on (t, d).
+
+    With band = (f_min, f_max), the same linear operator W (a real-FFT band mask, get_band_mask) is
+    applied to the data and to every basis function before the fit: W d ~ sum_j beta_j W g_j. The
+    comparison is then like for like and only covers [f_min, f_max]: energy outside it (modes past
+    the outermost cores, which no colony owns) is removed from the data and the model alike, and
+    W g_j is fitted with the coefficient of the unmasked g_j, so the amplitudes are unaffected by W.
+    Householder QR, as in get_statistics. Returns (model, data, amplitudes, phases): the model and
+    data as compared (masked when band is given), and A, phi of A exp(-pi f t / Q) sin(2 pi f t + phi)
+    at t = 0 of the record.
+    """
+    t = np.asarray(t, dtype=float)
+    d = np.asarray(d, dtype=float)
     fs = jnp.asarray(fs, dtype=float)
     Qs = jnp.asarray(Qs, dtype=float)
     _, E = get_basis(jnp.asarray(t), fs, Qs)
-    G = jnp.concatenate((jnp.real(E), jnp.imag(E)))      # (m, n): [cos * decay; sin * decay]
-    U, R = jnp.linalg.qr(G.T, mode="reduced")
+    G = np.asarray(jnp.concatenate((jnp.real(E), jnp.imag(E))))   # (m, n): [cos * decay; sin * decay]
+    if band is not None:
+        mask = get_band_mask(len(t), t[1] - t[0], *band)
+        d = np.fft.irfft(np.fft.rfft(d) * mask, n=len(t))
+        G = np.fft.irfft(np.fft.rfft(G, axis=1) * mask, n=len(t), axis=1)
+    U, R = jnp.linalg.qr(jnp.asarray(G.T), mode="reduced")
     Ud = U.T @ jnp.asarray(d)
     beta = solve_triangular(R, Ud, lower=False)
     k = fs.shape[0]
     amplitudes = jnp.sqrt(beta[:k] ** 2 + beta[k:] ** 2)
     phases = jnp.atan2(beta[:k], beta[k:])
-    return np.asarray(U @ Ud), np.asarray(amplitudes), np.asarray(phases)
+    return np.asarray(U @ Ud), d, np.asarray(amplitudes), np.asarray(phases)
 
 # Evaluation (minor) ----------------------------------------------------------------------
 
@@ -1557,7 +1586,8 @@ def save_signal_diagnostics(path, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vi
 def empty_marginal(summary):
     """Marginal record of a colony that keeps no signals."""
     empty = np.empty(0)
-    return {"fs": empty, "Qs": empty, "fs_unc": empty, "Qs_unc": empty, "amplitudes": empty, "phases": empty, "vif": empty, "filter_gain": empty, "covariance": np.empty((0, 0)), "summary": summary}
+    return {"fs": empty, "Qs": empty, "fs_unc": empty, "Qs_unc": empty, "amplitudes": empty, "phases": empty, "vif": empty, "filter_gain": empty, "covariance": np.empty((0, 0)),
+            "padding_fs": empty, "padding_Qs": empty, "summary": summary}
 
 def make_marginal(summary, owned, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, covariance):
     """A colony's own statistics for the signals it keeps (owned: mask over the f-sorted statistics).
@@ -2715,6 +2745,10 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         selected=best_count, kept=int(owned.sum()), glob_ll=float(glob_ll), bic=float(bic), noise_scale=posterior_variance,
     )
     marginal = make_marginal(colony_summary, owned_sorted, fs, Qs, fs_unc, Qs_unc, amplitudes, phases, vif, covariance)
+    # Signals this colony fitted outside its core (padding). Not reported; the marginal fit uses those
+    # past the global band edges as nuisance terms (see run).
+    marginal["padding_fs"] = np.asarray(fs, dtype=float)[~np.asarray(owned_sorted)]
+    marginal["padding_Qs"] = np.asarray(Qs, dtype=float)[~np.asarray(owned_sorted)]
 
     return core_signals, core_bounds, posterior_variance, marginal
 
@@ -2765,7 +2799,10 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     # amplitudes and phases are refitted jointly, by one linear solve, on the full-band data. The data
     # are the full-band filtered record from the reference time on (the latest colony start, so
     # nothing is extrapolated before any colony's data), downsampled like a colony (get_decimation).
-    # The fitted model is then exactly the projection of those data, and its amplitudes and phases
+    # The full-band filter still passes a lot past f_min and f_max (its gain is 0.9 at the band edges
+    # and falls slowly beyond them), where no colony reports signals, so data and basis are both
+    # restricted to [f_min, f_max] by the same FFT band mask before the fit (get_linear_fit). The
+    # fitted model is then exactly the projection of those data, and its amplitudes and phases
     # include the full-band filter: divided by its complex gain G they describe the unfiltered signals
     # at the reference time (the CSV values). The colonies' own (filter-corrected, shifted) amplitudes
     # and phases are kept alongside for comparison. f, Q, their uncertainties and the covariance stay
@@ -2776,13 +2813,23 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     full_decimation = get_decimation(sampling_rate, full_filter_min, full_filter_max, full_fit_max, filter_order)[0] if downsample else 1
     t_marginal = (t[window] - t[window][0])[::full_decimation]
     d_marginal = d[window][::full_decimation]
-    model, fitted_amplitudes, fitted_phases = get_linear_fit(t_marginal, d_marginal, marginal["fs"], marginal["Qs"])
+    # Nuisance terms: the outer colonies' padding signals past f_min or f_max. Their lines' tails reach
+    # inside the band; fitted alongside, not reported.
+    padding_fs = np.concatenate([np.asarray(colony_marginal.get("padding_fs", []), dtype=float) for colony_marginal in marginals])
+    padding_Qs = np.concatenate([np.asarray(colony_marginal.get("padding_Qs", []), dtype=float) for colony_marginal in marginals])
+    outside = (padding_fs < f_min) | (padding_fs > f_max)
+    n_marginal = len(marginal["fs"])
+    model, d_marginal, fitted_amplitudes, fitted_phases = get_linear_fit(
+        t_marginal, d_marginal, np.concatenate((marginal["fs"], padding_fs[outside])), np.concatenate((marginal["Qs"], padding_Qs[outside])), band=(f_min, f_max))
+    fitted_amplitudes, fitted_phases = fitted_amplitudes[:n_marginal], fitted_phases[:n_marginal]
     full_gain = get_filter_gain(marginal["fs"], marginal["Qs"], full_filter_min, full_filter_max, sampling_rate, filter_order)
     marginal["amplitudes"] = fitted_amplitudes / np.abs(full_gain)
     marginal["phases"] = np.angle(np.exp(1j * (fitted_phases - np.angle(full_gain))))
     residual_fraction = float(np.sqrt(np.mean((d_marginal - model) ** 2) / np.mean(d_marginal ** 2)))
     print(f"Marginal amplitudes and phases refitted jointly on the full-band data from {reference_hours:.2f} h "
-          f"({len(t_marginal)} samples, downsampled by {full_decimation}); residual rms {100 * residual_fraction:.2f}% of the data rms.\n", flush=True)
+          f"({len(t_marginal)} samples, downsampled by {full_decimation}; data and model restricted to {1000 * f_min:.3f}-{1000 * f_max:.3f} mHz; "
+          f"{int(outside.sum())} padding signals past the band edges fitted as nuisance terms); "
+          f"residual rms {100 * residual_fraction:.2f}% of the data rms.\n", flush=True)
 
     save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours), "Filter Gain": np.abs(full_gain), "Colony Amplitude": colony_amplitudes, "Colony Phase (rad)": colony_phases})
     save_subband_summary(path / "marginal_result", [colony_marginal["summary"] for colony_marginal in marginals])
