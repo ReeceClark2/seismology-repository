@@ -430,7 +430,7 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max, model_error_db=None):
 MAP_BOUND_TOLERANCE = 1e-3
 MAX_TREE_DEPTH = 7
 
-def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=500, model_error_db=None):
+def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200, model_error_db=None):
     """MAP refinement as bounded variable-projection least squares (scipy least_squares, method "trf").
 
     With m fixed, get_log_prob = (m - N)/2 log(RSS / sum d^2) is a decreasing function of the RSS, so
@@ -1082,6 +1082,22 @@ def get_parameter_model(t, start_hours, reference_hours, fs, Qs, amplitudes, pha
     for f, Q, amplitude, phase in zip(fs, Qs, amplitudes_0, phases_0):   # one signal at a time keeps memory at O(n)
         model += amplitude * np.exp(-np.pi * f * t / Q) * np.sin(2.0 * np.pi * f * t + phase)
     return model, amplitudes_0, phases_0
+
+def get_linear_fit(t, d, fs, Qs):
+    """Amplitudes and phases of fixed (f, Q) by linear least squares on (t, d): the projection of d
+    onto the damped-sinusoid basis (Householder QR, as in get_statistics). Returns (model, amplitudes,
+    phases) with the model A exp(-pi f t / Q) sin(2 pi f t + phi) at t = 0 of the given record."""
+    fs = jnp.asarray(fs, dtype=float)
+    Qs = jnp.asarray(Qs, dtype=float)
+    _, E = get_basis(jnp.asarray(t), fs, Qs)
+    G = jnp.concatenate((jnp.real(E), jnp.imag(E)))      # (m, n): [cos * decay; sin * decay]
+    U, R = jnp.linalg.qr(G.T, mode="reduced")
+    Ud = U.T @ jnp.asarray(d)
+    beta = solve_triangular(R, Ud, lower=False)
+    k = fs.shape[0]
+    amplitudes = jnp.sqrt(beta[:k] ** 2 + beta[k:] ** 2)
+    phases = jnp.atan2(beta[:k], beta[k:])
+    return np.asarray(U @ Ud), np.asarray(amplitudes), np.asarray(phases)
 
 # Evaluation (minor) ----------------------------------------------------------------------
 
@@ -2745,25 +2761,34 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
     print(f"Marginal amplitudes and phases are at t = {reference_hours:.3f} h after the record start (the longest subband trim).\n", flush=True)
     marginal = append_marginals(marginals)
     marginal_signals = jnp.stack((jnp.asarray(marginal["fs"]), jnp.asarray(marginal["Qs"])), axis=-1).reshape(-1, 2)
-    # The marginal model is built from the marginal amplitudes and phases themselves (nothing refitted;
-    # they describe the unfiltered signals). To compare like for like with the full-band data d, the
-    # model is built on the raw record and passed through exactly the same filter and trim as d.
-    # The Lorentzians describe the same trimmed window analytically: there each mode is the filter's
-    # steady-state response to it, i.e. its amplitude and phase at d's t = 0 times its complex gain G
-    # (get_filter_gain). Multiplying an unfiltered Lorentzian by |H(f)|^2 instead would describe a
-    # signal switched on at the window start, which the trimmed data are not.
-    model_raw, _, _ = get_parameter_model(t_raw - t_raw[0], 0.0, reference_hours, marginal["fs"], marginal["Qs"], marginal["amplitudes"], marginal["phases"])
-    _, model = filter_data(t_raw, model_raw, full_filter_min, full_filter_max, order=filter_order, ringing_db=ringing_db, max_trim_seconds=max_trim_seconds)
-    if len(model) != len(d):
-        raise RuntimeError(f"Filtered marginal model has {len(model)} samples, data {len(d)}")
+    # Marginal amplitudes and phases: the appended (f, Q) from all colonies are held fixed and the
+    # amplitudes and phases are refitted jointly, by one linear solve, on the full-band data. The data
+    # are the full-band filtered record from the reference time on (the latest colony start, so
+    # nothing is extrapolated before any colony's data), downsampled like a colony (get_decimation).
+    # The fitted model is then exactly the projection of those data, and its amplitudes and phases
+    # include the full-band filter: divided by its complex gain G they describe the unfiltered signals
+    # at the reference time (the CSV values). The colonies' own (filter-corrected, shifted) amplitudes
+    # and phases are kept alongside for comparison. f, Q, their uncertainties and the covariance stay
+    # the colonies' own (block-diagonal; correlations between subbands are not estimated).
+    colony_amplitudes, colony_phases = marginal["amplitudes"].copy(), marginal["phases"].copy()
+    window = (t + full_start_hours * 3600.0) >= reference_hours * 3600.0 - 0.5 / sampling_rate
+    full_fit_max = get_fit_band(full_filter_min, full_filter_max, sampling_rate, filter_order, fit_edge_gain)[1]
+    full_decimation = get_decimation(sampling_rate, full_filter_min, full_filter_max, full_fit_max, filter_order)[0] if downsample else 1
+    t_marginal = (t[window] - t[window][0])[::full_decimation]
+    d_marginal = d[window][::full_decimation]
+    model, fitted_amplitudes, fitted_phases = get_linear_fit(t_marginal, d_marginal, marginal["fs"], marginal["Qs"])
     full_gain = get_filter_gain(marginal["fs"], marginal["Qs"], full_filter_min, full_filter_max, sampling_rate, filter_order)
-    _, model_amplitudes, model_phases = get_parameter_model(t[:1], full_start_hours, reference_hours, marginal["fs"], marginal["Qs"], marginal["amplitudes"], marginal["phases"], gain=full_gain)
+    marginal["amplitudes"] = fitted_amplitudes / np.abs(full_gain)
+    marginal["phases"] = np.angle(np.exp(1j * (fitted_phases - np.angle(full_gain))))
+    residual_fraction = float(np.sqrt(np.mean((d_marginal - model) ** 2) / np.mean(d_marginal ** 2)))
+    print(f"Marginal amplitudes and phases refitted jointly on the full-band data from {reference_hours:.2f} h "
+          f"({len(t_marginal)} samples, downsampled by {full_decimation}); residual rms {100 * residual_fraction:.2f}% of the data rms.\n", flush=True)
 
-    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours), "Filter Gain": marginal["filter_gain"]})
+    save_signal_diagnostics(path / "marginal_result", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], marginal["amplitudes"], marginal["phases"], marginal["vif"], extra_columns={"Subband": marginal["subband"], "Reference Time (h)": np.full(len(marginal["fs"]), reference_hours), "Filter Gain": np.abs(full_gain), "Colony Amplitude": colony_amplitudes, "Colony Phase (rad)": colony_phases})
     save_subband_summary(path / "marginal_result", [colony_marginal["summary"] for colony_marginal in marginals])
-    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(marginal_signals)}.png", t, d, marginal_signals, model=model)
-    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}.png", t, d, f_min, f_max, marginal_signals, core_edges=band_edges, edges_label="Subband boundaries", model=model, amplitudes=model_amplitudes, phases=model_phases)
-    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}_model.png", t, model, f_min, f_max, core_edges=band_edges, edges_label="Subband boundaries")
+    plot_time_series("Time Series", path / "marginal_result" / f"time_series_{len(marginal_signals)}.png", t_marginal, d_marginal, marginal_signals, model=model)
+    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}.png", t_marginal, d_marginal, f_min, f_max, marginal_signals, core_edges=band_edges, edges_label="Subband boundaries", model=model, amplitudes=fitted_amplitudes, phases=fitted_phases)
+    plot_fourier_space(f"Fourier Space {len(marginal_signals)} Signal Model", path / "marginal_result" / f"fourier_space_{len(marginal_signals)}_model.png", t_marginal, model, f_min, f_max, core_edges=band_edges, edges_label="Subband boundaries")
     plot_signal_space(f"f-Q Diagram {len(marginal_signals)} Signal Model", path / "marginal_result" / f"signal_space_{len(marginal_signals)}.png", marginal["fs"], marginal["Qs"], marginal["fs_unc"], marginal["Qs_unc"], core_edges=band_edges, f_range=(f_min, f_max), edges_label="Subband boundaries")
     plot_covariance(f"Parameter Correlation {len(marginal_signals)} Signal Model", path / "marginal_result" / f"covariance_{len(marginal_signals)}.png", marginal_signals, marginal["covariance"], groups=marginal["subband"], edges=band_edges)
     print(f"Marginal result: {len(marginal_signals)} signals appended from {len(marginals)} subband(s)\n", flush=True)

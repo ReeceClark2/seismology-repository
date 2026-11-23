@@ -1,27 +1,27 @@
-type = "observed"
+type = "prem"
 event = "tohoku"
-network = "II"
+network = "W"
 station = "BFO"
 
-f_min = 0.0034
-f_max = 0.0050
+f_min = 0.00028
+f_max = 0.00500
 Q_min = 40
 Q_max = 10000
 
 f_points = 3000
 Q_points = 100
-f_margin = 0.00008
-log_Q_margin = 1.5
+f_margin = 1
+log_Q_margin = 50000
 depth = 96
 
 warmup = 200
 sample = 400
 
-devices = 8
-cores = 32
-diagnostics = "full"
+devices = 24
+cores = 96
+diagnostics = "partial"
 signal_step = 8
-subbands = 4
+subbands = 12
 
 min_novelty = 0.05
 prune = true
