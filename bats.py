@@ -27,7 +27,7 @@ from jax.scipy.linalg import cho_factor, cho_solve, solve_triangular
 from matplotlib.patches import Ellipse
 from numpyro.diagnostics import effective_sample_size, split_gelman_rubin
 from numpyro.infer import MCMC, NUTS, init_to_value
-from scipy.optimize import brentq, minimize
+from scipy.optimize import brentq, least_squares, minimize
 from scipy.signal import butter, sosfiltfilt, sosfreqz
 
 matplotlib.use("Agg", force=True)
@@ -58,6 +58,13 @@ GRAM_JITTER = 1e-12
 # The cap protects the early, highest-SNR part of the record: trimming T_trim scales a mode's
 # amplitude at the new t = 0 by exp(-pi f T_trim / Q), which costs low-Q modes most.
 MIN_TRIM_SECONDS = 1 * 3600
+
+# Downsampling: after filtering, each colony keeps every k-th sample. The filter is the anti-alias
+# filter: content above the new Nyquist f_N folds to 2 f_N - f, so the fit band [.., fit_max] only
+# receives content from f >= 2 f_N - fit_max. f_N is set so that frequency is where the zero-phase
+# gain |H|^2 has fallen to ALIAS_GAIN (amplitude, -100 dB): the wings up to fit_max are kept intact
+# and anything folded onto them is far below both the fit-edge leakage and the model-error floor.
+ALIAS_GAIN = 1e-5
 
 # Bretthorst global likelihood: bound ratios R (upper / lower) of the Jeffreys priors on the
 # amplitude scale delta and the noise sigma. They enter only as log(log R); delta matters only
@@ -397,8 +404,95 @@ def objective(t, d, B, f_min, f_max, Q_min, Q_max):
 MAP_BOUND_TOLERANCE = 1e-3
 MAX_TREE_DEPTH = 7
 
-def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1000, gtol=1e-6):
+def map_refine_least_squares(t, d, B, signals, bounds, max_iterations=200):
+    """MAP refinement as bounded variable-projection least squares (scipy least_squares, method "trf").
+
+    With m fixed, get_log_prob = (m - N)/2 log(RSS / sum d^2) is a decreasing function of the RSS, so
+    the MAP in (f, log Q) within the boxes is the minimum of ||r||^2, r = d - P(f, Q) d the projected
+    residual. The parameters are the box coordinates p = (x - lower) / width in [0, 1], x = (f, log Q),
+    with the boxes as hard bounds: a signal at a box edge stops there and the others keep converging
+    (no sigmoid, so no steps spent pushing towards an edge that can only be reached at infinity).
+    Gauss-Newton trust-region steps (its model J^T J is positive semi-definite) with the exact Jacobian
+    of r, one column per parameter (lax.map over JVPs, so memory stays at one n-vector per column).
+    The residual is scaled by sqrt((N - m) / RSS_0), so the cost is in nats to first order.
+    max_iterations caps the function evaluations (about one per iteration).
+    """
+    fs0, Qs0 = unpack_signals(signals, sort=False)
+    bounds = jnp.asarray(bounds).reshape(-1, 4)
+    s = fs0.shape[0]
+    m = 2 * s
+    N = int(2 * t[-1] * B)
+
+    lower = jnp.concatenate((bounds[:, 0], jnp.log(bounds[:, 2])))
+    upper = jnp.concatenate((bounds[:, 1], jnp.log(bounds[:, 3])))
+    width = upper - lower
+    x0 = jnp.concatenate((fs0, jnp.log(Qs0)))
+    p0 = jnp.clip((x0 - lower) / width, MAP_BOUND_TOLERANCE, 1.0 - MAP_BOUND_TOLERANCE)
+
+    def to_signals(p):
+        x = lower + width * p
+        return jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1)
+
+    def residual(p):
+        fs, Qs = unpack_signals(to_signals(p), sort=False)
+        return get_projection_pieces(t, d, fs, Qs)[3]
+
+    start_log_prob = float(get_log_prob(t, d, B, to_signals(p0)))
+    rss0 = float(jnp.sum(residual(p0) ** 2))
+    scale = np.sqrt(max(N - m, 1) / max(rss0, np.finfo(np.float64).tiny))
+
+    residual_jit = jax.jit(residual)
+    eye = jnp.eye(2 * s, dtype=p0.dtype)
+    jacobian_jit = jax.jit(lambda p: jax.lax.map(lambda v: jax.jvp(residual, (p,), (v,))[1], eye).T)
+
+    def fun(p):
+        value = np.asarray(residual_jit(jnp.asarray(p)), dtype=np.float64) * scale
+        return value if np.all(np.isfinite(value)) else np.full_like(value, 1e150)
+
+    def jac(p):
+        return np.asarray(jacobian_jit(jnp.asarray(p)), dtype=np.float64) * scale
+
+    failure = {"accepted": False, "improvement": 0.0, "iterations": 0, "at_bound": 0, "free_gradient": float("nan"), "bound_gradient": float("nan")}
+    try:
+        result = least_squares(fun, np.asarray(p0, dtype=np.float64), jac=jac, bounds=(0.0, 1.0), method="trf",
+                               x_scale="jac", ftol=1e-12, xtol=1e-12, gtol=1e-10, max_nfev=max_iterations)
+    except Exception as error:
+        print(f"MAP refinement failed ({error}); keeping the starting point.", flush=True)
+        return jnp.stack((fs0, Qs0), axis=-1), {**failure, "message": str(error)}
+
+    final_log_prob = float(get_log_prob(t, d, B, to_signals(jnp.asarray(result.x))))
+    accepted = bool(np.isfinite(final_log_prob) and final_log_prob >= start_log_prob)
+    p_final = jnp.asarray(result.x) if accepted else p0
+    near_bound = (p_final < MAP_BOUND_TOLERANCE) | (p_final > 1.0 - MAP_BOUND_TOLERANCE)
+    if accepted:
+        near_bound = near_bound | jnp.asarray(result.active_mask != 0)
+    signal_at_bound = near_bound[:s] | near_bound[s:]
+    at_bound = int(jnp.sum(signal_at_bound))
+
+    def log_prob_x(x):
+        return get_log_prob(t, d, B, jnp.stack((x[:s], jnp.exp(x[s:])), axis=-1))
+
+    scaled_gradient = jnp.abs(jax.grad(log_prob_x)(lower + width * p_final) * width)
+    signal_gradient = jnp.maximum(scaled_gradient[:s], scaled_gradient[s:])
+    free_gradient = float(jnp.max(jnp.where(signal_at_bound, 0.0, signal_gradient))) if at_bound < s else float("nan")
+    bound_gradient = float(jnp.max(jnp.where(signal_at_bound, signal_gradient, 0.0))) if at_bound > 0 else float("nan")
+
+    info = {
+        "accepted": accepted,
+        "improvement": final_log_prob - start_log_prob if accepted else 0.0,
+        "iterations": int(result.nfev),
+        "message": str(result.message),
+        "at_bound": at_bound,
+        "free_gradient": free_gradient,
+        "bound_gradient": bound_gradient,
+    }
+    return to_signals(p_final), info
+
+def map_refine(t, d, B, signals, bounds, method="trf", max_iterations=200, gtol=1e-6):
     """Refine a starting point to the posterior mode (MAP) within the NUTS prior box.
+
+    method "trf" (default): bounded least squares, see map_refine_least_squares. The trust-region
+    Newton methods below are kept for comparison.
 
     The NUTS prior is uniform in (f, log Q) on each signal's box, so the MAP in those
     coordinates is argmax get_log_prob. The box constraint is enforced by reparameterizing:
@@ -416,6 +510,9 @@ def map_refine(t, d, B, signals, bounds, method="trust-krylov", max_iterations=1
 
     The result is accepted only if it does not lower the log probability.
     """
+    if method == "trf":
+        return map_refine_least_squares(t, d, B, signals, bounds, max_iterations=max_iterations)
+
     fs0, Qs0 = unpack_signals(signals, sort=False)
     bounds = jnp.asarray(bounds).reshape(-1, 4)
     s = fs0.shape[0]
@@ -769,7 +866,7 @@ def nuts_orchestrator(checkpoints, t, d, B, warmup, sample, devices, tag="", sam
     return optimized_checkpoints
 
 def _colony_worker(args):
-    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds = args
+    ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample = args
     n_subbands = len(band_edges) - 1
     core_min = float(band_edges[ind])
     core_max = float(band_edges[ind + 1])
@@ -785,18 +882,18 @@ def _colony_worker(args):
     core = (core_min, core_max, ind == n_subbands - 1)
     filter_band = (filter_min, filter_max, core_edge_gain)
 
-    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db, sample_seconds)
+    signals, bounds, posterior_variance, marginal = colony(t_raw, d_raw, fit_min, fit_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, colony_path, min_novelty, prune, core, ringing_db, max_trim_seconds, filter_band, filter_order, max_condition, model_error_db, sample_seconds, downsample)
 
     marginal["summary"]["subband"] = ind + 1
     return ind, np.asarray(signals), np.asarray(bounds), posterior_variance, marginal
 
-def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None):
+def colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True):
     n_subbands = len(band_edges) - 1
     n_workers = min(devices, n_subbands)
     devices_per_colony = devices // n_workers
     cores_per_colony = cores // n_workers
 
-    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds) for ind in range(n_subbands)]
+    tasks = [(ind, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices_per_colony, cores_per_colony, diagnostics, signal_step, path, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample) for ind in range(n_subbands)]
     ctx = mp.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -2208,6 +2305,20 @@ def get_filter_band(core_min, core_max, fs, order=DEFAULT_FILTER_ORDER, core_gai
 
     return low, high, achieved
 
+def get_decimation(sampling_rate, filter_min, filter_max, fit_max, order=DEFAULT_FILTER_ORDER, alias_gain=ALIAS_GAIN):
+    """Integer decimation factor for data already filtered to [filter_min, filter_max].
+
+    Content at f above the new Nyquist f_N aliases to 2 f_N - f. Requiring every frequency that lands
+    at or below fit_max to have gain <= alias_gain gives 2 f_N - fit_max >= f_alias, where f_alias is
+    the frequency above the band at which the zero-phase gain |H(f)|^2 falls to alias_gain:
+        f_N = (fit_max + f_alias) / 2  (>= fit_max),   k = floor(sampling_rate / (2 f_N)) >= 1.
+    Returns (k, f_alias, new Nyquist).
+    """
+    _, f_alias = get_fit_band(filter_min, filter_max, sampling_rate, order, alias_gain)
+    nyquist = 0.5 * (fit_max + max(f_alias, fit_max))
+    k = max(1, int(np.floor(sampling_rate / (2.0 * nyquist))))
+    return k, f_alias, 0.5 * sampling_rate / k
+
 def filter_data(t, d, f_min, f_max, order=DEFAULT_FILTER_ORDER, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, return_info=False):
     """Zero-phase bandpass, then trim both ends.
 
@@ -2253,7 +2364,7 @@ def filter_data(t, d, f_min, f_max, order=DEFAULT_FILTER_ORDER, ringing_db=DEFAU
 
 # Run -------------------------------------------------------------------------------------
 
-def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None):
+def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, path, min_novelty=0.0, prune=False, core=None, ringing_db=DEFAULT_RINGING_DB, max_trim_seconds=DEFAULT_MAX_TRIM_SECONDS, filter_band=None, filter_order=DEFAULT_FILTER_ORDER, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True):
     """Fit one subband, using three nested frequency ranges.
 
     core = (core_min, core_max, closed_above): the true subband; only signals whose frequency lies
@@ -2269,6 +2380,14 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     filter_min, filter_max, core_edge_gain = filter_band if filter_band is not None else (core_min, core_max, 0.5)
 
     t, d, filter_info = filter_data(t, d, filter_min, filter_max, order=filter_order, ringing_db=ringing_db, max_trim_seconds=max_trim_seconds, return_info=True)
+    filter_rate = float(1 / np.mean(np.diff(t)))       # rate the filter ran at (its gain is defined there)
+
+    # Downsample the filtered, trimmed record (see get_decimation). t keeps its origin (t = 0 at the
+    # end of the trim), so amplitudes, phases and start_hours are unchanged; N = 2BT does not depend
+    # on the sample count, and get_log_prob and the Fisher covariance rescale by n consistently.
+    decimation, f_alias, nyquist = get_decimation(filter_rate, filter_min, filter_max, f_max, filter_order) if downsample else (1, float("nan"), 0.5 * filter_rate)
+    if decimation > 1:
+        t, d = t[::decimation], d[::decimation]
     core_edges = (core_min, core_max)
     filter_edges = (filter_min, filter_max)
 
@@ -2276,7 +2395,8 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
     colony_summary = {
         "core_min": core_min, "core_max": core_max, "filter_min": filter_min, "filter_max": filter_max,
         "fit_min": f_min, "fit_max": f_max, "core_edge_gain": core_edge_gain, "trim_hours": filter_info["trim_seconds"] / 3600,
-        "start_hours": filter_info["start_seconds"] / 3600, "sampling_rate": float(1 / np.mean(np.diff(t))), "filter_order": filter_order,
+        "start_hours": filter_info["start_seconds"] / 3600, "sampling_rate": filter_rate, "filter_order": filter_order,
+        "decimation": decimation,
     }
 
     initial_plot(path, t, d, f_min, f_max, core_edges, filter_edges)
@@ -2310,7 +2430,9 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
         f"{tag} Bands: core {1000 * core_min:.3f}-{1000 * core_max:.3f} mHz; filter {1000 * filter_min:.3f}-{1000 * filter_max:.3f} mHz "
         f"(order {filter_order}, {core_edge_gain:.3f} of amplitude kept at the core edges); fit {1000 * f_min:.3f}-{1000 * f_max:.3f} mHz\n"
         f"{tag} Filter time constant {filter_info['time_constant'] / 3600:.2f} h; trimmed {filter_info['trim_seconds'] / 3600:.1f} h "
-        f"at each end ({trim_note}); {t[-1] / 3600:.1f} h of record used\n",
+        f"at each end ({trim_note}); {t[-1] / 3600:.1f} h of record used\n"
+        f"{tag} Downsampled by {decimation} to {1000 * 0.5 * filter_rate / decimation:.3f} mHz Nyquist "
+        f"({len(t)} samples; gain falls to {ALIAS_GAIN:g} at {1000 * f_alias:.3f} mHz, so aliases onto the fit band are below that)\n",
         flush=True,
     )
 
@@ -2524,7 +2646,7 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     return core_signals, core_bounds, posterior_variance, marginal
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True):
     start_time = perf_counter()
     t_raw, d_raw = load_data(type, event, network, station)
     max_trim_seconds = max_trim_hours * 3600
@@ -2547,7 +2669,7 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     numpyro.set_host_device_count(devices)
 
-    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds)
+    signals, bounds, subband_variances, marginals = colony_orchestrator(path, t_raw, d_raw, band_edges, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, min_novelty, prune, fit_edge_gain, ringing_db, max_trim_seconds, filter_order, core_gain, max_condition, model_error_db, sample_seconds, downsample)
 
     signals = jnp.asarray(signals).reshape(-1, 2)
 
@@ -2711,4 +2833,5 @@ if __name__ == "__main__":
         max_condition=config.get("max_condition", DEFAULT_MAX_CONDITION),
         model_error_db=config.get("model_error_db", DEFAULT_MODEL_ERROR_DB),
         sample_seconds=config.get("sample_seconds", None),
+        downsample=config.get("downsample", True),
     )

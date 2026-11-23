@@ -10,30 +10,31 @@ Q_max = 10000
 
 f_points = 3000
 Q_points = 100
-f_margin = 0.00005
-log_Q_margin = 1.6
-depth = 64
+f_margin = 0.00008
+log_Q_margin = 1.5
+depth = 96
 
 warmup = 200
 sample = 400
 
-devices = 16
+devices = 24
 cores = 96
 diagnostics = "full"
 signal_step = 8
-subbands = 8
+subbands = 12
 
 min_novelty = 0.05
 prune = true
 
-subband_padding = 0.5
 filter_order = 8
 core_gain = 0.9
-fit_edge_gain  = 0.002
-model_error_db = -50.0
+fit_edge_gain = 0.002
+model_error_db = -45.0
 
 ringing_db = -60.0
 max_trim_hours = 10
-max_condition = 1000.0
+max_condition = 100.0
 
-sample_seconds = 600
+sample_seconds = 240
+
+downsample = true
