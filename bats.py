@@ -2948,7 +2948,7 @@ def parse_arguments():
     parser.add_argument("--station", help="station code, e.g. BFO")
     parser.add_argument("--channel", help="channel code, e.g. LHZ (optional; part of the data file name when given)")
     parser.add_argument("--config", default="config.toml", help="method settings (default: config.toml)")
-    parser.add_argument("--output-dir", default=".", help="directory in which the run directory is created (default: working directory)")
+    parser.add_argument("--output-dir", default=None, help=f"directory in which the run directory is created (default: runs/ in the enclosing {REPOSITORY_NAME} directory)")
     parser.add_argument("--data-root", default=None, help=f"directory holding <type>/<event>/ (default: the enclosing {REPOSITORY_NAME} directory)")
     return parser.parse_args()
 
@@ -2970,7 +2970,8 @@ if __name__ == "__main__":
     task = os.environ.get("SLURM_ARRAY_TASK_ID")
     suffix = f"_{job}" + (f"_{task}" if task is not None else "") if job else ""
     name = "dracula_" + "_".join(parts) + f"_{timestamp}{suffix}"
-    path = Path(arguments.output_dir).resolve() / name
+    output_dir = Path(arguments.output_dir) if arguments.output_dir is not None else get_repository_root() / "runs"
+    path = output_dir.resolve() / name
     path.mkdir(parents=True, exist_ok=True)
 
     shutil.copyfile(config_file, path / "config.txt")
