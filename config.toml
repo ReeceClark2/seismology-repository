@@ -1,7 +1,5 @@
-type = "prem"
-event = "tohoku"
-network = "W"
-station = "BFO"
+# Method settings shared by every dataset. The dataset itself (type, event, network, station,
+# channel) is given on the command line: see datasets.txt and submit.sh.
 
 f_min = 0.00028
 f_max = 0.00500
@@ -10,8 +8,8 @@ Q_max = 10000
 
 f_points = 3000
 Q_points = 100
-f_margin = 1
-log_Q_margin = 50000
+f_margin = 0.01
+log_Q_margin = 8.0  
 depth = 96
 
 warmup = 200
@@ -26,10 +24,10 @@ subbands = 12
 min_novelty = 0.05
 prune = true
 
-filter_order = 4
-core_gain = 0.8
+filter_order = 8
+core_gain = 0.99
 fit_edge_gain = 0.002
-model_error_db = -45.0
+model_error_db = -55.0
 
 ringing_db = -60.0
 max_trim_hours = 10
@@ -38,3 +36,4 @@ max_condition = 100.0
 sample_seconds = 240
 
 downsample = true
+selection = "bretthorst"

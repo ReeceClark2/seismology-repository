@@ -1,0 +1,2 @@
+# type     event   network station [channel]
+observed   tohoku  II      BFO

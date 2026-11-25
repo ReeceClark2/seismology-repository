@@ -1,4 +1,5 @@
 # Standard library
+import argparse
 import csv
 import multiprocessing as mp
 import os
@@ -2269,14 +2270,37 @@ def get_band_edges(path, t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, s
 
     return edges_init, edges
 
-def load_data(type, event, network, station):
-    if type == "observed":
-        path = Path.cwd() / type / event / f"{network}_{station}_TS.ascii"
-    elif type in ("synthetic", "prem"):
-        path = Path.cwd() / type / event / f"{network}_{station}.dat"
-    else:
+REPOSITORY_NAME = "seismology-repository"
+DATA_SUFFIXES = ("", ".dat", ".ascii", ".txt")   # accepted extensions, in order of preference
+
+def get_repository_root():
+    """The data root: the nearest directory named seismology-repository above this script (it also
+    finds the repository from a snapshot copy under seismology-repository/snapshots/), else the
+    BATS_DATA_ROOT environment variable, else the working directory."""
+    for directory in Path(__file__).resolve().parents:
+        if directory.name == REPOSITORY_NAME:
+            return directory
+    return Path(os.environ.get("BATS_DATA_ROOT", Path.cwd()))
+
+def load_data(type, event, network, station, channel=None, root=None):
+    """Two-column (time, value) text file <root>/<type>/<event>/<network>_<station>[_<channel>][ext].
+
+    Observed and synthetic files share one naming convention; the extension may be none, .dat,
+    .ascii or .txt. An older observed file named <network>_<station>_TS.ascii is still accepted.
+    """
+    if type not in ("observed", "synthetic", "prem"):
         raise ValueError(f"Unknown data type {type!r}; expected 'observed', 'synthetic' or 'prem'.")
-    data = np.loadtxt(path)
+    directory = Path(root) if root is not None else get_repository_root()
+    directory = directory / type / event
+    stem = f"{network}_{station}" if channel is None else f"{network}_{station}_{channel}"
+    candidates = [directory / f"{stem}{suffix}" for suffix in DATA_SUFFIXES] + [directory / f"{stem}_TS.ascii"]
+    found = [candidate for candidate in candidates if candidate.is_file()]
+    if not found:
+        raise FileNotFoundError(f"No data file for {stem} in {directory} (looked for: {', '.join(c.name for c in candidates)}).")
+    if len(found) > 1:
+        print(f"Several data files for {stem}: {', '.join(f.name for f in found)}; using {found[0].name}.", flush=True)
+    print(f"Loading {found[0]}", flush=True)
+    data = np.loadtxt(found[0])
     return data[:, 0], data[:, 1]
 
 def get_filter_time_constant(fs, f_min, f_max, order=DEFAULT_FILTER_ORDER):
@@ -2752,9 +2776,9 @@ def colony(t, d, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q
 
     return core_signals, core_bounds, posterior_variance, marginal
 
-def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True, selection=DEFAULT_SELECTION):
+def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_points, f_margin, log_Q_margin, depth, warmup, sample, devices, cores, diagnostics, signal_step, subbands, path, min_novelty=0.0, prune=False, fit_edge_gain=DEFAULT_FIT_EDGE_GAIN, ringing_db=DEFAULT_RINGING_DB, max_trim_hours=DEFAULT_MAX_TRIM_SECONDS / 3600, filter_order=DEFAULT_FILTER_ORDER, core_gain=DEFAULT_CORE_GAIN, max_condition=DEFAULT_MAX_CONDITION, model_error_db=DEFAULT_MODEL_ERROR_DB, sample_seconds=None, downsample=True, selection=DEFAULT_SELECTION, channel=None, data_root=None):
     start_time = perf_counter()
-    t_raw, d_raw = load_data(type, event, network, station)
+    t_raw, d_raw = load_data(type, event, network, station, channel, root=data_root)
     max_trim_seconds = max_trim_hours * 3600
     # The full band is filtered like a colony: widened so the band edges keep >= core_gain of the amplitude.
     sampling_rate = 1 / np.mean(np.diff(t_raw))
@@ -2909,25 +2933,58 @@ def run(type, event, network, station, f_min, f_max, Q_min, Q_max, f_points, Q_p
 
     return
 
+DATASET_KEYS = ("type", "event", "network", "station", "channel")
+
+def parse_arguments():
+    """Command line: the dataset (type, event, network, station, optional channel) and the config file.
+
+    The config file holds the method settings shared by every dataset. Dataset keys may still be in
+    it (older configs); a command-line value overrides them.
+    """
+    parser = argparse.ArgumentParser(description="BATS/DRACULA: Bayesian decomposition of a normal-mode record into damped sinusoids.")
+    parser.add_argument("--type", choices=("observed", "synthetic", "prem"), help="data type (directory under the data root)")
+    parser.add_argument("--event", help="event name (directory under <type>/)")
+    parser.add_argument("--network", help="network code, e.g. II")
+    parser.add_argument("--station", help="station code, e.g. BFO")
+    parser.add_argument("--channel", help="channel code, e.g. LHZ (optional; part of the data file name when given)")
+    parser.add_argument("--config", default="config.toml", help="method settings (default: config.toml)")
+    parser.add_argument("--output-dir", default=".", help="directory in which the run directory is created (default: working directory)")
+    parser.add_argument("--data-root", default=None, help=f"directory holding <type>/<event>/ (default: the enclosing {REPOSITORY_NAME} directory)")
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    config_file = Path("config.toml")
+    arguments = parse_arguments()
+    config_file = Path(arguments.config)
 
     with config_file.open("rb") as f:
         config = tomllib.load(f)
 
+    dataset = {key: getattr(arguments, key) if getattr(arguments, key) is not None else config.get(key) for key in DATASET_KEYS}
+    missing = [key for key in DATASET_KEYS[:4] if dataset[key] is None]
+    if missing:
+        raise SystemExit(f"Missing dataset argument(s): {', '.join('--' + key for key in missing)} (not given on the command line or in {config_file}).")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = (f"dracula_{config['type']}_{config['event']}_{config['network']}_{config['station']}_{timestamp}")
-    path = Path.cwd() / name
+    parts = [dataset["type"], dataset["event"], dataset["network"], dataset["station"]] + ([dataset["channel"]] if dataset["channel"] else [])
+    job = os.environ.get("SLURM_ARRAY_JOB_ID", os.environ.get("SLURM_JOB_ID"))
+    task = os.environ.get("SLURM_ARRAY_TASK_ID")
+    suffix = f"_{job}" + (f"_{task}" if task is not None else "") if job else ""
+    name = "dracula_" + "_".join(parts) + f"_{timestamp}{suffix}"
+    path = Path(arguments.output_dir).resolve() / name
     path.mkdir(parents=True, exist_ok=True)
 
     shutil.copyfile(config_file, path / "config.txt")
+    with (path / "config.txt").open("a") as f:
+        f.write("\n# Dataset (command line)\n" + "".join(f"{key} = {dataset[key]!r}\n".replace("'", '"') for key in DATASET_KEYS if dataset[key] is not None))
+    shutil.copyfile(Path(__file__).resolve(), path / "bats_used.py")     # the exact code that produced this run
 
     run(
-        type=config["type"],
-        event=config["event"],
-        network=config["network"],
-        station=config["station"],
-
+        type=dataset["type"],
+        event=dataset["event"],
+        network=dataset["network"],
+        station=dataset["station"],
+        channel=dataset["channel"],
+        data_root=arguments.data_root,
         f_min=config["f_min"],
         f_max=config["f_max"],
         Q_min=config["Q_min"],
